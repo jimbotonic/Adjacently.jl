@@ -10,3 +10,12 @@ Graphs = "86223c79-3864-5bf0-83f7-82e725a168b6"
 HDF5 = "f67ccb44-e63f-5c2f-98bd-6dc0ccc4ba2f"
 JLD = "4138dd39-2aa7-5051-a626-17a0bb65d9c8"
 Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
+
+[compat]
+julia = "1.0"
+DataStructures = "0.17.6"
+Distances = "0.8.2"
+Graphs = "0.10.3"
+HDF5 = "0.12.5"
+JLD = "0.9.1"
+
