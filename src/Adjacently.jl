@@ -1,4 +1,4 @@
-module JCNL
+module Adjacently
 
 module algo
 
