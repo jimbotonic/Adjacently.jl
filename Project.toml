@@ -1,0 +1,4 @@
+name = "JCNL"
+uuid = "411c8731-a39f-4a7d-8b26-fcc9fee4eb7b"
+authors = ["Jimmy Dubuisson <jimmy.dubuisson@gmail.com>"]
+version = "0.1.0"
