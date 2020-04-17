@@ -1,5 +1,5 @@
 #
-# JCNL: Julia Complex Networks Library
+# Adjacently: Julia Complex Networks Library
 # Copyright (C) 2016-2020 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
 #
 # This program is free software: you can redistribute it and/or modify
@@ -13,7 +13,7 @@
 # GNU General Public License for more details.
 #
 
-using Graphs, DataStructures, Logging
+using Graphs, DataStructures, SparseArrays, Logging
 
 include("algo.jl")
 
@@ -429,7 +429,6 @@ function get_colink_coefficients(g::GenericAdjacencyList{T,Array{T,1},Array{Arra
 	end
 	return ccs
 end
-
 
 # get inclist from adjlist
 function get_inclist_from_adjlist(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}) where {T<:Unsigned}
