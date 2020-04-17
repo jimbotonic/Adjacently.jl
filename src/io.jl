@@ -1,5 +1,5 @@
 #
-# JCNL: Julia Complex Networks Library
+# Adjacently: Julia Complex Networks Library
 # Copyright (C) 2016-2020 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
 #
 # This program is free software: you can redistribute it and/or modify
