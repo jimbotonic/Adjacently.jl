@@ -299,7 +299,7 @@ end
 
 Pearce version of Tarjan algorithm - iterative version
 """
-function pearce_iterative(g::LightGraphs.AbstractGraph{T) where {T<:Unsigned}
+function pearce_iterative(g::LightGraphs.AbstractGraph{T}) where {T<:Unsigned}
 	n = nv(g)
 	rindex = zeros(T,n)
 	S = T[]

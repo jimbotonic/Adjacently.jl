@@ -15,6 +15,8 @@
 
 using Graphs
 
+const G = Graphs
+
 """ 
     RW(g::GenericAdjacencyList{T, Array{T,1}, Array{Array{T,1},1}}, n_steps::UInt64, starting_v::T=convert(T,1)) where {T<:Unsigned}
 
@@ -46,7 +48,7 @@ proceeds until a sink node is reached or if rand()>jumping_constant from the spe
 @return an array vid position -> # visits
 """
 function RW_aggregated(g::GenericAdjacencyList{T, Array{T,1}, Array{Array{T,1},1}}, jumping_constant::Float64, starting_v::T=convert(T,1)) where {T<:Unsigned}
-	vv =  zeros(UInt32,length(vertices(g)))
+	vv =  zeros(UInt32,length(G.vertices(g)))
 	v = starting_v
 	vv[v] = 1
 	while rand() > jumping_constant
@@ -69,7 +71,7 @@ proceeds for n_steps starting from the specified vertex id
 @return an array vid position -> # visits
 """
 function RW_aggregated(g::GenericAdjacencyList{T, Array{T,1}, Array{Array{T,1},1}}, n_steps::UInt64, starting_v::T=convert(T,1)) where {T<:Unsigned}
-	vv =  zeros(UInt32,length(vertices(g)))
+	vv =  zeros(UInt32,length(G.vertices(g)))
 	v = starting_v
 	vv[v] = 1
 	for i in 1:n_steps
@@ -92,7 +94,7 @@ proceeds for n_steps
 """
 function US(g::GenericAdjacencyList{T, Array{T,1}, Array{Array{T,1},1}}, n_steps::UInt64) where {T<:Unsigned}
 	visited_nodes =  T[]
-	n = length(vertices(g))
+	n = length(G.vertices(g))
 	for i in 1:n_steps
 		pv = convert(T,rand(1:n))
 		push!(visited_nodes,pv)
