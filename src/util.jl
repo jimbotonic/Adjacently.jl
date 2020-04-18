@@ -16,14 +16,13 @@
 using DataStructures, Logging
 
 ##### custom implementation of QuickSort
-#function swap{T<:Integer}(A::Array{T,1},i::T,j::T)
+
 function swap(A::Array{T,1},i::T,j::T) where {T<:Integer}
 	t = A[i]
 	A[i] = A[j]
 	A[j] = t
 end
 
-#function partition{T<:Integer}(A::Array{T,1},R::Array{T,1},l::T,h::T)
 function partition(A::Array{T,1},R::Array{T,1},l::T,h::T) where {T<:Integer}
 	pvalue = A[h]
 	sindex = l
@@ -37,9 +36,13 @@ function partition(A::Array{T,1},R::Array{T,1},l::T,h::T) where {T<:Integer}
 	return sindex
 end
 
-# iterative quicksort
-#
-# @return permutation array and sort A in ascending order
+""" 
+    quicksort_iterative!(A::Array{T,1}) where {T<:Integer}
+
+iterative quicksort
+
+@return permutation array and sort A in ascending order
+"""
 function quicksort_iterative!(A::Array{T,1}) where {T<:Integer}
 	s = Stack{Tuple{T,T}}()
 	l = convert(T,1)
@@ -62,12 +65,16 @@ end
 
 ##### custom implementation of MergeSort
 
-# merge sort (ascending order)
-#
-# @returns permutation array R
-#
-# NB: to get the sorted array sA: sA[i] = A[R[i]] 
-#     R[i] is thus the index in the original array of element at new index i in the sorted array
+"""
+    bottom_up_sort(A::Array{T,1}) where {T<:Integer}
+
+merge sort (ascending order)
+
+@returns permutation array R
+
+NB: to get the sorted array sA: sA[i] = A[R[i]] 
+     R[i] is thus the index in the original array of element at new index i in the sorted array
+"""
 function bottom_up_sort(A::Array{T,1}) where {T<:Integer}
 	n = convert(T,length(A))
 	B = zeros(T,n)
@@ -105,11 +112,15 @@ function bottom_up_merge(A::Array{T,1},iLeft::T,iRight::T,iEnd::T,B::Array{T,1},
 end
 #####
 
-# custom binary search
-#
-# search x position in array A
-#
-# NB: array A is assumed to be sorted in ascending order
+"""
+    binary_search(A::Array{T,1}, x::T) where {T<:Integer}
+
+custom binary search
+
+search x position in array A
+
+NB: array A is assumed to be sorted in ascending order
+"""
 function binary_search(A::Array{T,1}, x::T) where {T<:Integer}
 	low = 1 
 	high = length(A)
@@ -143,10 +154,14 @@ end
 
 ##### custom implementation of Huffman encoding 
 
-# get sorted array
-#
-# A: initial array
-# R: permutation array
+"""
+    get_sorted_array(A::Array{T,1}, R::Array{T,1}, asc::Bool=true) where {T}
+
+get sorted array
+
+A: initial array
+R: permutation array
+"""
 function get_sorted_array(A::Array{T,1}, R::Array{T,1}, asc::Bool=true) where {T}
 	S = zeros(Int,length(A))
 	n = length(A)
@@ -177,11 +192,15 @@ mutable struct Node{T} <: AbstractNode
     right::AbstractNode
 end
 
-# encode binary tree
-#
-# the tree is encoded in
-# S: bits array
-# D: array of leaf node values 
+"""
+    encode_tree!(root::AbstractNode, S::BitArray{1} , D::Array{T,1}) where {T}
+
+encode binary tree
+
+the tree is encoded in
+S: bits array
+D: array of leaf node values 
+"""
 function encode_tree!(root::AbstractNode, S::BitArray{1} , D::Array{T,1}) where {T}
 	if root == EmptyNode
         	push!(S, 0)
@@ -194,9 +213,13 @@ function encode_tree!(root::AbstractNode, S::BitArray{1} , D::Array{T,1}) where 
 	end
 end
 
-# get Huffman prefix codes dictionary
-#
-# C: dictionary (bitarray -> value::T)
+"""
+    get_huffman_codes!(root::AbstractNode, C::Dict{BitArray{1},T}, B::BitArray{1}) where {T}
+
+get Huffman prefix codes dictionary
+
+C: dictionary (bitarray -> value::T)
+"""
 function get_huffman_codes!(root::AbstractNode, C::Dict{BitArray{1},T}, B::BitArray{1}) where {T}
 	if root.key != 0
         	C[B] = root.key
@@ -208,10 +231,14 @@ function get_huffman_codes!(root::AbstractNode, C::Dict{BitArray{1},T}, B::BitAr
 	end
 end
 
-# decode binary tree
-#
-# S: bits array
-# D: array of leaf node values 
+"""
+    decode_tree!(S::BitArray{1}, D::Array{T,1}) where {T}
+
+decode binary tree
+
+S: bits array
+D: array of leaf node values 
+"""
 function decode_tree!(S::BitArray{1}, D::Array{T,1}) where {T}
 	length(S) == 0 && return EmptyNode
 	b = popfirst!(S)
@@ -225,9 +252,13 @@ function decode_tree!(S::BitArray{1}, D::Array{T,1}) where {T}
 	return EmptyNode
 end
 
-# decode values
-#
-# C: code -> value dictionary
+"""
+    decode_values(tree::Node{T}, CDATA::BitArray{1}) where {T}
+
+decode values
+
+C: code -> value dictionary
+"""
 function decode_values(tree::Node{T}, CDATA::BitArray{1}) where {T}
 	children = T[]
 	cnode = tree
@@ -245,14 +276,18 @@ function decode_values(tree::Node{T}, CDATA::BitArray{1}) where {T}
 	return children
 end
 
-# @return huffman tree
-#
-# A is assumed to have a length >= 2
-# A[i] is the value associated to element having index i (e.g. A[i] could be the in-degree of vertex i)
-#
-# conventions
-# -> lowest child is assigned to left leaf, and highest child to right leaf
-# -> 0: left branch, 1: right branch
+"""
+    huffman_encoding(A::Array{T,1}) where {T<:Unsigned}
+
+@return huffman tree
+
+A is assumed to have a length >= 2
+A[i] is the value associated to element having index i (e.g. A[i] could be the in-degree of vertex i)
+
+conventions
+-> lowest child is assigned to left leaf, and highest child to right leaf
+-> 0: left branch, 1: right branch
+"""
 function huffman_encoding(A::Array{T,1}) where {T<:Unsigned}
 	# get sorted array in increasing order
 	# NB: instead of poping elements, we use shift
@@ -314,4 +349,3 @@ function huffman_encoding(A::Array{T,1}) where {T<:Unsigned}
 	end
 	return nNode
 end
-#####

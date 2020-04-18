@@ -17,6 +17,9 @@ include("rw.jl")
 
 using Graphs, LightGraphs, DataStructures, Logging, Distances, SparseArrays
 
+const G = Graphs
+const LG = LightGraphs
+
 DAMPING_FACTOR = 0.85
 EPSILON = 1e-6
 MAX_ITER = 100
@@ -31,7 +34,7 @@ MAX_ITER = 100
 Naive inefficient implementation of Pagerank algorithm
 """
 function PR(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}, rg::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}; init_pr::Array{Float64,1}=Float64[], damping::Float64=DAMPING_FACTOR, epsilon::Float64=EPSILON) where {T<:Unsigned}
-	vs = vertices(g)
+	vs = G.vertices(g)
 	n = length(vs)
 	@info("computing Pagerank (size of graph $n)")
 	# initialize pagerank vector
@@ -69,7 +72,7 @@ end
 Naive inefficient implementation of Pagerank algorithm (designed for large graphs)
 """
 function PR(rg::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}, out_degrees::Array{T,1}; init_pr::Array{Float64,1}=Float64[], damping::Float64=DAMPING_FACTOR, epsilon::Float64=EPSILON, save_pr::Bool=False) where {T<:Unsigned}
-	vs = vertices(rg)
+	vs = G.vertices(rg)
 	n = length(vs)
 	@info("computing Pagerank (size of graph $n)")
 	# initialize pagerank vector
@@ -120,7 +123,7 @@ end
 Naive inefficient implementation of personalized Pagerank with a single source vertex
 """
 function PPR(src::T, g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}, rg::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}; damping::Float64=DAMPING_FACTOR, epsilon::Float64=EPSILON) where {T<:Unsigned}
-	vs = vertices(g)
+	vs = G.vertices(g)
 	n = length(vs)
 	@info("computing personalized Pagerank (size of graph $n, source $src)")
 	# initialize pagerank vector
@@ -164,7 +167,7 @@ MC Pagerank with cyclic start of complete path stopping at sink nodes
 http://www-sop.inria.fr/members/Konstantin.Avratchenkov/pubs/mc.pdf
 """
 function PR(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}, n_cycles::Int; damping::Float64=DAMPING_FACTOR, epsilon::Float64=EPSILON) where {T<:Unsigned}
-	vs = vertices(g)
+	vs = G.vertices(g)
 	n = length(vs)
 	vv = zeros(Float64, n)
 	@info("computing Monte-Carlo Pagerank (size of graph $n)")
