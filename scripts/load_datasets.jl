@@ -16,9 +16,15 @@
 using Pkg
 Pkg.activate(normpath(joinpath(@__DIR__, "..")))
 
-include("../util.jl")
-include("../io.jl")
-include("../graph.jl")
+include("../src/util.jl")
+include("../src/io.jl")
+include("../src/graph.jl")
+
+using Graphs
+using LightGraphs
+
+const G = Graphs
+const LG = LightGraphs
 
 #Logging.configure(level=INFO)
 
@@ -33,13 +39,13 @@ if dataset == "amazon"
 	@info("loading Amazon_0601 graph")
 	g = adjlist(UInt32, is_directed=true)
 	load_adjacency_list_from_csv(UInt32, g, "../datasets/Amazon_0601/Amazon0601.txt")
-	@info("# vertices:", length(vertices(g)))
+	@info("# vertices:", length(G.vertices(g)))
 	g = adjlist(UInt32, is_directed=true)
 	@info("# edges:", num_edges(g))
 
 	@info("getting core")
 	core,oni,noi = get_core(g)
-	@info("# vertices:", length(vertices(core)))
+	@info("# vertices:", length(G.vertices(core)))
 	@info("# edges:", num_edges(core))
 
 	@info("getting reverse graph")
@@ -57,12 +63,12 @@ elseif dataset == "google"
 	@info("loading Web_Google graph")
 	g = adjlist(UInt32, is_directed=true)
 	load_adjacency_list_from_csv(UInt32, g, "../datasets/Web_Google/web-Google.txt")
-	@info("# vertices:", length(vertices(g)))
+	@info("# vertices:", length(G.vertices(g)))
 	@info("# edges:", num_edges(g))
 
 	@info("getting core")
 	core,oni,noi = get_core(g)
-	@info("# vertices:", length(vertices(core)))
+	@info("# vertices:", length(G.vertices(core)))
 	@info("# edges:", num_edges(core))
 
 	@info("getting reverse graph")
@@ -80,12 +86,12 @@ elseif dataset == "arxiv"
 	@info("loading Arxiv_HEP-PH graph")
 	g = adjlist(UInt32, is_directed=true)
 	load_adjacency_list_from_csv(UInt32, g, "../datasets/Arxiv_HEP-PH/Cit-HepPh.txt")
-	@info("# vertices:", length(vertices(g)))
+	@info("# vertices:", length(G.vertices(g)))
 	@info("# edges:", num_edges(g))
 
 	@info("getting core")
 	core,oni,noi = get_core(g)
-	@info("# vertices:", length(vertices(core)))
+	@info("# vertices:", length(G.vertices(core)))
 	@info("# edges:", num_edges(core))
 
 	@info("getting reverse graph")
@@ -103,12 +109,12 @@ elseif dataset == "eat"
 	@info("loading EAT (new) graph")
 	g = adjlist(UInt32, is_directed=true)
 	load_graph_from_pajek(UInt32, g, "../datasets/EAT/EATnew.net")
-	@info("# vertices:", length(vertices(g)))
+	@info("# vertices:", length(G.vertices(g)))
 	@info("# edges:", num_edges(g))
 
 	@info("getting core")
 	core,oni,noi = get_core(g)
-	@info("# vertices:", length(vertices(core)))
+	@info("# vertices:", length(G.vertices(core)))
 	@info("# edges:", num_edges(core))
 
 	@info("getting reverse graph")

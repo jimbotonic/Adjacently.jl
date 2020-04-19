@@ -16,27 +16,39 @@
 using Pkg
 Pkg.activate(normpath(joinpath(@__DIR__, "..")))
 
-include("../io.jl")
-include("../graph.jl")
+include("../src/io.jl")
+include("../src/graph.jl")
 
 g = adjlist(UInt32, is_directed=true)
+g2 = SimpleDiGraph(UInt32)
 
 filename = ARGS[1]
 
 # load CSV adjacency list
 load_adjacency_list_from_csv(UInt32, g, filename, '\t')
+load_adjacency_list_from_csv(UInt32, g2, filename, '\t')
 
 nvs,nes,dens = get_basic_stats(g)
 
 # save graph in MGSv3 format
 write_mgs3_graph(g, "Arxiv_HEP-PH")
+write_mgs3_graph(g2, "Arxiv_HEP-PH2")
 
 # load graph in MGSv3 format
-g2 = adjlist(UInt32, is_directed=true)
-load_mgs3_graph(g2, "Arxiv_HEP-PH.mgs")
+ga = adjlist(UInt32, is_directed=true)
+load_mgs3_graph(ga, "Arxiv_HEP-PH.mgs")
 
-println(length(vertices(g)))
-println(out_neighbors(vertices(g)[1],g))
-println(length(vertices(g2)))
-println(out_neighbors(vertices(g2)[1],g2))
-#println(length(edges(g2)))
+println(length(G.vertices(g)))
+println(out_neighbors(G.vertices(g)[1],g))
+println(length(G.vertices(ga)))
+println(out_neighbors(G.vertices(ga)[1],g2))
+#println(length(edges(ga)))
+
+gb = SimpleDiGraph(UInt32)
+load_mgs3_graph(gb, "Arxiv_HEP-PH2.mgs")
+
+println(nv(g2))
+println(outneighbors(g2,LG.vertices(g2)[1]))
+println(nv(gb))
+println(outneighbors(gb,LG.vertices(gb)[1]))
+#println(ne(gb))

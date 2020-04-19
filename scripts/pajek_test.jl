@@ -16,8 +16,8 @@
 using Pkg
 Pkg.activate(normpath(joinpath(@__DIR__, "..")))
 
-include("../io.jl")
-include("../graph.jl")
+include("../src/io.jl")
+include("../src/graph.jl")
 
 g = adjlist(UInt32, is_directed=true)
 

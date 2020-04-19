@@ -13,7 +13,8 @@
 # GNU General Public License for more details.
 #
 
-using Graphs, LightGraphs, DataStructures, SparseArrays, Logging
+using Graphs, LightGraphs, DataStructures, 
+	SparseArrays, LinearAlgebra, Logging
 
 const G = Graphs
 const LG = LightGraphs
@@ -65,12 +66,12 @@ function get_basic_stats(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1
 end
 
 """
-    get_basic_stats(g::LightGraphs.AbstractGraph{T}) where {T<:Unsigned}
+    get_basic_stats(g::LG.AbstractGraph{T}) where {T<:Unsigned}
 
 get # vertices, # of edges and density
 NB: for computing density, we assume a directed graph
 """
-function get_basic_stats(g::LightGraphs.AbstractGraph{T}) where {T<:Unsigned}
+function get_basic_stats(g::LG.AbstractGraph{T}) where {T<:Unsigned}
 	nvs = nv(g)
 	nes = ne(g)
 	density = nes/(nvs*(nvs-1))
@@ -104,13 +105,13 @@ function get_out_degree_stats(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T
 end
 
 """
-    get_out_degree_stats(g::LightGraphs.AbstractGraph{T}) where {T<:Unsigned}
+    get_out_degree_stats(g::LG.AbstractGraph{T}) where {T<:Unsigned}
 
 get out degree stats
 
 retuns avg out-degree, max out-degree, array of sinks vertices
 """
-function get_out_degree_stats(g::LightGraphs.AbstractGraph{T}) where {T<:Unsigned}
+function get_out_degree_stats(g::LG.AbstractGraph{T}) where {T<:Unsigned}
 	sum = 0
 	sinks = T[]
 	max_degree = 0
@@ -148,11 +149,11 @@ function get_sinks(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}) wh
 end
 
 """ 
-    get_sinks(g::LightGraphs.AbstractGraph{T}) where {T<:Unsigned}
+    get_sinks(g::LG.AbstractGraph{T}) where {T<:Unsigned}
 
 get array of sink vertices in the specified graph
 """
-function get_sinks(g::LightGraphs.AbstractGraph{T}) where {T<:Unsigned}
+function get_sinks(g::LG.AbstractGraph{T}) where {T<:Unsigned}
 	sinks = T[]
 	vs = LG.vertices(g)
 	for v in vs
@@ -181,11 +182,11 @@ function get_sources(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}) 
 end
 
 """ 
-    get_sources(g::LightGraphs.AbstractGraph{T}) where {T<:Unsigned}
+    get_sources(g::LG.AbstractGraph{T}) where {T<:Unsigned}
 
 get array of source vertices in the specified graph
 """
-function get_sources(g::LightGraphs.AbstractGraph{T}) where {T<:Unsigned}
+function get_sources(g::LG.AbstractGraph{T}) where {T<:Unsigned}
 	achildren = T[]
 	vs = LG.vertices(g)
 	for v in vs
@@ -241,11 +242,11 @@ function subgraph(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},sids
 end
 
 """ 
-    subgraph(g::LightGraphs.AbstractGraph{T},sids::Array{T,1}) where {T<:Unsigned}
+    subgraph(g::LG.AbstractGraph{T},sids::Array{T,1}) where {T<:Unsigned}
 
 get the subgraph of g induced by the set of vertices sids
 """
-function subgraph(g::LightGraphs.AbstractGraph{T},sids::Array{T,1}) where {T<:Unsigned}
+function subgraph(g::LG.AbstractGraph{T},sids::Array{T,1}) where {T<:Unsigned}
 	ng = SimpleDiGraph{T}()
 	# nvs should be sorted in acending order
 	nvs = sort(sids)
@@ -330,12 +331,12 @@ function subgraph_streamed(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1}
 end
 
 """ 
-    subgraph_streamed(g::LightGraphs.AbstractGraph{T},sids::Array{T,1},name::String) where {T<:Unsigned}
+    subgraph_streamed(g::LG.AbstractGraph{T},sids::Array{T,1},name::String) where {T<:Unsigned}
 
 get the subgraph of g induced by the set of vertices sids
 write the subgraph in MGS format v2
 """
-function subgraph_streamed(g::LightGraphs.AbstractGraph{T},sids::Array{T,1},name::String) where {T<:Unsigned}
+function subgraph_streamed(g::LG.AbstractGraph{T},sids::Array{T,1},name::String) where {T<:Unsigned}
 	ng = SimpleDiGraph{T}()
 	# nvs should be sorted in acending order
 	nvs = sort(sids)
@@ -419,13 +420,13 @@ function get_core(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}) whe
 end
 
 """ 
-    get_core(g::LightGraphs.AbstractGraph{T}) where {T<:Unsigned}
+    get_core(g::LG.AbstractGraph{T}) where {T<:Unsigned}
 
 get the main SCC
 
 @returns ng (core subgraph), oni (old->new vertex indices), noi (new->old vertex indices)
 """
-function get_core(g::LightGraphs.AbstractGraph{T}) where {T<:Unsigned}
+function get_core(g::LG.AbstractGraph{T}) where {T<:Unsigned}
 	sccs = pearce_iterative(g)
 	scc_ids = union(sccs,[])
 	id_size = Dict{T,T}()
@@ -499,12 +500,12 @@ function get_core_streamed(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1}
 end
 
 """ 
-    get_core_streamed(g::LightGraphs.AbstractGraph{T},sccs::Array{T,1},name::String) where {T<:Unsigned}
+    get_core_streamed(g::LG.AbstractGraph{T},sccs::Array{T,1},name::String) where {T<:Unsigned}
 
 get the main SCC and write it to the specified file (MGS format)
 write the subgraph in MGS format v2
 """
-function get_core_streamed(g::LightGraphs.AbstractGraph{T},sccs::Array{T,1},name::String) where {T<:Unsigned}
+function get_core_streamed(g::LG.AbstractGraph{T},sccs::Array{T,1},name::String) where {T<:Unsigned}
 	scc_ids = union(sccs,[])
 	id_size = Dict{T,T}()
 
@@ -565,13 +566,13 @@ function get_reverse_graph(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1}
 end
 
 """ 
-    get_reverse_graph(g::LightGraphs.AbstractGraph{T}) where {T<:Unsigned}
+    get_reverse_graph(g::LG.AbstractGraph{T}) where {T<:Unsigned}
 
 get the reverse graph (same graph with all edge directions reversed)
 
 @returns reversed graph
 """
-function get_reverse_graph(g::LightGraphs.AbstractGraph{T}) where {T<:Unsigned}
+function get_reverse_graph(g::LG.AbstractGraph{T}) where {T<:Unsigned}
 	ng = SimpleDiGraph{T}()
 
 	# same set of vertices
@@ -611,13 +612,13 @@ function get_vertex_in_degrees(g::GenericAdjacencyList{T,Array{T,1},Array{Array{
 end
 
 """ 
-    get_vertex_in_degrees(g::LightGraphs.AbstractGraph{T}) where {T<:Unsigned}
+    get_vertex_in_degrees(g::LG.AbstractGraph{T}) where {T<:Unsigned}
 
 get in-degree of g vertices
 
 @returns dictionary (vertex_id -> in-degree)
 """
-function get_vertex_in_degrees(g::LightGraphs.AbstractGraph{T}) where {T<:Unsigned}
+function get_vertex_in_degrees(g::LG.AbstractGraph{T}) where {T<:Unsigned}
 	vin = Dict{T,T}()
 	for v in LG.vertices(g)
 		ovs = outneighbors(g,v)
@@ -649,11 +650,11 @@ function get_in_out_degrees(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1
 end
 
 """ 
-    get_in_out_degrees(g::LightGraphs.AbstractGraph{T}) where {T<:Unsigned}
+    get_in_out_degrees(g::LG.AbstractGraph{T}) where {T<:Unsigned}
 
 get in- and out- degree arrays of specified graph
 """
-function get_in_out_degrees(g::LightGraphs.AbstractGraph{T}) where {T<:Unsigned}
+function get_in_out_degrees(g::LG.AbstractGraph{T}) where {T<:Unsigned}
 	vin = get_vertex_in_degrees(g)
 	in_degrees = T[]
 	out_degrees = T[]
@@ -687,7 +688,7 @@ function get_avg_out_degree(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1
 end
 
 """ 
-    get_avg_out_degree(g::LightGraphs.AbstractGraph{T},visited::Array{T,1},p_avg::Float64=float64(-1),np_steps::UInt64=uint64(0)) where {T<:Unsigned}
+    get_avg_out_degree(g::LG.AbstractGraph{T},visited::Array{T,1},p_avg::Float64=float64(-1),np_steps::UInt64=uint64(0)) where {T<:Unsigned}
 
 get the avg out-degree of the specified set of visited nodes
 
@@ -696,7 +697,7 @@ nb_steps: number of points used to compute p_avg
 
 NB: to get the avg in-degree of visited nodes, one can use the reverse graph of g
 """
-function get_avg_out_degree(g::LightGraphs.AbstractGraph{T},visited::Array{T,1},p_avg::Float64=float64(-1),np_steps::UInt64=uint64(0)) where {T<:Unsigned}
+function get_avg_out_degree(g::LG.AbstractGraph{T},visited::Array{T,1},p_avg::Float64=float64(-1),np_steps::UInt64=uint64(0)) where {T<:Unsigned}
 	sum = float64(0)
 	for v in visited
 		sum += length(outneighbors(g,v))
@@ -755,11 +756,11 @@ function get_forward_ball(v::T,g::GenericAdjacencyList{T,Array{T,1},Array{Array{
 end
 
 """ 
-    get_forward_ball(v::T,g::LightGraphs.AbstractGraph{T},radius::Int=2,p::Float64=1) where {T<:Unsigned}
+    get_forward_ball(v::T,g::LG.AbstractGraph{T},radius::Int=2,p::Float64=1) where {T<:Unsigned}
 
 get a forward ball centered at the specified vertex
 """
-function get_forward_ball(v::T,g::LightGraphs.AbstractGraph{T},radius::Int=2,p::Float64=1) where {T<:Unsigned}
+function get_forward_ball(v::T,g::LG.AbstractGraph{T},radius::Int=2,p::Float64=1) where {T<:Unsigned}
 	# vertex ids of the ball
 	subids = T[]
 	push!(subids,v)
@@ -837,13 +838,13 @@ function get_clustering_coefficients(g::GenericAdjacencyList{T,Array{T,1},Array{
 end
 
 """ 
-    get_clustering_coefficients(g::LightGraphs.AbstractGraph{T},rg::LightGraphs.AbstractGraph{T},ntriangles::Array{T,1},density::Float64=-1.) where {T<:Unsigned}
+    get_clustering_coefficients(g::LG.AbstractGraph{T},rg::LG.AbstractGraph{T},ntriangles::Array{T,1},density::Float64=-1.) where {T<:Unsigned}
 
 get the array of clustering coefficients
 
 ncolinks: array of the number of colinks for each vertex
 """
-function get_clustering_coefficients(g::LightGraphs.AbstractGraph{T},rg::LightGraphs.AbstractGraph{T},ntriangles::Array{T,1},density::Float64=-1.) where {T<:Unsigned}
+function get_clustering_coefficients(g::LG.AbstractGraph{T},rg::LG.AbstractGraph{T},ntriangles::Array{T,1},density::Float64=-1.) where {T<:Unsigned}
 	vs = LG.vertices(g)
 	n = nv(g)
 	ccs = zeros(Float64,n)
@@ -903,13 +904,13 @@ function get_colink_coefficients(g::GenericAdjacencyList{T,Array{T,1},Array{Arra
 end
 
 """ 
-    get_colink_coefficients(g::LightGraphs.AbstractGraph{T},rg::LightGraphs.AbstractGraph{T},ncolinks::Array{T,1},density::Float64=-1.) where {T<:Unsigned}
+    get_colink_coefficients(g::LG.AbstractGraph{T},rg::LG.AbstractGraph{T},ncolinks::Array{T,1},density::Float64=-1.) where {T<:Unsigned}
 
 get the array of colink coefficients
 
 ncolinks: array of the number of colinks for each vertex
 """
-function get_colink_coefficients(g::LightGraphs.AbstractGraph{T},rg::LightGraphs.AbstractGraph{T},ncolinks::Array{T,1},density::Float64=-1.) where {T<:Unsigned}
+function get_colink_coefficients(g::LG.AbstractGraph{T},rg::LG.AbstractGraph{T},ncolinks::Array{T,1},density::Float64=-1.) where {T<:Unsigned}
 	vs = LG.vertices(g)
 	n = nv(g)
 	ccs = zeros(Float64,n)
@@ -968,11 +969,11 @@ function get_sparse_adj_matrix(g::GenericAdjacencyList{T,Array{T,1},Array{Array{
 end
 
 """ 
-    get_sparse_adj_matrix(g::LightGraphs.AbstractGraph{T}) where {T<:Unsigned}
+    get_sparse_adj_matrix(g::LG.AbstractGraph{T}) where {T<:Unsigned}
 
 get sparse adjacency matrix A
 """
-function get_sparse_adj_matrix(g::LightGraphs.AbstractGraph{T}) where {T<:Unsigned}
+function get_sparse_adj_matrix(g::LG.AbstractGraph{T}) where {T<:Unsigned}
 	I = Array{T,1}()
 	J = Array{T,1}()
 	V = Array{Float64,1}()
@@ -990,74 +991,46 @@ end
     get_sparse_P_matrix(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}) where {T<:Unsigned}
 
 get P = D^-1 A matrix
+
+NB: we assume there is no sink in the graph
 """
 function get_sparse_P_matrix(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}) where {T<:Unsigned}
-	I = Array{T,1}()
-	J = Array{T,1}()
-	V = Array{Float64,1}()
-	I2 = Array{T,1}()
-	J2 = Array{T,1}()
-	V2 = Array{Float64,1}()
-	for u in G.vertices(g)
-		for v in out_neighbors(u,g)
-			push!(I2,u)
-			push!(J2,v)
-			push!(V2,1.)
-		end
-		push!(I,u)
-		push!(J,u)
-		push!(V,1/out_degree(u,g))
-	end
-	return  sparse(I,J,V) * sparse(I2,J2,V2)
+	n = length(G.vertices(g))
+	A = get_sparse_adj_matrix(g)
+	S = dropdims(sum(A, dims=2), dims=2)
+	S = 1 ./ S
+	D = sparse(1:n,1:n,S)
+	return D*A
 end
 
 """ 
-    get_sparse_P_matrix(g::LightGraphs.AbstractGraph{T}) where {T<:Unsigned}
+    get_sparse_P_matrix(g::LG.AbstractGraph{T}) where {T<:Unsigned}
 
 get P = D^-1 A matrix
 """
-function get_sparse_P_matrix(g::LightGraphs.AbstractGraph{T}) where {T<:Unsigned}
-	I = Array{T,1}()
-	J = Array{T,1}()
-	V = Array{Float64,1}()
-	I2 = Array{T,1}()
-	J2 = Array{T,1}()
-	V2 = Array{Float64,1}()
-	for u in LG.vertices(g)
-		for v in outneighbors(g,u)
-			push!(I2,u)
-			push!(J2,v)
-			push!(V2,1.)
-		end
-		push!(I,u)
-		push!(J,u)
-		push!(V,1/outdegree(g,u))
-	end
-	return  sparse(I,J,V) * sparse(I2,J2,V2)
+function get_sparse_P_matrix(g::LG.AbstractGraph{T}) where {T<:Unsigned}
+	n = nv(g)
+	A = get_sparse_adj_matrix(g)
+	S = dropdims(sum(A, dims=2), dims=2)
+	S = 1 ./ S
+	D = sparse(1:n,1:n,S)
+	return D*A
 end
 
 """ 
-    get_sparse_symmetric_P_matrix(g::LightGraphs.AbstractGraph{T}) where {T<:Unsigned}
+    get_sparse_symmetric_P_matrix(g::LG.AbstractGraph{T}) where {T<:Unsigned}
 
-get P = D^(-1/2) A D^(-1/2) matrix
+get P = D*^(-1/2) A* D*^(-1/2) matrix with A* = (A+I)
+
+NB: we assume there is no sink in the graph
 """
-function get_sparse_symmetric_P_matrix(g::LightGraphs.AbstractGraph{T}) where {T<:Unsigned}
-	I = Array{T,1}()
-	J = Array{T,1}()
-	V = Array{Float64,1}()
-	I2 = Array{T,1}()
-	J2 = Array{T,1}()
-	V2 = Array{Float64,1}()
-	for u in LG.vertices(g)
-		for v in outneighbors(g,u)
-			push!(I2,u)
-			push!(J2,v)
-			push!(V2,1.)
-		end
-		push!(I,u)
-		push!(J,u)
-		push!(V,sqrt(1/outdegree(u,g)))
-	end
-	return  sparse(I,J,V) * sparse(I2,J2,V2)
+function get_sparse_symmetric_P_matrix(g::LG.AbstractGraph{T}) where {T<:Unsigned}
+	n = length(G.vertices(g))
+	A = get_sparse_adj_matrix(g)
+	A = A + sparse(I,n,n)
+	S = dropdims(sum(A, dims=2), dims=2)
+	S = 1 ./ sqrt.(S)
+	D = sparse(1:n,1:n,S)
+	return D*A*D
 end
 

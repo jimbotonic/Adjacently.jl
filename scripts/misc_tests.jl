@@ -16,9 +16,15 @@
 using Pkg
 Pkg.activate(normpath(joinpath(@__DIR__, "..")))
 
-include("../util.jl")
-include("../io.jl")
-include("../graph.jl")
+include("../src/util.jl")
+include("../src/io.jl")
+include("../src/graph.jl")
+
+using Graphs 
+using LightGraphs
+
+const G = Graphs
+const LG = LightGraphs
 
 #using Base.Test
 
@@ -125,21 +131,36 @@ get_huffman_codes!(t2, C, B)
 # load graph
 @info("loading MGS3 graph")
 g = adjlist(UInt32, is_directed=true)
-load_mgs3_graph(g,"../datasets/Arxiv_HEP-PH/Arxiv_HEP-PH_core.mgs")
-@info("# vertices:", length(vertices(g)))
+g2 = SimpleDiGraph(UInt32)
+
+load_mgs3_graph(g, "../datasets/Arxiv_HEP-PH/Arxiv_HEP-PH_core.mgs")
+load_mgs3_graph(g2, "../datasets/Arxiv_HEP-PH/Arxiv_HEP-PH_core.mgs")
+
+@info("# vertices:", length(G.vertices(g)))
 @info("# edges:", num_edges(g))
+
+@info("# vertices:", nv(g2))
+@info("# edges:", ne(g2))
 
 @info("getting reverse graph")
 rg = get_reverse_graph(g) 
 @info("# edges (rg):", num_edges(rg))
+rg2 = get_reverse_graph(g2) 
+@info("# edges (rg):", ne(rg2))
 
 @info("writing MGS4 graph")
 write_mgs4_graph(g, rg, "test")
+write_mgs4_graph(g2, rg2, "test2")
 
 @info("loading MGS4 graph")
-g2 = adjlist(UInt32, is_directed=true)
-load_mgs4_graph(g2,"test.mgz")
-@info("# vertices:", length(vertices(g2)))
-@info("# edges:", num_edges(g2))
+ga = adjlist(UInt32, is_directed=true)
+load_mgs4_graph(ga,"test.mgz")
+@info("# vertices:", length(G.vertices(ga)))
+@info("# edges:", num_edges(ga))
+
+gb = SimpleDiGraph(UInt32)
+load_mgs4_graph(gb,"test2.mgz")
+@info("# vertices:", nv(gb))
+@info("# edges:", ne(gb))
 
 @info("##########")
