@@ -15,6 +15,9 @@
 
 using Graphs, LightGraphs, DataStructures, Logging
 
+const G = Graphs
+const LG = LightGraphs
+
 """
     tarjan(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}) where {T<:Unsigned}
 
@@ -25,7 +28,7 @@ NB: the recursive calls may create a stack overflow error
 """
 function tarjan(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}) where {T<:Unsigned}
 	sccs = Array(Array{T,1},0)
-	n = length(vertices(g))
+	n = length(G.vertices(g))
 	indices = zeros(T,n)
 	lowlinks = zeros(T,n)
 	S = T[]
@@ -62,7 +65,7 @@ function tarjan(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}) where
 		end
 	end
 
-	for v in vertices(g)
+	for v in G.vertices(g)
 		indices[v] == 0 && visit(v)
 	end
 
@@ -77,7 +80,7 @@ Tarjan algorithm (recursive version)
 NB: successfully tested with FA core
 NB: the recursive calls may create a stack overflow error
 """
-function tarjan(g::LightGraphs.AbstractGraph{T}) where {T<:Unsigned}
+function tarjan(g::LG.AbstractGraph{T}) where {T<:Unsigned}
 	sccs = Array(Array{T,1},0)
 	n = nv(g)
 	indices = zeros(T,n)
@@ -91,7 +94,7 @@ function tarjan(g::LightGraphs.AbstractGraph{T}) where {T<:Unsigned}
 		lowlinks[v] = index
 		index += 1
 		push!(S,v)
-		children = outneighbors(v,g)
+		children = outneighbors(g,v)
 		for w in children
 			# w was not visited yet
 			if indices[w] == 0
@@ -116,7 +119,7 @@ function tarjan(g::LightGraphs.AbstractGraph{T}) where {T<:Unsigned}
 		end
 	end
 
-	for v in vertices(g)
+	for v in LG.vertices(g)
 		indices[v] == 0 && visit(v)
 	end
 
@@ -132,7 +135,7 @@ NB: successfully tested with FA core
 NB: the recursive calls may create a stack overflow error
 """
 function pearce(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}) where {T<:Unsigned}
-	n = length(vertices(g))
+	n = length(G.vertices(g))
 	rindex = zeros(T,n)
 	S = T[]
 	index = 1
@@ -162,7 +165,7 @@ function pearce(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}) where
 		end
 	end
 
-	for v in vertices(g)
+	for v in G.vertices(g)
 		if rindex[v] == 0
 			visit(v)
 		end
@@ -172,14 +175,14 @@ function pearce(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}) where
 end
 
 """
-    pearce(g::LightGraphs.AbstractGraph{T}) where {T<:Unsigned}
+    pearce(g::LG.AbstractGraph{T}) where {T<:Unsigned}
 
 Pearce version of Tarjan algorithm
 
 NB: successfully tested with FA core
 NB: the recursive calls may create a stack overflow error
 """
-function pearce(g::LightGraphs.AbstractGraph{T}) where {T<:Unsigned}
+function pearce(g::LG.AbstractGraph{T}) where {T<:Unsigned}
 	n = nv(g)
 	rindex = zeros(T,n)
 	S = T[]
@@ -191,7 +194,7 @@ function pearce(g::LightGraphs.AbstractGraph{T}) where {T<:Unsigned}
 		root = true
 		rindex[v] = index
 		index += 1
-		children = outneighbors(v,g)
+		children = outneighbors(g,v)
 		for w in children
 			rindex[w] == 0 && visit(w)
 			rindex[w] < rindex[v] && begin rindex[v] = rindex[w]; root = false end
@@ -210,7 +213,7 @@ function pearce(g::LightGraphs.AbstractGraph{T}) where {T<:Unsigned}
 		end
 	end
 
-	for v in vertices(g)
+	for v in LG.vertices(g)
 		if rindex[v] == 0
 			visit(v)
 		end
@@ -232,7 +235,7 @@ end
 Pearce version of Tarjan algorithm - iterative version
 """
 function pearce_iterative(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}) where {T<:Unsigned}
-	n = length(vertices(g))
+	n = length(G.vertices(g))
 	rindex = zeros(T,n)
 	S = T[]
 	index = 1
@@ -285,7 +288,7 @@ function pearce_iterative(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},
 		end
 	end
 
-	for v in vertices(g)
+	for v in G.vertices(g)
 		if rindex[v] == 0
 			visit(v)
 		end
@@ -295,11 +298,11 @@ function pearce_iterative(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},
 end
 
 """
-    pearce_iterative(g::LightGraphs.AbstractGraph{T) where {T<:Unsigned}
+    pearce_iterative(g::LG.AbstractGraph{T) where {T<:Unsigned}
 
 Pearce version of Tarjan algorithm - iterative version
 """
-function pearce_iterative(g::LightGraphs.AbstractGraph{T}) where {T<:Unsigned}
+function pearce_iterative(g::LG.AbstractGraph{T}) where {T<:Unsigned}
 	n = nv(g)
 	rindex = zeros(T,n)
 	S = T[]
@@ -321,7 +324,7 @@ function pearce_iterative(g::LightGraphs.AbstractGraph{T}) where {T<:Unsigned}
 				index += 1
 				active_loop = true
 			end
-			children = outneighbors(current_state.v,g)
+			children = outneighbors(g,current_state.v)
 			for w in children
 				if active_loop
 					if rindex[w] == 0
@@ -353,7 +356,7 @@ function pearce_iterative(g::LightGraphs.AbstractGraph{T}) where {T<:Unsigned}
 		end
 	end
 
-	for v in vertices(g)
+	for v in LG.vertices(g)
 		if rindex[v] == 0
 			visit(v)
 		end

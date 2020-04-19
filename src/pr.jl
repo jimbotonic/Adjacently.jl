@@ -67,11 +67,49 @@ function PR(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}, rg::Gener
 end
 
 """ 
-    PR(rg::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}, out_degrees::Array{T,1}; init_pr::Array{Float64,1}=Float64[], damping::Float64=DAMPING_FACTOR, epsilon::Float64=EPSILON, save_pr::Bool=False) where {T<:Unsigned}
+    PR(g::LG.AbstractGraph{T}, rg::LG.AbstractGraph{T}; init_pr::Array{Float64,1}=Float64[], damping::Float64=DAMPING_FACTOR, epsilon::Float64=EPSILON) where {T<:Unsigned}
+
+Naive inefficient implementation of Pagerank algorithm
+"""
+function PR(g::LG.AbstractGraph{T}, rg::LG.AbstractGraph{T}; init_pr::Array{Float64,1}=Float64[], damping::Float64=DAMPING_FACTOR, epsilon::Float64=EPSILON) where {T<:Unsigned}
+	vs = LG.vertices(g)
+	n = nv(g)
+	@info("computing Pagerank (size of graph $n)")
+	# initialize pagerank vector
+	if length(init_pr) == n
+		pr = init_pr
+	else
+		pr = Float64[1/n for k in vs]
+	end
+	pr2 = zeros(Float64,n)
+	while true
+		for v in vs
+			nv = 0.
+			# get v children in the reverse graph
+			in_nei = outneighbors(rg,v)
+			if length(in_nei) > 0
+				for p in in_nei
+					nv +=  pr[p]/length(outneighbors(g,p))
+				end
+			end
+			pr2[v] = (1-damping)/n+damping*nv
+		end
+		d = chebyshev(pr,pr2)
+		if d <= epsilon
+			pr = pr2
+			break
+		end
+		pr = copy(pr2)
+	end
+	return pr
+end
+
+""" 
+    PR(rg::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},out_degrees::Array{T,1};init_pr::Array{Float64,1}=Float64[],damping::Float64=DAMPING_FACTOR,epsilon::Float64=EPSILON,save_pr::Bool=False) where {T<:Unsigned}
 
 Naive inefficient implementation of Pagerank algorithm (designed for large graphs)
 """
-function PR(rg::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}, out_degrees::Array{T,1}; init_pr::Array{Float64,1}=Float64[], damping::Float64=DAMPING_FACTOR, epsilon::Float64=EPSILON, save_pr::Bool=False) where {T<:Unsigned}
+function PR(rg::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},out_degrees::Array{T,1};init_pr::Array{Float64,1}=Float64[],damping::Float64=DAMPING_FACTOR,epsilon::Float64=EPSILON,save_pr::Bool=False) where {T<:Unsigned}
 	vs = G.vertices(rg)
 	n = length(vs)
 	@info("computing Pagerank (size of graph $n)")
@@ -118,11 +156,62 @@ function PR(rg::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}, out_degr
 end
 
 """ 
-    PPR(src::T, g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}, rg::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}; damping::Float64=DAMPING_FACTOR, epsilon::Float64=EPSILON) where {T<:Unsigned}
+    PR(rg::LG.AbstractGraph{T},out_degrees::Array{T,1};init_pr::Array{Float64,1}=Float64[],damping::Float64=DAMPING_FACTOR,epsilon::Float64=EPSILON,save_pr::Bool=False) where {T<:Unsigned}
+
+Naive inefficient implementation of Pagerank algorithm (designed for large graphs)
+"""
+function PR(rg::LG.AbstractGraph{T},out_degrees::Array{T,1};init_pr::Array{Float64,1}=Float64[],damping::Float64=DAMPING_FACTOR,epsilon::Float64=EPSILON,save_pr::Bool=False) where {T<:Unsigned}
+	vs = LG.vertices(rg)
+	n = nv(g)
+	@info("computing Pagerank (size of graph $n)")
+	# initialize pagerank vector
+	if length(init_pr) == n
+		pr = init_pr
+	else
+		pr = Float64[1/n for k in vs]
+	end
+	pr2 = zeros(Float64, n)
+	# iteration number
+	ic = 1
+	# progression
+	thp = ceil(Int,n/100)
+	while true
+		for v in vs
+			nv = 0.
+			# get v children in the reverse graph
+			in_nei = outneighbors(rg,v)
+			if length(in_nei) > 0
+				for p in in_nei
+					nv +=  pr[p]/out_degrees[p]
+				end
+			end
+			pr2[v] = (1-damping)/n+damping*nv
+			if v % thp == 0
+				# log progression
+				@info("iteration $ic: ", (v/n)*100, " %")
+			end
+		end
+		d = chebyshev(pr,pr2)
+		@info("distance(t,t+1) = $d")
+		if save_pr
+			serialize_to_file(pr, "pr-iter-$ic.jld")
+		end
+		ic = ic + 1
+		if d <= epsilon
+			pr = pr2
+			break
+		end
+		pr = copy(pr2)
+	end
+	return pr
+end
+
+""" 
+    PPR(src::T,g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},rg::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}};damping::Float64=DAMPING_FACTOR,epsilon::Float64=EPSILON) where {T<:Unsigned}
 
 Naive inefficient implementation of personalized Pagerank with a single source vertex
 """
-function PPR(src::T, g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}, rg::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}; damping::Float64=DAMPING_FACTOR, epsilon::Float64=EPSILON) where {T<:Unsigned}
+function PPR(src::T,g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},rg::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}};damping::Float64=DAMPING_FACTOR,epsilon::Float64=EPSILON) where {T<:Unsigned}
 	vs = G.vertices(g)
 	n = length(vs)
 	@info("computing personalized Pagerank (size of graph $n, source $src)")
@@ -156,19 +245,77 @@ function PPR(src::T, g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}, 
 	return pr
 end
 
+""" 
+    PPR(src::T,g::LG.AbstractGraph{T},rg::LG.AbstractGraph{T};damping::Float64=DAMPING_FACTOR,epsilon::Float64=EPSILON) where {T<:Unsigned}
+
+Naive inefficient implementation of personalized Pagerank with a single source vertex
+"""
+function PPR(src::T,g::LG.AbstractGraph{T},rg::LG.AbstractGraph{T};damping::Float64=DAMPING_FACTOR,epsilon::Float64=EPSILON) where {T<:Unsigned}
+	vs = LG.vertices(g)
+	n = nv(g)
+	@info("computing personalized Pagerank (size of graph $n, source $src)")
+	# initialize pagerank vector
+	pr = [0. for k in vs]
+	pr[src] = 1.
+	pr2 = zeros(Float64, n)
+	while true
+		for v in vs
+			nv = 0.
+			# get v children in the reverse graph
+			in_nei = outneighbors(rg,v)
+			if length(in_nei) > 0
+				for p in in_nei
+					nv +=  pr[p]/length(outneighbors(g,p))
+				end
+			end
+			if v == src
+				pr2[v] = (1-damping)+damping*nv
+			else
+				pr2[v] = damping*nv
+			end
+		end
+		d = chebyshev(pr,pr2)
+		if d <= epsilon
+			pr = pr2
+			break
+		end
+		pr = copy(pr2)
+	end
+	return pr
+end
+
 ###
 # Monte-Carlo Pagerank algorithm
 ###
 
 """ 
-    PR(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}, n_cycles::Int; damping::Float64=DAMPING_FACTOR, epsilon::Float64=EPSILON) where {T<:Unsigned}
+    PR(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},n_cycles::Int;damping::Float64=DAMPING_FACTOR,epsilon::Float64=EPSILON) where {T<:Unsigned}
 
 MC Pagerank with cyclic start of complete path stopping at sink nodes
 http://www-sop.inria.fr/members/Konstantin.Avratchenkov/pubs/mc.pdf
 """
-function PR(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}, n_cycles::Int; damping::Float64=DAMPING_FACTOR, epsilon::Float64=EPSILON) where {T<:Unsigned}
+function PR(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},n_cycles::Int;damping::Float64=DAMPING_FACTOR,epsilon::Float64=EPSILON) where {T<:Unsigned}
 	vs = G.vertices(g)
 	n = length(vs)
+	vv = zeros(Float64, n)
+	@info("computing Monte-Carlo Pagerank (size of graph $n)")
+	for i in 1:n_cycles
+		for v in vs
+			vv += RW_aggregated(g, (1-damping), v)
+		end
+	end
+	return vv/sum(vv)
+end
+
+""" 
+    PR(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},n_cycles::Int;damping::Float64=DAMPING_FACTOR,epsilon::Float64=EPSILON) where {T<:Unsigned}
+
+MC Pagerank with cyclic start of complete path stopping at sink nodes
+http://www-sop.inria.fr/members/Konstantin.Avratchenkov/pubs/mc.pdf
+"""
+function PR(g::LG.AbstractGraph{T},n_cycles::Int;damping::Float64=DAMPING_FACTOR,epsilon::Float64=EPSILON) where {T<:Unsigned}
+	vs = LG.vertices(g)
+	n = nv(g)
 	vv = zeros(Float64, n)
 	@info("computing Monte-Carlo Pagerank (size of graph $n)")
 	for i in 1:n_cycles

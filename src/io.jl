@@ -228,6 +228,54 @@ function load_mgs1_graph(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1
 end
 
 """ 
+    load_mgs1_graph(g::LG.AbstractGraph{T},name::AbstractString) where {T<:Unsigned}
+
+load graph in format MGS v1
+"""
+function load_mgs1_graph(g::LG.AbstractGraph{T},name::AbstractString) where {T<:Unsigned}
+	ipos = OrderedDict{T,T}()
+	children = T[]
+
+	load_mgs1_graph_index(ipos,"$name.index")
+	load_graph_data(children,"$name.data")
+
+	# ipos is an ordered dictionary
+	ks = collect(keys(ipos))
+	# vertex set
+	vs = sort(union(children,ks))
+
+	# add vertices
+    LG.add_vertices!(g,length(vs))
+
+	# instantiate dictionary
+	oni = Dict{T,T}()
+
+	counter = convert(T,1)
+	for v in vs
+		oni[v] = counter
+		counter += convert(T,1)
+	end
+
+	# add edges
+	for i in 1:length(ks)
+		source = oni[ks[i]]
+		# if we reached the last parent vertex
+		if i == length(ks)
+			pos1 = ipos[ks[i]]
+			pos2 = length(children)
+		else
+			pos1 = ipos[ks[i]]
+			pos2 = ipos[ks[i+1]]-1
+		end
+		for p in pos1:pos2
+			target = oni[children[p]]
+			LG.add_edge!(g,source,target)
+		end
+	end
+	return g,oni
+end
+
+""" 
     load_mgs2_graph(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},name::AbstractString) where {T<:Unsigned}
 
 load graph in format MGS v2
@@ -264,6 +312,45 @@ function load_mgs2_graph(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1
 		for p in pos1:pos2
 			target = children[p]
 			G.add_edge!(g,source,target)
+		end
+	end
+end
+
+""" 
+    load_mgs2_graph(g::LG.AbstractGraph{T},name::AbstractString) where {T<:Unsigned}
+
+load graph in format MGS v2
+"""
+function load_mgs2_graph(g::LG.AbstractGraph{T},name::AbstractString) where {T<:Unsigned}
+	pos = T[]
+	children = T[]
+
+	load_mgs2_graph_index(pos,"$name.index")
+	load_graph_data(children,"$name.data")
+
+	#@debug("#pos:",length(pos))
+	#@debug("#children:",length(children))
+
+	# vertex set
+	vs = range(1,length(pos))
+
+	# add vertices
+	LG.add_vertices!(g,length(vs))
+
+	# add edges
+	for i in 1:length(vs)
+		source = convert(T,i)
+		# if we reached the last parent vertex
+		if i == length(vs)
+			pos1 = pos[i]
+			pos2 = length(children)
+		else
+			pos1 = pos[i]
+			pos2 = pos[i+1]-1
+		end
+		for p in pos1:pos2
+			target = children[p]
+			LG.add_edge!(g,source,target)
 		end
 	end
 end
@@ -343,7 +430,7 @@ function write_mgs3_graph(g::LG.AbstractGraph{T}, filename::AbstractString) wher
 	vs = LG.vertices(g)
 	cpos = convert(T,1)
 	for v in vs
-		ovs = outneighbors(v,g)
+		ovs = outneighbors(g,v)
 		push!(pos,cpos)
 		for o in ovs
 			push!(children,o)	
@@ -483,11 +570,11 @@ function load_mgs3_graph(g::LG.AbstractGraph{T}, filename::AbstractString) where
 end
 
 """
-    write_mgs4_graph(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}, rg::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}, filename::AbstractString) where {T<:Unsigned}
+    write_mgs4_graph(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},rg::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},filename::AbstractString) where {T<:Unsigned}
 
 load graph in format MGS v4
 """
-function write_mgs4_graph(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}, rg::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}, filename::AbstractString) where {T<:Unsigned}
+function write_mgs4_graph(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},rg::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},filename::AbstractString) where {T<:Unsigned}
   	# 8 bytes: 7 bytes string + 1 byte: 'MGSv4  ' + <8bits T size>
 	# 4 bytes (32bits): offset in size_t of graph data section (i.e. # of vertices)
   	version = 0x4d475376342020
@@ -591,11 +678,11 @@ function write_mgs4_graph(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},
 end
 
 """
-    write_mgs4_graph(g::LG.AbstractGraph{T}, rg::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}, filename::AbstractString) where {T<:Unsigned}
+    write_mgs4_graph(g::LG.AbstractGraph{T}, rg::LG.AbstractGraph{T},filename::AbstractString) where {T<:Unsigned}
 
 load graph in format MGS v4
 """
-function write_mgs4_graph(g::LG.AbstractGraph{T}, rg::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}, filename::AbstractString) where {T<:Unsigned}
+function write_mgs4_graph(g::LG.AbstractGraph{T}, rg::LG.AbstractGraph{T},filename::AbstractString) where {T<:Unsigned}
   	# 8 bytes: 7 bytes string + 1 byte: 'MGSv4  ' + <8bits T size>
 	# 4 bytes (32bits): offset in size_t of graph data section (i.e. # of vertices)
   	version = 0x4d475376342020
@@ -611,9 +698,9 @@ function write_mgs4_graph(g::LG.AbstractGraph{T}, rg::GenericAdjacencyList{T,Arr
 	in_degrees = T[]
 	cpos = convert(T,1)
 	for v in vs
-		ovs = outneighbors(v,g)
+		ovs = outneighbors(g,v)
 		push!(pos,cpos)
-		push!(in_degrees,length(outneighbors(v,rg)))
+		push!(in_degrees,length(outneighbors(rg,v)))
 		for o in ovs
 			push!(children,o)	
 			cpos += convert(T,1)
@@ -758,7 +845,7 @@ function load_mgs4_graph(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1
 	
 	@info("generating graph")
 	# vertex set
-	vs = range(1,length(pos))
+	vs = range(1,stop=length(pos))
 
 	@info("adding vertices")
 	# add vertices
@@ -845,7 +932,7 @@ function load_mgs4_graph(g::LG.AbstractGraph{T}, filename::AbstractString) where
 	
 	@info("generating graph")
 	# vertex set
-	vs = range(1,length(pos))
+	vs = range(1,stop=length(pos))
 
 	@info("adding vertices")
 	# add vertices
