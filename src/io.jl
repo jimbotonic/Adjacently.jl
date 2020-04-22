@@ -194,7 +194,7 @@ function load_mgs1_graph(g::AbstractGraph{T},name::AbstractString) where {T<:Uns
 	# add vertices
     add_vertices!(g,length(vs))
 
-	# instantiate dictionary
+	# dictionary old -> new vertex indices
 	oni = Dict{T,T}()
 
 	counter = convert(T,1)
@@ -219,7 +219,8 @@ function load_mgs1_graph(g::AbstractGraph{T},name::AbstractString) where {T<:Uns
 			add_edge!(g,source,target)
 		end
 	end
-	return g,oni
+
+	return oni
 end
 
 """ 
@@ -565,7 +566,7 @@ end
 
 load graph from CSV adjacency list
 """
-function load_adjacency_list_from_csv(::Type{T},g::AbstractGraph{T},filename::AbstractString,separator::Char=' ') where {T<:Unsigned}
+function load_adjacency_list_from_csv(::Type{T},g::AbstractGraph{T},filename::AbstractString,separator::Char=',') where {T<:Unsigned}
 	f = open(filename,"r")
 	oni = Dict{T,T}()
 	edges = Array{Tuple{T,T},1}()
@@ -594,10 +595,11 @@ function load_adjacency_list_from_csv(::Type{T},g::AbstractGraph{T},filename::Ab
 	add_vertices!(g,length(keys(oni)))
 	
 	# add edges
-	for i in 1:length(edges)
-		egde = edges[i]
-		add_edge!(g, edges[i][1], edges[i][2])	
+	for edge in edges
+		add_edge!(g, edge[1], edge[2])	
 	end
+
+	return oni
 end
 
 """ 
@@ -609,6 +611,8 @@ function load_graph_from_pajek(::Type{T},g::AbstractGraph{T},filename::AbstractS
 	f = open(filename,"r")
 	inside_vertices_section = false
 	inside_edges_section = false
+	vdict = Dict{UInt32, UInt32}()
+	vcounter = convert(T,1)
 	while !eof(f)
 		line = lowercase(strip(readline(f)))
 		if !startswith(line, "%")
@@ -622,10 +626,14 @@ function load_graph_from_pajek(::Type{T},g::AbstractGraph{T},filename::AbstractS
 			end
 			if inside_vertices_section
 				sa = split(line, ' ')
-        			add_vertex!(g, parse(T,sa[1]))
+				vdict[parse(T,sa[1])] = vcounter
+				vcounter += convert(T,1)	
+        		add_vertex!(g)
 			elseif inside_edges_section
 				sa = split(line, ' ')
-				add_edge!(g, parse(T, sa[1]), parse(T,sa[2]))
+				vs = vdict[parse(T,sa[1])]
+				vt = vdict[parse(T,sa[2])]
+				add_edge!(g,vs,vt)
 			end
 		end
 	end
