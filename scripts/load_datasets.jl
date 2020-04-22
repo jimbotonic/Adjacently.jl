@@ -20,21 +20,23 @@ include("../src/util.jl")
 include("../src/io.jl")
 include("../src/graph.jl")
 
-#Logging.configure(level=INFO)
+#Logging.configure(level=Debug)
 
-function load_dataset(input_path::AbstractString,output_filename::AbstractString,is_pajek=false) where {T<:Unsigned}
+using GraphPlot
+
+function load_dataset(input_path::AbstractString,output_filename::AbstractString;is_pajek=false) where {T<:Unsigned}
 	g = SimpleDiGraph{UInt32}()
 	if !is_pajek
 		load_adjacency_list_from_csv(UInt32, g, input_path)
 	else
 	    load_graph_from_pajek(UInt32, g, input_path)
 	end
-	@info("# vertices:", nv(g))
+	@info("# vertices:", convert(Int,nv(g)))
 	@info("# edges:", ne(g))
 
 	@info("getting core")
 	core,oni,noi = get_core(g)
-	@info("# vertices:", nv(core))
+	@info("# vertices:", convert(Int,nv(core)))
 	@info("# edges:", ne(core))
 
 	@info("getting reverse graph")
@@ -68,5 +70,5 @@ elseif dataset == "arxiv"
 	load_dataset("../datasets/Arxiv_HEP-PH/Cit-HepPh.txt", "Arxiv_HEP-PH_core")
 elseif dataset == "eat"
 	@info("loading EAT (new) graph")
-	load_dataset("../datasets/EAT/EATnew.net", "EAT_rcore", pajek=true)
+	load_dataset("../datasets/EAT/EATnew.net", "EAT_rcore", is_pajek=true)
 end

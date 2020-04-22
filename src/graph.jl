@@ -131,12 +131,16 @@ end
 get the subgraph of g induced by the set of vertices sids
 """
 function subgraph(g::AbstractGraph{T},sids::Array{T,1}) where {T<:Unsigned}
-	ng = SimpleDiGraph{T}()
+	if typeof(g) == SimpleDiGraph{T}
+		ng = SimpleDiGraph{T}()
+	else
+		ng = SimpleGraph{T}()
+	end
 	# nvs should be sorted in ascending order
 	nvs = sort(sids)
 
 	# add vertices
-	add_vertices!(g,length(nvs))
+	add_vertices!(ng,length(nvs))
 
 	# old id -> new id
 	oni = Dict{T,T}()
@@ -224,6 +228,7 @@ function get_core(g::AbstractGraph{T}) where {T<:Unsigned}
 	scc_ids = union(sccs,[])
 	id_size = Dict{T,T}()
 
+	# compute the size of each SCC
 	for id in scc_ids
 		id_size[id] = 0
 	end
@@ -246,7 +251,7 @@ function get_core(g::AbstractGraph{T}) where {T<:Unsigned}
 	counter = convert(T,1)
 	for id in sccs
 		id == mid && push!(sids,counter)
-		counter = convert(T,counter+1)
+		counter += convert(T,1)
 	end
 
 	@debug("# core vids: ", length(sids))
