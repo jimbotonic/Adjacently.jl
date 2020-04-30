@@ -1,14 +1,18 @@
-# Julia Complex Networks Library
+# Adjancently.jl 
 
-### Dependencies
-```
+Adjancently.jl is Julia library for the analysis of large complex networks.
 
-import Pkg;
-Pkg.add("DataStructures")
-Pkg.add("Graphs")
-Pkg.add("HDF5")
-Pkg.add("JLD")
-Pkg.add("Distances")
-
+### Launch Notebooks
 
 ```
+julia> using IJulia
+julia> notebook()
+```
+
+### Add New Dependencies
+
+```
+pkg> activate .
+pkg> add {package-name}
+```
+

@@ -1,5 +1,5 @@
 #
-# JCNL: Julia Complex Networks Library
+# Adjacently: Julia Complex Networks Library
 # Copyright (C) 2016-2020 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
 #
 # This program is free software: you can redistribute it and/or modify
@@ -13,15 +13,19 @@
 # GNU General Public License for more details.
 #
 
-using Graphs, DataStructures, Logging
+using LightGraphs, DataStructures, Logging
 
-# Tarjan algorithm (recursive version)
-#
-# NB: successfully tested with FA core
-# NB: the recursive calls may create a stack overflow error
-function tarjan(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}) where {T<:Unsigned}
+"""
+    tarjan(g::AbstractGraph{T}) where {T<:Unsigned}
+
+Tarjan algorithm (recursive version)
+
+NB: successfully tested with FA core
+NB: the recursive calls may create a stack overflow error
+"""
+function tarjan(g::AbstractGraph{T}) where {T<:Unsigned}
 	sccs = Array(Array{T,1},0)
-	n = length(vertices(g))
+	n = nv(g)
 	indices = zeros(T,n)
 	lowlinks = zeros(T,n)
 	S = T[]
@@ -33,7 +37,7 @@ function tarjan(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}) where
 		lowlinks[v] = index
 		index += 1
 		push!(S,v)
-		children = out_neighbors(v,g)
+		children = outneighbors(g,v)
 		for w in children
 			# w was not visited yet
 			if indices[w] == 0
@@ -65,12 +69,16 @@ function tarjan(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}) where
 	return sccs
 end
 
-# Pearce version of Tarjan algorithm
-#
-# NB: successfully tested with FA core
-# NB: the recursive calls may create a stack overflow error
-function pearce(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}) where {T<:Unsigned}
-	n = length(vertices(g))
+"""
+    pearce(g::AbstractGraph{T}) where {T<:Unsigned}
+
+Pearce version of Tarjan algorithm
+
+NB: successfully tested with FA core
+NB: the recursive calls may create a stack overflow error
+"""
+function pearce(g::AbstractGraph{T}) where {T<:Unsigned}
+	n = nv(g)
 	rindex = zeros(T,n)
 	S = T[]
 	index = 1
@@ -81,7 +89,7 @@ function pearce(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}) where
 		root = true
 		rindex[v] = index
 		index += 1
-		children = out_neighbors(v,g)
+		children = outneighbors(g,v)
 		for w in children
 			rindex[w] == 0 && visit(w)
 			rindex[w] < rindex[v] && begin rindex[v] = rindex[w]; root = false end
@@ -110,23 +118,27 @@ function pearce(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}) where
 end
 
 # Pearce algorithm state
-mutable struct state{T}
+mutable struct State{T}
 	v::T
 	stage::T
 	root::Bool
 end
 
-# Pearce version of Tarjan algorithm - iterative version
-function pearce_iterative(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}) where {T<:Unsigned}
-	n = length(vertices(g))
+"""
+    pearce_iterative(g::AbstractGraph{T) where {T<:Unsigned}
+
+Pearce version of Tarjan algorithm - iterative version
+"""
+function pearce_iterative(g::AbstractGraph{T}) where {T<:Unsigned}
+	n = nv(g)
 	rindex = zeros(T,n)
 	S = T[]
 	index = 1
 	c = n-1
 
 	function visit(v)
-		states = state[]
-		current_state = state(v,convert(T,0),true)
+		states = State[]
+		current_state = State(v,convert(T,0),true)
 		push!(states, current_state)
 
 		@label start
@@ -139,14 +151,14 @@ function pearce_iterative(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},
 				index += 1
 				active_loop = true
 			end
-			children = out_neighbors(current_state.v,g)
+			children = outneighbors(g,current_state.v)
 			for w in children
 				if active_loop
 					if rindex[w] == 0
 						current_state.stage = w
 						push!(states,current_state)
 
-						new_state = state(w,convert(T,0),true)
+						new_state = State(w,convert(T,0),true)
 						push!(states,new_state)
 						@goto start
 					end
@@ -179,4 +191,3 @@ function pearce_iterative(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},
 
 	return rindex
 end
-
