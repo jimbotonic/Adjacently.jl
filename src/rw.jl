@@ -1,5 +1,5 @@
 #
-# JCNL: Julia Complex Networks Library
+# Adjacently: Julia Complex Networks Library
 # Copyright (C) 2016-2020 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
 #
 # This program is free software: you can redistribute it and/or modify
@@ -13,18 +13,21 @@
 # GNU General Public License for more details.
 #
 
-using Graphs
+using LightGraphs
 
-# Random Walk
-#
-# proceeds for n_steps starting from the specified vertex id
-#
-# @return the list of visited nodes
-function RW(g::GenericAdjacencyList{T, Array{T,1}, Array{Array{T,1},1}}, n_steps::UInt64, starting_v::T=convert(T,1)) where {T<:Unsigned}
+""" 
+    RW(g::AbstractGraph{T},n_steps::UInt64,starting_v::T=convert(T,1)) where {T<:Unsigned}
+
+Random Walk
+
+proceeds for n_steps starting from the specified vertex id
+@return the list of visited nodes
+"""
+function RW(g::AbstractGraph{T},n_steps::UInt64,starting_v::T=convert(T,1)) where {T<:Unsigned}
 	visited_nodes =  T[]
 	v = starting_v
 	for i in 1:n_steps
-		nei = out_neighbors(v,g)
+		nei = outneighbors(g,v)
 		nv = nei[rand(1:length(nei))]
 		push!(visited_nodes,v)
 		v = nv
@@ -32,17 +35,20 @@ function RW(g::GenericAdjacencyList{T, Array{T,1}, Array{Array{T,1},1}}, n_steps
 	return visited_nodes
 end
 
-# Random Walk
-#
-# proceeds until a sink node is reached or if rand()>jumping_constant from the specified vertex id
-#
-# @return an array vid position -> # visits
-function RW_aggregated(g::GenericAdjacencyList{T, Array{T,1}, Array{Array{T,1},1}}, jumping_constant::Float64, starting_v::T=convert(T,1)) where {T<:Unsigned}
-	vv =  zeros(UInt32,length(vertices(g)))
+"""
+    RW_aggregated(g::AbstractGraph{T},jumping_constant::Float64,starting_v::T=convert(T,1)) where {T<:Unsigned}
+
+Random Walk
+
+proceeds until a sink node is reached or if rand()>jumping_constant from the specified vertex id
+@return an array vid position -> # visits
+"""
+function RW_aggregated(g::AbstractGraph{T},jumping_constant::Float64,starting_v::T=convert(T,1)) where {T<:Unsigned}
+	vv =  zeros(UInt32,nv(g))
 	v = starting_v
 	vv[v] = 1
 	while rand() > jumping_constant
-		nei = out_neighbors(v,g)
+		nei = outneighbors(g,v)
 		length(nei) == 0 && break
 		nv = nei[rand(1:length(nei))]
 		vv[nv] += 1
@@ -51,17 +57,20 @@ function RW_aggregated(g::GenericAdjacencyList{T, Array{T,1}, Array{Array{T,1},1
 	return vv
 end
 
-# Random Walk
-#
-# proceeds for n_steps starting from the specified vertex id
-#
-# @return an array vid position -> # visits
-function RW_aggregated(g::GenericAdjacencyList{T, Array{T,1}, Array{Array{T,1},1}}, n_steps::UInt64, starting_v::T=convert(T,1)) where {T<:Unsigned}
-	vv =  zeros(UInt32,length(vertices(g)))
+""" 
+    RW_aggregated(g::AbstractGraph{T},n_steps::UInt64,starting_v::T=convert(T,1)) where {T<:Unsigned}
+
+Random Walk
+
+proceeds for n_steps starting from the specified vertex id
+@return an array vid position -> # visits
+"""
+function RW_aggregated(g::AbstractGraph{T},n_steps::UInt64,starting_v::T=convert(T,1)) where {T<:Unsigned}
+	vv =  zeros(UInt32,nv(g))
 	v = starting_v
 	vv[v] = 1
 	for i in 1:n_steps
-		nei = out_neighbors(v,g)
+		nei = outneighbors(g,v)
 		nv = nei[rand(1:length(nei))]
 		vv[nv] += 1
 		v = nv
@@ -69,14 +78,17 @@ function RW_aggregated(g::GenericAdjacencyList{T, Array{T,1}, Array{Array{T,1},1
 	return vv
 end
 
-# Uniform sampling
-#
-# proceeds for n_steps 
-#
-# @return the list of sampled vertices
-function US(g::GenericAdjacencyList{T, Array{T,1}, Array{Array{T,1},1}}, n_steps::UInt64) where {T<:Unsigned}
+""" 
+    US(g::AbstractGraph{T},n_steps::UInt64) where {T<:Unsigned}
+
+Uniform sampling
+
+proceeds for n_steps 
+@return the list of sampled vertices
+"""
+function US(g::AbstractGraph{T},n_steps::UInt64) where {T<:Unsigned}
 	visited_nodes =  T[]
-	n = length(vertices(g))
+	n = nv(g)
 	for i in 1:n_steps
 		pv = convert(T,rand(1:n))
 		push!(visited_nodes,pv)
@@ -84,9 +96,13 @@ function US(g::GenericAdjacencyList{T, Array{T,1}, Array{Array{T,1},1}}, n_steps
 	return visited_nodes
 end
 
-# get the flying index (select a child with a probability equals to its score)
-#
-# @input array of child scores
+""" 
+    get_flying_index(a::Array{Float64,1})
+
+get the flying index (select a child with a probability equals to its score)
+
+@input array of child scores
+"""
 function get_flying_index(a::Array{Float64,1})
 	r = rand()
 	sum = 0.
@@ -102,17 +118,21 @@ function get_flying_index(a::Array{Float64,1})
 	return -1
 end
 
-# Avoiding Random Walk
-#
-# rd: stochastic repulsive vector
-# @return an array vid position -> # visits
-function ARW(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}, n_steps::UInt64, rd::Array{Float64,1}, starting_v::T=convert(T,1)) where {T<:Unsigned}
+"""
+    ARW(g::AbstractGraph{T},n_steps::UInt64,rd::Array{Float64,1},starting_v::T=convert(T,1)) where {T<:Unsigned}
+
+Avoiding Random Walk
+
+rd: stochastic repulsive vector
+@return an array vid position -> # visits
+"""
+function ARW(g::AbstractGraph{T},n_steps::UInt64,rd::Array{Float64,1},starting_v::T=convert(T,1)) where {T<:Unsigned}
 	visited_nodes =  T[]
 	v = starting_v
 	push!(visited_nodes,v)
 	rejected = 0
 	for i in 1:n_steps
-		nei = out_neighbors(v,g)
+		nei = outneighbors(g,v)
 		if length(nei) > 1
 			# select a child randomly
 			rpos = rand(1:length(nei))
@@ -135,18 +155,22 @@ function ARW(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}, n_steps:
 	return visited_nodes, rejected
 end
 
-# Avoiding Random Walk (flying mode)
-#
-# NB: flying mode avoids to get stuck at a given node and thus to sample nodes more efficiently
-#
-# @input rd: stochastic repulsive vector
-# @return an array vid position -> # visits
-function ARW_flying(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}, n_steps::UInt64, rd::Array{Float64,1}, starting_v::T=convert(T,1)) where {T<:Unsigned}
+""" 
+    ARW_flying(g::AbstractGraph{T},n_steps::UInt64,rd::Array{Float64,1},starting_v::T=convert(T,1)) where {T<:Unsigned}
+
+Avoiding Random Walk (flying mode)
+
+NB: flying mode avoids to get stuck at a given node to sample nodes more efficiently
+
+@input rd: stochastic repulsive vector
+@return an array vid position -> # visits
+"""
+function ARW_flying(g::AbstractGraph{T},n_steps::UInt64,rd::Array{Float64,1},starting_v::T=convert(T,1)) where {T<:Unsigned}
 	visited_nodes =  T[]
 	v = starting_v
 	push!(visited_nodes,v)
 	for i in 1:n_steps
-		nei = out_neighbors(v,g)
+		nei = outneighbors(g,v)
 		if length(nei) > 1
 			# compute repulsive scores of neighbors
 			scores = stochastic([rd[v]/rd[i] for i in nei])
@@ -162,19 +186,23 @@ function ARW_flying(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}, n
 	return visited_nodes
 end
 
-# Metropolis-Hasting Random Walk
-#
-# NB: in the case of undirected graphs, MHRW corrects the sampling bias by avoiding high degree nodes
-# NB: but in the case of directed graphs, the strategy to adopt is less clear
-#
-# @return an array vid position -> # visits
-function MHRW(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}, n_steps::UInt64, in_degrees::Array{T,1}, out_degrees::Array{T,1},starting_v::T=convert(T,1)) where {T<:Unsigned}
+""" 
+    MHRW(g::AbstractGraph{T},n_steps::UInt64,in_degrees::Array{T,1},out_degrees::Array{T,1},starting_v::T=convert(T,1)) where {T<:Unsigned}
+
+Metropolis-Hasting Random Walk
+
+NB: in the case of undirected graphs, MHRW corrects the sampling bias by avoiding high degree nodes
+NB: but in the case of directed graphs, the strategy to adopt is less clear
+
+@return an array vid position -> # visits
+"""
+function MHRW(g::AbstractGraph{T},n_steps::UInt64,in_degrees::Array{T,1},out_degrees::Array{T,1},starting_v::T=convert(T,1)) where {T<:Unsigned}
 	visited_nodes =  T[]
 	v = starting_v
 	push!(visited_nodes,v)
 	rejected = 0
 	for i in 1:n_steps
-		nei = out_neighbors(v,g)
+		nei = outneighbors(g,v)
 		if length(nei) > 1
 			# choose a child uniformly at random
 			rpos = rand(1:length(nei))
@@ -198,15 +226,18 @@ function MHRW(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}, n_steps
 	return visited_nodes, rejected
 end
 
-# Metropolis-Hasting Random Walk (flying mode)
-#
-# @return an array vid position -> # visits
-function MHRW_flying(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}, n_steps::UInt64, in_degrees::Array{T,1}, out_degrees::Array{T,1},starting_v::T=convert(T,1)) where {T<:Unsigned}
+"""
+    MHRW_flying(g::AbstractGraph{T},n_steps::UInt64,in_degrees::Array{T,1},out_degrees::Array{T,1},starting_v::T=convert(T,1)) where {T<:Unsigned}
+
+Metropolis-Hasting Random Walk (flying mode)
+@return an array vid position -> # visits
+"""
+function MHRW_flying(g::AbstractGraph{T},n_steps::UInt64,in_degrees::Array{T,1},out_degrees::Array{T,1},starting_v::T=convert(T,1)) where {T<:Unsigned}
 	visited_nodes =  T[]
 	v = starting_v
 	push!(visited_nodes,v)
 	for i in 1:n_steps
-		nei = out_neighbors(v,g)
+		nei = outneighbors(g,v)
 		if length(nei) > 1
 			# compute scores of neighbors
 			in_v = in_degrees[v]
@@ -225,17 +256,21 @@ function MHRW_flying(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}, 
 	return visited_nodes
 end
 
-# RW in flying mode guided by the colink (C1C) or clustering (C2C) coefficient
-#
-# Twitter dataset: nchains: 100, burning_time: 100, nsteps: 5000
-function CC_MHRW_flying(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}, n_steps::UInt64, ccs::Array{Float64,1}, starting_v::T=convert(T,1)) where {T<:Unsigned}
+"""
+    CC_MHRW_flying(g::AbstractGraph{T},n_steps::UInt64,ccs::Array{Float64,1},starting_v::T=convert(T,1)) where {T<:Unsigned}
+
+RW in flying mode guided by the colink (C1C) or clustering (C2C) coefficient
+
+Twitter dataset: nchains: 100, burning_time: 100, nsteps: 5000
+"""
+function CC_MHRW_flying(g::AbstractGraph{T},n_steps::UInt64,ccs::Array{Float64,1},starting_v::T=convert(T,1)) where {T<:Unsigned}
 	visited_nodes =  T[]
 	v = starting_v
 	push!(visited_nodes,v)
 	visited_distr = Dict{T,T}()
 	visited_distr[v] = 1
 	for i in 1:n_steps
-		nei = out_neighbors(v,g)
+		nei = outneighbors(g,v)
 		if length(nei) > 1
 			# compute scores of neighbors
 			scores = Float64[]
@@ -276,13 +311,17 @@ function CC_MHRW_flying(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}
 	return visited_nodes,visited_distr
 end
 
-# explore a ball centered around starting vertex with a modified random walk
-function get_CC_MHRW_flying_ball(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}, n_vertices::T, ccs::Array{Float64,1}, starting_v::T=convert(T,1),jumping_constant::Float64=0.) where {T<:Unsigned}
+""" 
+    get_CC_MHRW_flying_ball(g::AbstractGraph{T},n_vertices::T,ccs::Array{Float64,1},starting_v::T=convert(T,1),jumping_constant::Float64=0.) where {T<:Unsigned}
+
+Explore a ball centered around starting vertex with a modified random walk
+"""
+function get_CC_MHRW_flying_ball(g::AbstractGraph{T},n_vertices::T,ccs::Array{Float64,1},starting_v::T=convert(T,1),jumping_constant::Float64=0.) where {T<:Unsigned}
 	visited_nodes =  Set{T}()
 	v = starting_v
 	push!(visited_nodes, v)
 	while length(visited_nodes) < n_vertices
-		nei = out_neighbors(v,g)
+		nei = outneighbors(g,v)
 		#@debug("# children $v: ", length(nei))
 		diff = collect(setdiff(Set(nei),visited_nodes))
 		#@debug("# unvisited children $v: ", length(diff))

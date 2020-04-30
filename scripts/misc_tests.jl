@@ -1,5 +1,5 @@
 #
-# JCNL: Julia Complex Networks Library
+# Adjacently: Julia Complex Networks Library
 # Copyright (C) 2016-2020 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
 #
 # This program is free software: you can redistribute it and/or modify
@@ -13,9 +13,12 @@
 # GNU General Public License for more details.
 #
 
-include("../util.jl")
-include("../io.jl")
-include("../graph.jl")
+using Pkg
+Pkg.activate(normpath(joinpath(@__DIR__, "..")))
+
+include("../src/util.jl")
+include("../src/io.jl")
+include("../src/graph.jl")
 
 #using Base.Test
 
@@ -121,22 +124,24 @@ get_huffman_codes!(t2, C, B)
 
 # load graph
 @info("loading MGS3 graph")
-g = adjlist(UInt32, is_directed=true)
-load_mgs3_graph(g,"../datasets/Arxiv_HEP-PH/Arxiv_HEP-PH_core.mgs")
-@info("# vertices:", length(vertices(g)))
-@info("# edges:", num_edges(g))
+g = SimpleDiGraph{UInt32}()
+
+load_mgs3_graph(g, "../datasets/Arxiv_HEP-PH/Arxiv_HEP-PH_core.mgs")
+
+@info("# vertices:", nv(g))
+@info("# edges:", ne(g))
 
 @info("getting reverse graph")
 rg = get_reverse_graph(g) 
-@info("# edges (rg):", num_edges(rg))
+@info("# edges (rg):", ne(rg))
 
 @info("writing MGS4 graph")
 write_mgs4_graph(g, rg, "test")
 
 @info("loading MGS4 graph")
-g2 = adjlist(UInt32, is_directed=true)
-load_mgs4_graph(g2,"test.mgz")
-@info("# vertices:", length(vertices(g2)))
-@info("# edges:", num_edges(g2))
+gb = SimpleDiGraph{UInt32}()
+load_mgs4_graph(gb,"test.mgz")
+@info("# vertices:", nv(gb))
+@info("# edges:", ne(gb))
 
 @info("##########")

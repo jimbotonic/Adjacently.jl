@@ -1,5 +1,5 @@
 #
-# JCNL: Julia Complex Networks Library
+# Adjacently: Julia Complex Networks Library
 # Copyright (C) 2016-2020 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
 #
 # This program is free software: you can redistribute it and/or modify
@@ -13,14 +13,16 @@
 # GNU General Public License for more details.
 #
 
-using Graphs, DataStructures, Logging
+using LightGraphs, DataStructures, Logging
 
 """
+    list_colinks(g::AbstractGraph{T},rg::AbstractGraph{T},filename::String) where {T<:Unsigned}
+
 Get the list of colinks
 """
-function list_colinks(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},rg::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},filename::String) where {T<:Unsigned}
+function list_colinks(g::AbstractGraph{T},rg::AbstractGraph{T},filename::String) where {T<:Unsigned}
 	vs = vertices(g)
-	n = length(vs)
+	n = nv(g)
 	io = T[]
 	# number of unique colinks per node
 	un2 = zeros(Uint64,n)
@@ -34,8 +36,8 @@ function list_colinks(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},
 	end
 	for v in vs
 		# get greater children and parents
-		gc = filter(x->x>v,out_neighbors(v,g))
-		gp = filter(x->x>v,out_neighbors(v,rg))
+		gc = filter(x->x>v,outneighbors(v,g))
+		gp = filter(x->x>v,outneighbors(v,rg))
 		inter = intersect(gc,gp)
 		for t in inter
 			append!(io,[v,t])
@@ -61,12 +63,14 @@ function list_colinks(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},
 end
 
 """
-List triangles - map
+    list_triangles_map(v::T,g::AbstractGraph{T},rg::AbstractGraph{T},dpos::Dict{T,T}) where {T<:Unsigned}
+
+	List triangles - map
 """
-function list_triangles_map(v::T,g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},rg::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},dpos::Dict{T,T}) where {T<:Unsigned}
+function list_triangles_map(v::T,g::AbstractGraph{T},rg::AbstractGraph{T},dpos::Dict{T,T}) where {T<:Unsigned}
 	candidates = (T,T,T)[]
-	gc = filter(x->dpos[x]>dpos[v],out_neighbors(v,g))
-	gp = filter(x->dpos[x]>dpos[v],out_neighbors(v,rg))
+	gc = filter(x->dpos[x]>dpos[v],outneighbors(g,v))
+	gp = filter(x->dpos[x]>dpos[v],outneighbors(rg,v))
 	#@debug("# greater children: ", length(gc))
 	#@debug("# greater parents: ", length(gp))
 	for c in gc
@@ -80,14 +84,14 @@ function list_triangles_map(v::T,g::GenericAdjacencyList{T,Array{T,1},Array{Arra
 end
 
 """
-    list_triangles_reduce(candidates::Array{(T,T,T),1},g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},io::Array{T,1}) where {T<:Unsigned}
+    list_triangles_reduce(candidates::Array{Tuple{T,T,T},1},g::AbstractGraph{T},io::Array{T,1}) where {T<:Unsigned}
 
 list triangles - reduce
 """
-function list_triangles_reduce(candidates::Array{Tuple{T,T,T},1},g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},io::Array{T,1}) where {T<:Unsigned}
+function list_triangles_reduce(candidates::Array{Tuple{T,T,T},1},g::AbstractGraph{T},io::Array{T,1}) where {T<:Unsigned}
 	count = convert(T,0)
 	for c in candidates
-		cc = out_neighbors(convert(T,c[2]),g)
+		cc = outneighbors(g,convert(T,c[2]))
 		sort!(cc)
 		if binary_search(cc,c[3]) != -1
 			append!(io,[c[1],c[2],c[3]])
@@ -98,15 +102,17 @@ function list_triangles_reduce(candidates::Array{Tuple{T,T,T},1},g::GenericAdjac
 end
 
 """
+    list_triangles_mapreduce(v::T,g::AbstractGraph{T},rg::AbstractGraph{T},dpos::Dict{T,T},io::Array{T,1}) where {T<:Unsigned}
+
 List triangles - map&reduce
 """
-function list_triangles_mapreduce(v::T,g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},rg::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},dpos::Dict{T,T},io::Array{T,1}) where {T<:Unsigned}
+function list_triangles_mapreduce(v::T,g::AbstractGraph{T},rg::AbstractGraph{T},dpos::Dict{T,T},io::Array{T,1}) where {T<:Unsigned}
 	count = convert(T,0)
 	vpos = dpos[v]
-	gc = filter(x->dpos[x]>vpos,out_neighbors(v,g))
-	gp = filter(x->dpos[x]>vpos,out_neighbors(v,rg))
+	gc = filter(x->dpos[x]>vpos,outneighbors(g,v))
+	gp = filter(x->dpos[x]>vpos,outneighbors(rg,v))
 	for c in gc
-		cc = out_neighbors(c,g)
+		cc = outneighbors(g,c)
 		sort!(cc)
 		for p in gp
 			if c != p
@@ -123,24 +129,26 @@ function list_triangles_mapreduce(v::T,g::GenericAdjacencyList{T,Array{T,1},Arra
 end
 
 """
+    init_un23_arrays(g::AbstractGraph{T},rg::AbstractGraph{T},dpos::Dict{T,T}) where {T<:Unsigned}
+
 Initialize un2 (# of colink candidates) and un3 (# of triangle candidates) array
 """
-function init_un23_arrays(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},rg::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},dpos::Dict{T,T}) where {T<:Unsigned}
+function init_un23_arrays(g::AbstractGraph{T},rg::AbstractGraph{T},dpos::Dict{T,T}) where {T<:Unsigned}
 	@debug("initializing # colink candidates + # triangle candidates arrays")
 	vs = vertices(g)
-	n = length(vs)
+	n = nv(g)
 	un2 = Uint64[]
 	un3 = Uint64[]
 	for v in vs
 		# total order relation 1
 		# get the set of greater children of vertex v
-		gc1 = filter(x->x>v,out_neighbors(v,g))
+		gc1 = filter(x->x>v,outneighbors(g,v))
 		push!(un2, length(gc1))
 
 		# total order relation 2
 		vpos = dpos[v]
-		gc2 = filter(x->dpos[x]>vpos,out_neighbors(v,g))
-		gp = filter(x->dpos[x]>vpos,out_neighbors(v,rg))
+		gc2 = filter(x->dpos[x]>vpos,outneighbors(g,v))
+		gp = filter(x->dpos[x]>vpos,outneighbors(rg,v))
 		p = length(gp)
 		c = length(gc2)
 		i = length(intersect(gp,gc2))
@@ -150,17 +158,19 @@ function init_un23_arrays(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},
 end
 
 """
+    init_mn23_arrays(g::AbstractGraph{T},rg::AbstractGraph{T}) where {T<:Unsigned}
+
 Initialize mn2 (maximum # of colinks) and mn3 (maximum # of triangles) array
 """
-function init_mn23_arrays(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},rg::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}) where {T<:Unsigned}
+function init_mn23_arrays(g::AbstractGraph{T},rg::AbstractGraph{T}) where {T<:Unsigned}
 	@debug("initializing max # colinks + max # triangles arrays")
 	vs = vertices(g)
-	n = length(vs)
+	n = nv(g)
 	mn2 = Uint64[]
 	mn3 = Uint64[]
 	for v in vs
-		parents = out_neighbors(v,rg)
-		children = out_neighbors(v,g)
+		parents = outneighbors(rg,v)
+		children = outneighbors(g,v)
 		p = length(parents)
 		c = length(children)
 		i = length(intersect(parents,children))
@@ -174,10 +184,12 @@ function init_mn23_arrays(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},
 end
 
 """
+    list_triangles(g::AbstractGraph{T},rg::AbstractGraph{T},filename::String) where {T<:Unsigned}
+
 Get the list of triangles
 """
-function list_triangles(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},rg::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},filename::String) where {T<:Unsigned}
-	n = length(vertices(g))
+function list_triangles(g::AbstractGraph{T},rg::AbstractGraph{T},filename::String) where {T<:Unsigned}
+	n = nv(g)
 	io = T[]
 	# actual number of unique triangles
 	un3 = zeros(Uint64,n)
@@ -239,7 +251,11 @@ function list_triangles(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}
 	close(f)
 end
 
-# load the colinks distribution from the specified file
+""" 
+	load_colinks_distribution(size::T,filename::String) where {T<:Unsigned}
+	
+load the colinks distribution from the specified file
+"""
 function load_colinks_distribution(size::T,filename::String) where {T<:Unsigned}
 	f = open(filename,"r")
 	d = Dict{T,T}()
@@ -269,7 +285,11 @@ function load_colinks_distribution(size::T,filename::String) where {T<:Unsigned}
 	return c_stats
 end
 
-# load the triangles distribution from the specified file
+""" 
+    load_triangles_distribution(size::T,filename::String) where {T<:Unsigned}
+
+load the triangles distribution from the specified file
+"""
 function load_triangles_distribution(size::T,filename::String) where {T<:Unsigned}
 	f = open(filename,"r")
 	d = Dict{T,T}()

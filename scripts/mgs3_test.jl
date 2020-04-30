@@ -1,5 +1,5 @@
 #
-# JCNL: Julia Complex Networks Library
+# Adjacently: Julia Complex Networks Library
 # Copyright (C) 2016-2019  Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
 #
 # This program is free software: you can redistribute it and/or modify
@@ -13,10 +13,13 @@
 # GNU General Public License for more details.
 #
 
-include("../io.jl")
-include("../graph.jl")
+using Pkg
+Pkg.activate(normpath(joinpath(@__DIR__, "..")))
 
-g = adjlist(UInt32, is_directed=true)
+include("../src/io.jl")
+include("../src/graph.jl")
+
+g = SimpleDiGraph{UInt32}()
 
 filename = ARGS[1]
 
@@ -29,11 +32,11 @@ nvs,nes,dens = get_basic_stats(g)
 write_mgs3_graph(g, "Arxiv_HEP-PH")
 
 # load graph in MGSv3 format
-g2 = adjlist(UInt32, is_directed=true)
-load_mgs3_graph(g2, "Arxiv_HEP-PH.mgs")
+gb = SimpleDiGraph{UInt32}()
+load_mgs3_graph(gb, "Arxiv_HEP-PH.mgs")
 
-println(length(vertices(g)))
-println(out_neighbors(vertices(g)[1],g))
-println(length(vertices(g2)))
-println(out_neighbors(vertices(g2)[1],g2))
-#println(length(edges(g2)))
+println(nv(g))
+println(outneighbors(g,vertices(g)[1]))
+println(nv(gb))
+println(outneighbors(gb,vertices(gb)[1]))
+#println(ne(gb))

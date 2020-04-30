@@ -1,5 +1,5 @@
 #
-# JCNL: Julia Complex Networks Library
+# Adjacently: Julia Complex Networks Library
 # Copyright (C) 2016-2020 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
 #
 # This program is free software: you can redistribute it and/or modify
@@ -13,7 +13,8 @@
 # GNU General Public License for more details.
 #
 
-using Graphs, DataStructures, Logging
+using LightGraphs, DataStructures, SparseArrays, 
+	LinearAlgebra, Logging
 
 include("algo.jl")
 
@@ -21,17 +22,12 @@ include("algo.jl")
 # Basic stats for directed graphs
 ###
 
-# get # vertices, # of edges and density
-# NB: for computing density, we assume a directed graph
-function get_basic_stats(g)
-	nvs = length(vertices(g))
-	nes = num_edges(g)
-	density = nes/(nvs*(nvs-1))
-	return nvs,nes,density
-end
+""" 
+    display_basic_stats(g,rg)
 
-# display basic stats
-function display_basic_stats(g,rg)
+display basic stats
+"""
+function display_basic_stats(g::AbstractGraph,rg::AbstractGraph)
 	nvs,nes,dens = get_basic_stats(g)
 	nvs2,nes2,dens2 = get_basic_stats(rg)
 
@@ -53,16 +49,33 @@ function display_basic_stats(g,rg)
 	info("# sources: $nsources")
 end
 
-# get out degree stats
-#
-# retuns avg out-degree, max out-degree, array of sinks vertices
-function get_out_degree_stats(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}) where {T<:Unsigned}
+"""
+    get_basic_stats(g::AbstractGraph{T}) where {T<:Unsigned}
+
+get # vertices, # of edges and density
+NB: for computing density, we assume a directed graph
+"""
+function get_basic_stats(g::AbstractGraph{T}) where {T<:Unsigned}
+	nvs = nv(g)
+	nes = ne(g)
+	density = nes/(nvs*(nvs-1))
+	return nvs,nes,density
+end
+
+"""
+    get_out_degree_stats(g::AbstractGraph{T}) where {T<:Unsigned}
+
+get out degree stats
+
+retuns avg out-degree, max out-degree, array of sinks vertices
+"""
+function get_out_degree_stats(g::AbstractGraph{T}) where {T<:Unsigned}
 	sum = 0
 	sinks = T[]
 	max_degree = 0
 	vs = vertices(g)
 	for v in vs
-		children = out_neighbors(v,g)
+		children = outneighbors(g,v)
 		od = length(children)
 		sum += od
 		if od == 0
@@ -75,12 +88,16 @@ function get_out_degree_stats(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T
 	return sum/length(vs),max_degree,sinks
 end
 
-# get array of sink vertices in the specified graph
-function get_sinks(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}) where {T<:Unsigned}
+""" 
+    get_sinks(g::AbstractGraph{T}) where {T<:Unsigned}
+
+get array of sink vertices in the specified graph
+"""
+function get_sinks(g::AbstractGraph{T}) where {T<:Unsigned}
 	sinks = T[]
 	vs = vertices(g)
 	for v in vs
-		children = out_neighbors(v,g)
+		children = outneighbors(g,v)
 		od = length(children)
 		if od == 0
 			push!(sinks,v)
@@ -89,12 +106,16 @@ function get_sinks(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}) wh
 	return sinks
 end
 
-# get array of source vertices in the specified graph
-function get_sources(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}) where {T<:Unsigned}
+""" 
+    get_sources(g::AbstractGraph{T}) where {T<:Unsigned}
+
+get array of source vertices in the specified graph
+"""
+function get_sources(g::AbstractGraph{T}) where {T<:Unsigned}
 	achildren = T[]
 	vs = vertices(g)
 	for v in vs
-		children = out_neighbors(v,g)
+		children = outneighbors(g,v)
 		achildren = union(achildren,children)
 	end
 	return setdiff(vs,achildren)
@@ -104,16 +125,22 @@ end
 # Subgraphs && SCCs
 ###
 
-# get the subgraph of g induced by the set of vertices sids
-function subgraph(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},sids::Array{T,1}) where {T<:Unsigned}
-	ng = adjlist(T, is_directed=true)
-	# nvs should be sorted in acending order
+""" 
+    subgraph(g::AbstractGraph{T},sids::Array{T,1}) where {T<:Unsigned}
+
+get the subgraph of g induced by the set of vertices sids
+"""
+function subgraph(g::AbstractGraph{T},sids::Array{T,1}) where {T<:Unsigned}
+	if typeof(g) == SimpleDiGraph{T}
+		ng = SimpleDiGraph{T}()
+	else
+		ng = SimpleGraph{T}()
+	end
+	# nvs should be sorted in ascending order
 	nvs = sort(sids)
 
 	# add vertices
-	for i in 1:length(nvs)
-        	add_vertex!(ng,convert(T,i))
-	end
+	add_vertices!(ng,length(nvs))
 
 	# old id -> new id
 	oni = Dict{T,T}()
@@ -128,7 +155,7 @@ function subgraph(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},sids
 
 	# add edges
 	for v in nvs
-		children = out_neighbors(v,g)
+		children = outneighbors(g,v)
 		source = oni[v]
 		for c in children
 			#if index_sorted(nvs,c) != 0
@@ -141,10 +168,14 @@ function subgraph(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},sids
 	return ng,oni,noi
 end
 
-# get the subgraph of g induced by the set of vertices sids
-# write the subgraph in MGS format v2
-function subgraph_streamed(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}, sids::Array{T,1}, name::String) where {T<:Unsigned}
-	ng = adjlist(T, is_directed=true)
+""" 
+    subgraph_streamed(g::AbstractGraph{T},sids::Array{T,1},name::String) where {T<:Unsigned}
+
+get the subgraph of g induced by the set of vertices sids
+write the subgraph in MGS format v2
+"""
+function subgraph_streamed(g::AbstractGraph{T},sids::Array{T,1},name::String) where {T<:Unsigned}
+	ng = SimpleDiGraph{T}()
 	# nvs should be sorted in acending order
 	nvs = sort(sids)
 
@@ -162,7 +193,7 @@ function subgraph_streamed(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1}
 
 	pos = convert(T,1)
 	for v in nvs
-		children = out_neighbors(v,g)
+		children = outneighbors(g,v)
 		bytes = reinterpret(Uint8, [pos])
                 write(f1, reverse(bytes))
 		for c in children
@@ -185,14 +216,19 @@ function subgraph_streamed(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1}
 	return oni
 end
 
-# get the main SCC
-#
-# @returns ng (core subgraph), oni (old->new vertex indices), noi (new->old vertex indices)
-function get_core(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}) where {T<:Unsigned}
+""" 
+    get_core(g::AbstractGraph{T}) where {T<:Unsigned}
+
+get the main SCC
+
+@returns ng (core subgraph), oni (old->new vertex indices), noi (new->old vertex indices)
+"""
+function get_core(g::AbstractGraph{T}) where {T<:Unsigned}
 	sccs = pearce_iterative(g)
 	scc_ids = union(sccs,[])
 	id_size = Dict{T,T}()
 
+	# compute the size of each SCC
 	for id in scc_ids
 		id_size[id] = 0
 	end
@@ -215,17 +251,20 @@ function get_core(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}) whe
 	counter = convert(T,1)
 	for id in sccs
 		id == mid && push!(sids,counter)
-		counter = convert(T,counter+1)
+		counter += convert(T,1)
 	end
 
 	@debug("# core vids: ", length(sids))
-
 	return subgraph(g,sids)
 end
 
-# get the main SCC and write it to the specified file (MGS format)
-# write the subgraph in MGS format v2
-function get_core_streamed(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},sccs::Array{T,1},name::String) where {T<:Unsigned}
+""" 
+    get_core_streamed(g::AbstractGraph{T},sccs::Array{T,1},name::String) where {T<:Unsigned}
+
+get the main SCC and write it to the specified file (MGS format)
+write the subgraph in MGS format v2
+"""
+function get_core_streamed(g::AbstractGraph{T},sccs::Array{T,1},name::String) where {T<:Unsigned}
 	scc_ids = union(sccs,[])
 	id_size = Dict{T,T}()
 
@@ -255,25 +294,25 @@ function get_core_streamed(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1}
 	end
 
 	@debug("# core vids: ", length(sids))
-
 	subgraph_streamed(g,sids,name)
 end
 
-# get the reverse graph (same graph with all edge directions reversed)
-#
-# @returns reversed graph
-function get_reverse_graph(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}) where {T<:Unsigned}
-	ng = adjlist(T, is_directed=true)
-	vs = vertices(g)
+""" 
+    get_reverse_graph(g::AbstractGraph{T}) where {T<:Unsigned}
+
+get the reverse graph (same graph with all edge directions reversed)
+
+@returns reversed graph
+"""
+function get_reverse_graph(g::AbstractGraph{T}) where {T<:Unsigned}
+	ng = SimpleDiGraph{T}()
 
 	# same set of vertices
-	for v in vs
-		add_vertex!(ng,v)
-	end
+	add_vertices!(ng,nv(g))
 
 	# inverse the edge directions
-	for v in vs
-		children = out_neighbors(v,g)
+	for v in vertices(g)
+		children = outneighbors(g,v)
 		for c in children
 			add_edge!(ng,c,v)
 		end
@@ -282,13 +321,17 @@ function get_reverse_graph(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1}
 	return ng
 end
 
-# get in-degree of g vertices
-#
-# @returns dictionary (vertex_id -> in-degree)
-function get_vertex_in_degrees(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}) where {T<:Unsigned}
+""" 
+    get_vertex_in_degrees(g::AbstractGraph{T}) where {T<:Unsigned}
+
+get in-degree of g vertices
+
+@returns dictionary (vertex_id -> in-degree)
+"""
+function get_vertex_in_degrees(g::AbstractGraph{T}) where {T<:Unsigned}
 	vin = Dict{T,T}()
 	for v in vertices(g)
-		ovs = out_neighbors(v,g)
+		ovs = outneighbors(g,v)
 		for o in ovs
 			if !haskey(vin,o)
 				vin[o] = convert(T,1)
@@ -300,28 +343,36 @@ function get_vertex_in_degrees(g::GenericAdjacencyList{T,Array{T,1},Array{Array{
 	return vin
 end
 
-# get in- and out- degree arrays of specified graph
-function get_in_out_degrees(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}) where {T<:Unsigned}
+""" 
+    get_in_out_degrees(g::AbstractGraph{T}) where {T<:Unsigned}
+
+get in- and out- degree arrays of specified graph
+"""
+function get_in_out_degrees(g::AbstractGraph{T}) where {T<:Unsigned}
 	vin = get_vertex_in_degrees(g)
 	in_degrees = T[]
 	out_degrees = T[]
 	for v in vertices(g)
 		push!(in_degrees,vin[v])
-		push!(out_degrees,convert(T,length(out_neighbors(v,g))))
+		push!(out_degrees,convert(T,length(outneighbors(g,v))))
 	end
 	return in_degrees,out_degrees
 end
 
-# get the avg out-degree of the specified set of visited nodes
-#
-# p_avg: current average
-# nb_steps: number of points used to compute p_avg
-#
-# NB: to get the avg in-degree of visited nodes, one can use the reverse graph of g
-function get_avg_out_degree(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}, visited::Array{T,1}, p_avg::Float64=float64(-1), np_steps::UInt64=uint64(0)) where {T<:Unsigned}
-	sum = float64(0)
+""" 
+    get_avg_out_degree(g::AbstractGraph{T},visited::Array{T,1},p_avg::Float64=float64(-1),np_steps::UInt64=uint64(0)) where {T<:Unsigned}
+
+get the avg out-degree of the specified set of visited nodes
+
+p_avg: current average
+nb_steps: number of points used to compute p_avg
+
+NB: to get the avg in-degree of visited nodes, one can use the reverse graph of g
+"""
+function get_avg_out_degree(g::AbstractGraph{T},visited::Array{T,1},p_avg::Float64=float64(-1),np_steps::UInt64=uint64(0)) where {T<:Unsigned}
+	sum = 0.
 	for v in visited
-		sum += length(out_neighbors(v,g))
+		sum += length(outneighbors(g,v))
 	end
 	if p_avg != -1
 		return (p_avg*np_steps+sum)/(np_steps+length(visited))
@@ -330,8 +381,12 @@ function get_avg_out_degree(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1
 	end
 end
 
-# get a ball centered at the specified vertex
-function get_forward_ball(v::T,g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},radius::Int=2,p::Float64=1) where {T<:Unsigned}
+""" 
+    get_forward_ball(v::T,g::AbstractGraph{T},radius::Int=2,p::Float64=1) where {T<:Unsigned}
+
+get a forward ball centered at the specified vertex
+"""
+function get_forward_ball(v::T,g::AbstractGraph{T},radius::Int=2,p::Float64=1) where {T<:Unsigned}
 	# vertex ids of the ball
 	subids = T[]
 	push!(subids,v)
@@ -341,7 +396,7 @@ function get_forward_ball(v::T,g::GenericAdjacencyList{T,Array{T,1},Array{Array{
 		so = T[]
 		for u in subids
 			if !(u in explored)
-				append!(so,out_neighbors(u,g))
+				append!(so,outneighbors(g,u))
 				push!(explored,u)
 			end
 		end
@@ -372,16 +427,20 @@ function get_forward_ball(v::T,g::GenericAdjacencyList{T,Array{T,1},Array{Array{
 	return unique(subids)
 end
 
-# get the array of clustering coefficients
-#
-# ncolinks: array of the number of colinks for each vertex
-function get_clustering_coefficients(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},rg::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},ntriangles::Array{T,1},density::Float64=-1.) where {T<:Unsigned}
+""" 
+    get_clustering_coefficients(g::AbstractGraph{T},rg::AbstractGraph{T},ntriangles::Array{T,1},density::Float64=-1.) where {T<:Unsigned}
+
+get the array of clustering coefficients
+
+ncolinks: array of the number of colinks for each vertex
+"""
+function get_clustering_coefficients(g::AbstractGraph{T},rg::AbstractGraph{T},ntriangles::Array{T,1},density::Float64=-1.) where {T<:Unsigned}
 	vs = vertices(g)
-	n = length(vs)
+	n = nv(g)
 	ccs = zeros(Float64,n)
 	for v in vs
-		parents = out_neighbors(v,rg)
-		children = out_neighbors(v,g)
+		parents = outneighbors(rg,v)
+		children = outneighbors(g,v)
 		p = length(parents)
 		c = length(children)
 		i = length(intersect(parents,children))
@@ -404,16 +463,20 @@ function get_clustering_coefficients(g::GenericAdjacencyList{T,Array{T,1},Array{
 	return ccs
 end
 
-# get the array of colink coefficients
-#
-# ncolinks: array of the number of colinks for each vertex
-function get_colink_coefficients(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},rg::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}},ncolinks::Array{T,1},density::Float64=-1.) where {T<:Unsigned}
+""" 
+    get_colink_coefficients(g::AbstractGraph{T},rg::AbstractGraph{T},ncolinks::Array{T,1},density::Float64=-1.) where {T<:Unsigned}
+
+get the array of colink coefficients
+
+ncolinks: array of the number of colinks for each vertex
+"""
+function get_colink_coefficients(g::AbstractGraph{T},rg::AbstractGraph{T},ncolinks::Array{T,1},density::Float64=-1.) where {T<:Unsigned}
 	vs = vertices(g)
-	n = length(vs)
+	n = nv(g)
 	ccs = zeros(Float64,n)
 	for v in vs
-		parents = out_neighbors(v,rg)
-		children = out_neighbors(v,g)
+		parents = outneighbors(rg,v)
+		children = outneighbors(g,v)
 		p = length(parents)
 		c = length(children)
 		i = length(intersect(parents,children))
@@ -430,26 +493,17 @@ function get_colink_coefficients(g::GenericAdjacencyList{T,Array{T,1},Array{Arra
 	return ccs
 end
 
+""" 
+    get_sparse_adj_matrix(g::AbstractGraph{T}) where {T<:Unsigned}
 
-# get inclist from adjlist
-function get_inclist_from_adjlist(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}) where {T<:Unsigned}
-	g2 = inclist(vertices(g), is_directed=true)
-	for u in vertices(g)
-		for v in out_neighbors(u,g)
-			add_edge!(g2,u,v)
-		end
-	end
-	return g2
-end
-
-# get sparse adjacency matrix
-function get_sparse_adj_matrix(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}) where {T<:Unsigned}
+get sparse adjacency matrix A
+"""
+function get_sparse_adj_matrix(g::AbstractGraph{T}) where {T<:Unsigned}
 	I = Array{T,1}()
 	J = Array{T,1}()
 	V = Array{Float64,1}()
 	for u in vertices(g)
-		nei = out_neighbors(v,g)
-		for v in nei
+		for v in outneighbors(g,u)
 			push!(I,u)
 			push!(J,v)
 			push!(V,1.)
@@ -458,24 +512,36 @@ function get_sparse_adj_matrix(g::GenericAdjacencyList{T,Array{T,1},Array{Array{
 	return sparse(I,J,V)
 end
 
-# get P = D^-1 A matrix
-function get_sparse_P_matrix(g::GenericAdjacencyList{T,Array{T,1},Array{Array{T,1},1}}) where {T<:Unsigned}
-	I = Array{T,1}()
-	J = Array{T,1}()
-	V = Array{Float64,1}()
-	I2 = Array{T,1}()
-	J2 = Array{T,1}()
-	V2 = Array{Float64,1}()
-	for u in vertices(g)
-		nei = out_neighbors(u,g)
-		for v in nei
-			push!(I2,u)
-			push!(J2,v)
-			push!(V2,1.)
-		end
-		push!(I,u)
-		push!(J,u)
-		push!(V,1/out_degree(u,g))
-	end
-	return  sparse(I,J,V) * sparse(I2,J2,V2)
+""" 
+    get_sparse_P_matrix(g::AbstractGraph{T}) where {T<:Unsigned}
+
+get P = D^-1 A matrix
+"""
+function get_sparse_P_matrix(g::AbstractGraph{T}) where {T<:Unsigned}
+	n = nv(g)
+	A = get_sparse_adj_matrix(g)
+	S = dropdims(sum(A, dims=2), dims=2)
+	S = 1 ./ S
+	range = convert(Array{T,1}, 1:n)
+	D = sparse(range, range, S)
+	return D*A
 end
+
+""" 
+    get_sparse_symmetric_P_matrix(g::AbstractGraph{T}) where {T<:Unsigned}
+
+get P = D*^(-1/2) A* D*^(-1/2) matrix with A* = (A+I)
+
+NB: we assume there is no sink in the graph
+"""
+function get_sparse_symmetric_P_matrix(g::AbstractGraph{T}) where {T<:Unsigned}
+	n = length(G.vertices(g))
+	A = get_sparse_adj_matrix(g)
+	A = A + sparse(I,n,n)
+	S = dropdims(sum(A, dims=2), dims=2)
+	S = 1 ./ sqrt.(S)
+	range = convert(Array{T,1}, 1:n)
+	D = sparse(range, range, S)
+	return D*A*D
+end
+
