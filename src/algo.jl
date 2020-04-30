@@ -118,7 +118,7 @@ function pearce(g::AbstractGraph{T}) where {T<:Unsigned}
 end
 
 # Pearce algorithm state
-mutable struct state{T}
+mutable struct State{T}
 	v::T
 	stage::T
 	root::Bool
@@ -137,8 +137,8 @@ function pearce_iterative(g::AbstractGraph{T}) where {T<:Unsigned}
 	c = n-1
 
 	function visit(v)
-		states = state[]
-		current_state = state(v,convert(T,0),true)
+		states = State[]
+		current_state = State(v,convert(T,0),true)
 		push!(states, current_state)
 
 		@label start
@@ -158,7 +158,7 @@ function pearce_iterative(g::AbstractGraph{T}) where {T<:Unsigned}
 						current_state.stage = w
 						push!(states,current_state)
 
-						new_state = state(w,convert(T,0),true)
+						new_state = State(w,convert(T,0),true)
 						push!(states,new_state)
 						@goto start
 					end
