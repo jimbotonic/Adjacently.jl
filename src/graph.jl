@@ -513,6 +513,22 @@ function get_sparse_adj_matrix(g::AbstractGraph{T}) where {T<:Unsigned}
 end
 
 """ 
+    get_adj_matrix(g::AbstractGraph{T}) where {T<:Unsigned}
+
+get adjacency matrix A
+"""
+function get_adj_matrix(g::AbstractGraph{T}) where {T<:Unsigned}
+	n = nv(g) 
+	A = zeros(Float64,n,n) 
+	for u in vertices(g)
+		for v in outneighbors(g,u)
+			A[u,v] = 1.
+		end
+	end
+	return A
+end
+
+""" 
     get_sparse_P_matrix(g::AbstractGraph{T}) where {T<:Unsigned}
 
 get P = D^-1 A matrix
