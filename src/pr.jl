@@ -186,7 +186,7 @@ end
 Compute Pagerank (Power iteration method)
 
 ppr: personalized distribution of random jumps
-init_pr: initial Pagerank
+init_pr: initial Pagerank distribution
 """
 function PR(P::SparseMatrixCSC{Float64,T};ppr::Array{Float64,1}=Float64[],init_pr::Array{Float64,1}=Float64[], damping::Float64=DAMPING_FACTOR, epsilon::Float64=EPSILON, max_iter::Int=MAX_ITER) where {T<:Unsigned}
 	n = size(P)[1]
@@ -221,12 +221,17 @@ end
 
 Compute non-linear Pagerank (Power iteration method)
 
+P: sparse adjacency matrix
+fun: activation function
 ppr: personalized distribution of random jumps
-init_pr: initial Pagerank
+init_pr: initial Pagerank distribution
+damping: damping factor 
+epsilon: 
+max_iter: maximum number of iterations
 """
 function PR(P::SparseMatrixCSC{Float64,T},fun::Function;ppr::Array{Float64,1}=Float64[],init_pr::Array{Float64,1}=Float64[], damping::Float64=DAMPING_FACTOR, epsilon::Float64=EPSILON, max_iter::Int=MAX_ITER) where {T<:Unsigned}
 	n = size(P)[1]
-	# initialize personalized vector
+	# initialize personalized vector if needed
 	if length(ppr) != n
 		ppr = Float64[1/n for i in 1:n]
 	end
