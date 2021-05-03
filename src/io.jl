@@ -603,6 +603,45 @@ function load_adjacency_list_from_csv(::Type{T},g::AbstractGraph{T},filename::Ab
 end
 
 """ 
+    load_adjacency_list(::Type{T},g::AbstractGraph{T},adj_list::Array{T,2}) where {T<:Unsigned}
+
+load graph from adjacency list
+
+NB: adjcency list should be represented as a 2-dimensional array with 2 rows and 1 column per edge
+"""
+function load_adjacency_list(::Type{T},g::AbstractGraph{T},adj_list::Array{T,2}) where {T<:Unsigned}
+	oni = Dict{T,T}()
+	edges = Array{Tuple{T,T},1}()
+	counter = convert(T,1)
+	nes = size(adj_list)[2]
+	for i in 1:nes
+		edge = adj_list[i]
+		v1 = parse(T,edge[1])
+		v2 = parse(T,edge[2])
+
+		if !haskey(oni, v1)
+			oni[v1] = counter
+			counter += convert(T,1)
+		end
+		if !haskey(oni, v2)
+			oni[v2] = counter
+			counter += convert(T,1)
+		end
+		push!(edges, (oni[v1], oni[v2]))
+	end
+	
+	# add vertices
+	add_vertices!(g,length(keys(oni)))
+	
+	# add edges
+	for edge in edges
+		add_edge!(g, edge[1], edge[2])	
+	end
+
+	return oni
+end
+
+""" 
     load_graph_from_pajek(::Type{T},g::AbstractGraph{T},filename::AbstractString) where {T<:Unsigned}
 
 Load net Pajek file
