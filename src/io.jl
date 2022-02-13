@@ -1,6 +1,6 @@
 #
 # Adjacently: Julia Complex Networks Library
-# Copyright (C) 2016-2020 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
+# Copyright (C) 2016-2022 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -35,6 +35,8 @@
 # NB: vertex ids need to be contiguous. In case, a vertex has no child, pos[k] = pos[k+1]
 
 using LightGraphs, DataStructures, HDF5, JLD
+
+include("util.jl")
 
 """ 
     load_jls_serialized(filename::AbstractString)
@@ -562,11 +564,11 @@ function load_mgs4_graph(g::AbstractGraph{T},filename::AbstractString) where {T<
 end
 
 """ 
-    load_adjacency_list_from_csv(::Type{T},g::AbstractGraph{T},filename::AbstractString,separator::Char=' ') where {T<:Unsigned}
+    load_adjacency_list_from_csv(::Type{T},g::AbstractGraph{T},filename::AbstractString,separator::Char=',') where {T<:Unsigned}
 
 load graph from CSV adjacency list
 """
-function load_adjacency_list_from_csv(::Type{T},g::AbstractGraph{T},filename::AbstractString,separator::Char=',') where {T<:Unsigned}
+function load_adjacency_list_from_csv(::Type{T},g::AbstractGraph{T},filename::AbstractString,separator::AbstractChar=',') where {T<:Unsigned}
 	f = open(filename,"r")
 	oni = Dict{T,T}()
 	edges = Array{Tuple{T,T},1}()
