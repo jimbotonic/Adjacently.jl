@@ -1,6 +1,6 @@
 #
-# Adjacently: Julia Complex Networks Library
-# Copyright (C) 2016-2022 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
+# Adjacently: Julia Complex Directed Networks Library
+# Copyright (C) 2016-2024 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -13,30 +13,15 @@
 # GNU General Public License for more details.
 #
 
-# MGS adjacency graph format - version 1
-#
-# unsigned integers stored in big endian format (byte and bit levels)
-# positions: 0-based
-#
-# graph.index: vid1 (1 word), pos1 (1 word) | ...
-# graph.data: vid1, vid2, vid3, ...
-#
-# NB: vertices do not need to be contiguous
-#
-
-# MGS adjacency graph format - version 2
-#
-# unsigned integers stored in big endian format (byte and bit levels)
-# positions: 1-based
-#
-# graph.index: pos1 (1 word) | pos2 | ...
-# graph.data: vid1 (1 word), vid2, vid3, ...
-#
-# NB: vertex ids need to be contiguous. In case, a vertex has no child, pos[k] = pos[k+1]
-
 using LightGraphs, DataStructures, HDF5, JLD
 
 include("util.jl")
+
+# constants
+HEADER_MGS3_CS0_C0 = 0x4d475303000000
+HEADER_MGS3_CS1_C0 = 0x4d475303000010
+
+MGS3_MAX_SIZE = 0xffffffffff
 
 """ 
     load_jls_serialized(filename::AbstractString)
@@ -88,297 +73,242 @@ function serialize_to_jld(x::Any, name::AbstractString, filename::AbstractString
 	end
 end
 
-""" 
-    load_mgs1_graph_index(ipos::OrderedDict{T,T},filename::AbstractString) where {T<:Unsigned}
-
-get the ordered dictionary vid -> startpos (mgs v1)
-"""
-function load_mgs1_graph_index(ipos::OrderedDict{T,T},filename::AbstractString) where {T<:Unsigned}
-	f = open(filename, "r")
-	while !eof(f1)
-		id = read(f,UInt8,sizeof(T))
-		pos = read(f,UInt8,sizeof(T))
-		# Julia is 1-based -> +1
-		ipos[reinterpret(T,reverse(id))[1]] = reinterpret(T,reverse(pos))[1] + 1
-	end
-	close(f)
-end
-
-""" 
-    load_mgs2_graph_index(pos::Array{T,1},filename::AbstractString) where {T<:Unsigned}
-
-get the set of positions (mgs v2)
-"""
-function load_mgs2_graph_index(pos::Array{T,1},filename::AbstractString) where {T<:Unsigned}
-	f = open(filename, "r")
-	while !eof(f)
-		p = read(f,UInt8,sizeof(T))
-		push!(pos, reinterpret(T,reverse(p))[1])
-	end
-	close(f)
-end
-
-""" 
-    write_mgs1_graph_index(ipos::OrderedDict{T,T}, filename::AbstractString) where {T<:Unsigned}
-
-write index file (mgs v1)
-"""
-function write_mgs1_graph_index(ipos::OrderedDict{T,T}, filename::AbstractString) where {T<:Unsigned}
-	f = open(filename, "w")
-	for p in ipos
-    # reinterpret pair (vid,pos) in an array of bytes
-		bytes = reinterpret(UInt8, [p])
-		write(f, reverse(bytes))
-	end
-	close(f)
-end
-
-""" 
-    write_mgs2_graph_index(pos::Array{T,1}, filename::AbstractString) where {T<:Unsigned}
-
-write index file (mgs v2)
-"""
-function write_mgs2_graph_index(pos::Array{T,1}, filename::AbstractString) where {T<:Unsigned}
-	f = open(filename, "w")
-	for p in pos
-    # reinterpret pos in an array of bytes
-		bytes = reinterpret(UInt8, [p])
-		write(f, reverse(bytes))
-	end
-	close(f)
-end
-
-""" 
-    load_graph_data(children::Array{T,1},filename::AbstractString) where {T<:Unsigned}
-
-get the array of graph children (MGSv1 & MGSv2)
-"""
-function load_graph_data(children::Array{T,1},filename::AbstractString) where {T<:Unsigned}
-	f = open(filename, "r")
-	while !eof(f)
-		child = read(f,UInt8,sizeof(T))
-		push!(children,reinterpret(T,reverse(child))[1])
-	end
-	close(f)
-end
-
-""" 
-    write_graph_data(children::Array{T,1}, filename::AbstractString) where {T<:Unsigned}
-
-write the array of graph children (MGSv1 & MGSv2)
-"""
-function write_graph_data(children::Array{T,1}, filename::AbstractString) where {T<:Unsigned}
-	f = open(filename, "w")
-	for c in children
-		bytes = reinterpret(UInt8, [c])
-		write(f, reverse(bytes))
-	end
-	close(f)
-end
-
-""" 
-    load_mgs1_graph(g::AbstractGraph{T},name::AbstractString) where {T<:Unsigned}
-
-load graph in format MGS v1
-"""
-function load_mgs1_graph(g::AbstractGraph{T},name::AbstractString) where {T<:Unsigned}
-	ipos = OrderedDict{T,T}()
-	children = T[]
-
-	load_mgs1_graph_index(ipos,"$name.index")
-	load_graph_data(children,"$name.data")
-
-	# ipos is an ordered dictionary
-	ks = collect(keys(ipos))
-	# vertex set
-	vs = sort(union(children,ks))
-
-	# add vertices
-    add_vertices!(g,length(vs))
-
-	# dictionary old -> new vertex indices
-	oni = Dict{T,T}()
-
-	counter = convert(T,1)
-	for v in vs
-		oni[v] = counter
-		counter += convert(T,1)
-	end
-
-	# add edges
-	for i in 1:length(ks)
-		source = oni[ks[i]]
-		# if we reached the last parent vertex
-		if i == length(ks)
-			pos1 = ipos[ks[i]]
-			pos2 = length(children)
-		else
-			pos1 = ipos[ks[i]]
-			pos2 = ipos[ks[i+1]]-1
-		end
-		for p in pos1:pos2
-			target = oni[children[p]]
-			add_edge!(g,source,target)
-		end
-	end
-
-	return oni
-end
-
-""" 
-    load_mgs2_graph(g::AbstractGraph{T},name::AbstractString) where {T<:Unsigned}
-
-load graph in format MGS v2
-"""
-function load_mgs2_graph(g::AbstractGraph{T},name::AbstractString) where {T<:Unsigned}
-	pos = T[]
-	children = T[]
-
-	load_mgs2_graph_index(pos,"$name.index")
-	load_graph_data(children,"$name.data")
-
-	#@debug("#pos:",length(pos))
-	#@debug("#children:",length(children))
-
-	# vertex set
-	vs = range(1,length(pos))
-
-	# add vertices
-	add_vertices!(g,length(vs))
-
-	# add edges
-	for i in 1:length(vs)
-		source = convert(T,i)
-		# if we reached the last parent vertex
-		if i == length(vs)
-			pos1 = pos[i]
-			pos2 = length(children)
-		else
-			pos1 = pos[i]
-			pos2 = pos[i+1]-1
-		end
-		for p in pos1:pos2
-			target = children[p]
-			add_edge!(g,source,target)
-		end
-	end
-end
-
 """
     write_mgs3_graph(g::AbstractGraph{T},filename::AbstractString) where {T<:Unsigned}
 
-load graph in format MGS v3
+write graph in format MGS v3
 """
-function write_mgs3_graph(g::AbstractGraph{T},filename::AbstractString) where {T<:Unsigned}
+function write_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, coding_scheme::UInt8=0x00) where {T<:Unsigned}
   	# Header 12 bytes: 
-	# -> version: 7 bytes string
-	# -> size T: 1 byte
-	# -> # vertices: 4 bytes position 
+	# -> version: 'MGS' 3 bytes string
+	# -> major + minor version: 2 bytes
+	# -> flag: 2 bytes
+	#	 * Byte 1:
+	#    	- graph type: 			0x0: directed graph | 0x1: undirected graph
+	#	 	- compression scheme: 	0x0: no compression
+	#	 * Byte 2:
+	#		- coding scheme: 		0x0: data section only | 0x1: index+data section with implicit numbering of vertices
+	#	 	- reserved flags: 		0x0: reserved
+	# -> # vertices: 5 bytes position 
 	#
-	# for example: 'MGSv3  ' + <8bits T size> +  <32bits offset in size_t of data section>
-  	version = 0x4d475376332020
-	# size of type T in bytes
-	size_t = convert(UInt8, sizeof(T))
-
-	pos = T[]
-	children = T[]
+	# <'MGS' string 3 bytes> + <16 bits major|minor version> + <flags 2 bytes> + <# vertices 5 bytes>
+	
 	vs = vertices(g)
-	cpos = convert(T,1)
-	for v in vs
-		ovs = outneighbors(g,v)
-		push!(pos,cpos)
-		for o in ovs
-			push!(children,o)	
-			cpos += convert(T,1)
+	# number of vertices
+	gs = convert(UInt64, length(vs))
+
+	# if the graph has more than 2^40-1 vertices, `T` should be `UInt64`
+	if gs > MGS3_MAX_SIZE
+		error("Input graph cannot have more than 2^40-1 vertices")
+	end
+	
+	# `n_size_t` is the number of bytes needed to represent the graph vertices
+	# NB: `n_size_t` (the computed size) may be lower than `sizeof(T)` of the graph type in parameter
+	n_size_t = convert(UInt8, ceil(log(2, gs)))
+	# NB: `T` should be an unsigned integer of size 1,2,4,8 bytes
+	p_size_t = sizeof(T)
+	
+	#  The difference of size should >= 0 
+	diff_size = p_size_st - n_size_t
+
+	if coding_scheme == 0x00
+		# 'MGS' + 0x0300 + 0x00 (directed graph + no compression) + 0x00 (data section only + reserved) (7 bytes)
+		# encoding: data section only with implicit numbering of vertices
+  		version = HEADER_MGS3_CS0_C0
+	elseif coding_scheme == 0x01
+		# 'MGS' + 0x0300 + 0x00 (directed graph + no compression) + 0x00 (index and data sections + reserved) (7 bytes)
+		# encoding: index+data sections with implicit numbering of vertices
+  		version = HEADER_MGS3_CS0_C1
+	end
+
+	f = open("$filename.mgs", "w")
+	
+	### write header
+	# MGS version + parameters (7 bytes)
+	# NB: reinterpret generates an array of length 8 even if version has a length of 7 bytes
+	bytes = reverse(reinterpret(UInt8, [version]))[2:8]
+	write(f, bytes)
+
+	# write the number of vertices (5 bytes)
+	bytes = reverse(reinterpret(UInt8, [gs]))[4:8]
+	write(f, bytes)
+	
+	# coding scheme: data section only with implicit numbering of vertices
+	if coding_scheme == 0x00
+		stop_seq = [0x00 for i in 1:n_size_t]
+		for v in vs
+			ovs = outneighbors(g, v)
+			for c in ovs
+				bytes = reverse(reinterpret(UInt8, [c]))[(diff_size+1):p_size_t]
+				write(f, bytes)
+			end
+			write(f, stop_seq)
+		end
+
+	# coding scheme: index+data sections with implicit numbering of vertices
+	elseif coding_scheme == 0x01
+		# number of children for each vertex
+		# NB: `T` should have a sufficient size to store the number of children
+		ods = T[]
+		# flattened list of children for all the vertices
+		# NB: `T` should have a sufficient size to store the children indices
+		children = T[]
+
+		for v in vs
+			ovs = outneighbors(g, v)
+			push!(ods, length(ovs))
+			for o in ovs
+				push!(children, o)	
+			end
+		end
+
+		### write index section
+		for o in ods
+			bytes = reverse(reinterpret(UInt8, [o]))[(diff_size+1):p_size_t]
+			write(f, bytes)
+		end
+		### write data section
+		for c in children
+			bytes = reverse(reinterpret(UInt8, [c]))[(diff_size+1):p_size_t]
+			write(f, bytes)
 		end
 	end
 
-	# number of vertices
-	gs = convert(UInt32, length(vs))
-
-	f = open("$filename.mgs", "w")
-	### write header
-	# NB: reinterpret generates an array of length 8 even if version has a length of 7 bytes
-	bytes = reinterpret(UInt8, [version])[1:7]
-	write(f, bytes)
-	bytes = reinterpret(UInt8, [size_t])
-	write(f, bytes)
-	bytes = reinterpret(UInt8, [gs])
-	write(f, bytes)
-	### write index section
-	for p in pos
-		bytes = reinterpret(UInt8, [p])
-		write(f, bytes)
-	end
-	### write data section
-	for c in children
-		bytes = reinterpret(UInt8, [c])
-		write(f, bytes)
-	end
 	close(f)
 end
 
 """ 
-    load_mgs3_graph(g::AbstractGraph{T},filename::AbstractString) where {T<:Unsigned}
+    load_mgs3_graph(filename::AbstractString)::AbstractGraph{U} where {U<:Unsigned}
 
 load graph in format MGS v3
 """
-function load_mgs3_graph(g::AbstractGraph{T},filename::AbstractString) where {T<:Unsigned}
+function load_mgs3_graph(filename::AbstractString)::AbstractGraph{U} where {U<:Unsigned}
 	f = open(filename, "r")
 	### read header
+  	# 7 bytes: <3 bytes string 'MGS'> + <2 bytes major/minor> + <2 bytes flags>
+	# 5 bytes (40 bits): number of vertices
+	###
 	# 7-bytes version
 	version = read(f,7)
-	# size in bytes of T
-	size_t = convert(UInt8, read(f,1)[1])
 	# number of vertices
-	gs = reinterpret(UInt32, read(f,4))[1]
-	# read index
-	pos = T[]
-	for i in 1:gs
-		p = read(f, sizeof(T))
-		push!(pos, reinterpret(T,p)[1])
+	gs = reinterpret(UInt64, vcat(reverse(read(f,5)),[0x00,0x00,0x00]))
+	
+	# `n_size_u` is the number of bits needed to represent the graph vertices
+	n_bits_u = convert(UInt8, ceil(log(2, length(gs))))
+	# `U` should be an unsigned integer of size 1,2,4,8 bytes
+	U = infer_uint_type(n_bits_u)
+
+	# graph type is 4 first bits of 6th byte of header	
+	# 0x0: directed graph | 0x1: undirected graph
+	graph_type = version[6] >> 4
+
+	# coding scheme is 4 first bits of 7th byte of header	
+	coding_scheme = version[7] >> 4
+
+	# intialize graph g according to graph type
+	if graph_type == 0x0
+		g = SimpleDiGraph{U}()
+	else
+		g = SimpleGraph{U}()
 	end
-	# read data
-	children = T[]
-	while !eof(f)
-		c = read(f, sizeof(T))
-		push!(children, reinterpret(T,c)[1])
-	end
-	close(f)
 	
 	# vertex set
-	vs = range(1, stop=length(pos))
+	vs = range(1, stop=gs)
 
-	# add vertices
+	# add vertices to graph
     add_vertices!(g, length(vs))
 
-	# add edges
-	for i in 1:length(vs)
-		source = convert(T,i)
-		# if we reached the last parent vertex
-		if i == length(vs)
-			pos1 = pos[i]
-			pos2 = length(children)
-		else
-			pos1 = pos[i]
-			pos2 = pos[i+1]-1
+	# coding scheme: data section only with implicit numbering of vertices
+	# NB: each list of children is terminated with 0
+	if coding_scheme == 0x00
+		# read data
+		children = U[]
+		while !eof(f)
+			c = read(f, sizeof(U))
+			push!(children, reinterpret(U,c)[1])
 		end
-		for p in pos1:pos2
-			target = children[p]
-			add_edge!(g,source,target)
+		
+		# add edges
+		pos = 1
+		n_children = length(children)
+
+		for i in 1:length(vs)
+			if pos <= n_children
+				source = convert(U,i)
+				while children[pos] != 0x00
+					target = children[pos]
+					add_edge!(g,source,target)
+					pos += 1
+				end
+				# skip 0x00
+				pos += 1
+			else
+				# if we reached the last child, we are done
+				break
+			end
+		end
+	
+	# coding scheme: index+data sections with implicit numbering of vertices
+	elseif coding_scheme == 0x01
+		# read index
+		# NB: 
+		# - position indices are 1-based
+		# - each position indicates the index of the first child of a vertex
+		pos = U[]
+		for i in 1:gs
+			p = read(f, sizeof(U))
+			push!(pos, reinterpret(U,p)[1])
+		end
+		# read data
+		children = U[]
+		while !eof(f)
+			c = read(f, sizeof(U))
+			push!(children, reinterpret(U,c)[1])
+		end
+
+		# add edges
+		for i in 1:length(vs)
+			source = convert(U,i)
+			# if we reached the last parent vertex
+			if i == length(vs)
+				pos1 = pos[i]
+				pos2 = length(children)
+			else
+				pos1 = pos[i]
+				# position of the last child of vertex i
+				pos2 = pos[i+1]-1
+			end
+			# add edges for each child
+			for p in pos1:pos2
+				target = children[p]
+				add_edge!(g,source,target)
+			end
 		end
 	end
+		
+	close(f)
+
+	return g
 end
 
 """
     write_mgs4_graph(g::AbstractGraph{T},rg::AbstractGraph{T},filename::AbstractString) where {T<:Unsigned}
 
-load graph in format MGS v4
+write graph in format MGS v4
 """
 function write_mgs4_graph(g::AbstractGraph{T},rg::AbstractGraph{T},filename::AbstractString) where {T<:Unsigned}
-  	# 8 bytes: 7 bytes string + 1 byte: 'MGSv4  ' + <8bits T size>
-	# 4 bytes (32bits): offset in size_t of graph data section (i.e. # of vertices)
-  	version = 0x4d475376342020
+  	# Header 12 bytes: 
+	# -> version: 'MGS' 3 bytes string
+	# -> major + minor version: 2 bytes
+	# -> reserved flag: 2 bytes
+	# -> size_t in bytes: 1 byte
+	# -> # vertices: 4 bytes position 
+	#
+	#'MGS' + <16 bits major|minor version> + <8 bits size_t> 
+	# 	+ <32 bits offset in size_t of data section>
+
+	# MGS + 0x0400 + 0x0000
+  	version = 0x4d475304000000
 	# size of type T in bytes
 	size_t = convert(UInt8, sizeof(T))
 	
@@ -486,9 +416,9 @@ load graph in format MGS v4
 function load_mgs4_graph(g::AbstractGraph{T},filename::AbstractString) where {T<:Unsigned}
 	f = open(filename, "r")
 	### read header
-  	# 8 bytes: 7 bytes string + 1 byte: 'MGSv4  ' + <8bits T size>
-	# 4 bytes (32bits): offset in size_t of graph data section (i.e. # of vertices)
-	#
+  	# 8 bytes: <3 bytes string 'MGS'> + <2 bytes major/minor> + <2 bytes flags> + <1 byte size_t>
+	# 4 bytes (32 bits): offset in size_t of graph data section (i.e. # of vertices)
+	###
 	# 7-bytes version
 	version = read(f,7)
 	# size in bytes of T

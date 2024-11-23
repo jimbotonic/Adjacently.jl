@@ -1,6 +1,6 @@
 #
-# Adjacently: Julia Complex Networks Library
-# Copyright (C) 2016-2022 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
+# Adjacently: Julia Complex Directed Networks Library
+# Copyright (C) 2016-2024 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -24,25 +24,28 @@ include("../src/graph.jl")
 
 using GraphPlot
 
-function load_dataset(input_path::AbstractString,output_filename::AbstractString;is_pajek=false) where {T<:Unsigned}
+function manage_dataset(input_path::AbstractString, output_filename::AbstractString; is_pajek=false) where {T<:Unsigned}
 	g = SimpleDiGraph{UInt32}()
 	if !is_pajek
 		load_adjacency_list_from_csv(UInt32, g, input_path)
 	else
 	    load_graph_from_pajek(UInt32, g, input_path)
 	end
-	@info("# vertices:", convert(Int,nv(g)))
-	@info("# edges:", ne(g))
+
+	# display basic stats
+	@info("Full graph #v:", convert(Int,nv(g)))
+	@info("Full graph #e:", ne(g))
 
 	@info("getting core")
 	core,oni,noi = get_core(g)
-	@info("# vertices:", convert(Int,nv(core)))
-	@info("# edges:", ne(core))
+	@info("Core #v:", convert(Int,nv(core)))
+	@info("Core #e:", ne(core))
 
-	@info("getting reverse graph")
+	@info("getting reverse core")
 	rcore = get_reverse_graph(core) 
-	@info("# edges (rcore):", ne(rcore))
+	@info("RCore #e:", ne(rcore))
 
+	# export graph data of core and reverse core
 	write_mgs3_graph(core, output_filename)
 	write_mgs4_graph(core, rcore, output_filename)
 	#serialize_to_jld(core, "core", output_filename)

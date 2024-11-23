@@ -1,6 +1,6 @@
 #
-# Adjacently: Julia Complex Networks Library
-# Copyright (C) 2016-2022 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
+# Adjacently: Julia Complex Directed Networks Library
+# Copyright (C) 2016-2024 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -349,3 +349,24 @@ function huffman_encoding(A::Array{T,1}) where {T<:Unsigned}
 	end
 	return nNode
 end
+
+"""
+	infer_uint_type(n::UInt)
+
+Infer the unsigned integer type needed to store the specified size
+"""
+function infer_uint_type(n_bits::UInt8)
+    if n_bits > 64
+        throw(ArgumentError("List size is too large. Maximum supported bits are 64."))
+    end
+    if n_bits <= 8
+        return UInt8
+    elseif n_bits <= 16
+        return UInt16
+    elseif n_bits <= 32
+        return UInt32
+    else
+        return UInt64
+    end
+end
+

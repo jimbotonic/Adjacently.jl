@@ -1,6 +1,6 @@
 #
-# Adjacently: Julia Complex Networks Library
-# Copyright (C) 2016-2022 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
+# Adjacently: Julia Complex Directed Networks Library
+# Copyright (C) 2016-2024 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -128,12 +128,12 @@ g = SimpleDiGraph{UInt32}()
 
 load_mgs3_graph(g, "../datasets/Arxiv_HEP-PH/Arxiv_HEP-PH_core.mgs")
 
-@info("# vertices:", nv(g))
-@info("# edges:", ne(g))
+@info("Core #v:", nv(g))
+@info("Core #e:", ne(g))
 
 @info("getting reverse graph")
 rg = get_reverse_graph(g) 
-@info("# edges (rg):", ne(rg))
+@info("RCore #e:", ne(rg))
 
 @info("writing MGS4 graph")
 write_mgs4_graph(g, rg, "test")
