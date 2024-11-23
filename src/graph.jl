@@ -1,6 +1,6 @@
 #
-# Adjacently: Julia Complex Networks Library
-# Copyright (C) 2016-2022 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
+# Adjacently: Julia Complex Directed Networks Library
+# Copyright (C) 2016-2024 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -531,7 +531,7 @@ end
 """ 
     get_sparse_P_matrix(g::AbstractGraph{T}) where {T<:Unsigned}
 
-get P = D^-1 A matrix
+get P = D^-1 * A matrix
 """
 function get_sparse_P_matrix(g::AbstractGraph{T}) where {T<:Unsigned}
 	n = nv(g)
