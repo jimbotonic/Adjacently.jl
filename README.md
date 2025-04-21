@@ -2,24 +2,23 @@
 
 Adjancently.jl is Julia library for the analysis of large complex directed networks.
 
-### Launch notebooks
 
+## Development
+
+### Launch notebooks
 ```
 julia> using IJulia
 julia> notebook()
 ```
 
 ### Dependencies management
-
 ```
 pkg> activate .
 pkg> add {package-name}
-
 pkg> update
 ```
 
-## Notes on Julia
-
+### Notes
 ```julia
 ###
 # Write in big endian

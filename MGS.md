@@ -1,9 +1,8 @@
 # MGS File Format
 
-MGS stands for Massive Graph Storage. It is a binary file format to store the toplogy of massive directed graphs in a compact form. 
+MGS stands for Massive Graph Storage. It is a binary file format designed to store the toplogy of massive directed graphs in a compact form. 
 
-In the following sections, we describe the MGS file format in detail. $n$ is the number of vertices in the graph.
-
+In the following sections, we describe the MGS file format in detail. $n$ represents the number of vertices in the graph.
 
 ## MGS version 3
 
@@ -32,13 +31,21 @@ The possible coding schemes are:
 * 0x0: data section only with implicit numbering of vertices
 * 0x1: index section + data section with explicit numbering of vertices
 
-The number of bytes allocated for each vertex id is computed as follows:
+The minimum number of bits allocated for each vertex id is computed as follows:
 
-$$ size\_t = \lceil log_2 (n+1) \rceil$$
+$$ nbits = \lceil log_2 (n+1) \rceil$$
+
+The number of bytes allocated for each vertex id is then given by the closest unsigned integer type that can represent the vertex ids among the following:
+
+* `UInt8` for $n \leq 255$
+* `UInt16` for $n \leq 65535$
+* `UInt24` for $n \leq 16777215$
+* `UInt32` for $n \leq 4294967295$
+* `UInt40` for $n \leq 1099511627775$
 
 ### 0x0 Coding Scheme (data section only)
 
-There is no index section. The data section contains contiguous lists of vertex ids representing the children of each vertex numbered implicitly from $1$ to $n. Each adjacency list is terminated by a special value $0$ of $size\_t$ bytes, except for the last one. 
+There is no index section. The data section contains contiguous lists of vertex ids representing the children of each vertex numbered implicitly from $1$ to $n. Each adjacency list is terminated by a special value $0$ of $size\_t$ bytes. 
 
 NB: by reordering the vertices by decreasing out-degree allows, it is possible to spare adding $0$-termination values corresponding to $0$-out-degree vertices. 
 
@@ -47,7 +54,6 @@ NB: by reordering the vertices by decreasing out-degree allows, it is possible t
 The index section starts directly after the header and has a size of $size\_t * n$ bytes. Each entry indicates the number of children of the corresponding vertex numbered implicitly from $1$ to $n$.
 
 The following data section contains contiguous lists of vertex ids representing the children of each vertex.
-
 
 ## Deprecated MGS formats
 
