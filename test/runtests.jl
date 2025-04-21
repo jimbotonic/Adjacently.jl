@@ -15,7 +15,6 @@
 
 using Test, LightGraphs, Adjacently.io, Adjacently.graph, Adjacently.util
 
-
 const GRAY_TO_RSA_TABLE_PATH = joinpath(@__DIR__, "data", "gray_to_rsa.txt")
 
 const AMZ_DATASET_IN = joinpath(@__DIR__, "..", "datasets", "Amazon_0601", "Amazon0601.txt")
@@ -35,14 +34,13 @@ const EAT_DATASET_OUT = "EAT_rcore"
 
 Load graph from CSV adjacency list or Pajek file
 """
-function load_dataset(input_path::AbstractString; separator::AbstractChar=',', is_pajek::Bool=false) where {T<:Unsigned}
-	g = SimpleDiGraph{UInt32}()
+function load_dataset(input_path::AbstractString; separator::AbstractChar=',', is_pajek::Bool=false)
 	if !is_pajek
-		load_adjacency_list_from_csv(UInt32, g, input_path, separator)
+		g = load_adjacency_list_from_csv(input_path, separator)
 	else
-	    load_graph_from_pajek(UInt32, g, input_path)
+	    g = load_graph_from_pajek(input_path)
 	end
-	g
+	return g
 end
 
 @testset "io.jl" begin
@@ -59,12 +57,25 @@ end
 
 	@info("getting reverse graph")
 	amz_rcore = get_reverse_graph(amz_core) 
+	@test 395234 == convert(Int,nv(amz_rcore))
 	@test 3301092 == ne(amz_rcore)
 
-	@info("Save Amazon dataset (core) in MGS format")
-	#write_mgs3_graph(amz_core, AMZ_DATASET_OUT)
-	#write_mgs4_graph(amz_core, amz_rcore, AMZ_DATASET_OUT)
+	@info("Saving Amazon dataset (core) in MGS format")
+	write_mgs3_graph(amz_core, AMZ_DATASET_OUT)
+
+	@info("Saving Amazon dataset (core) in MGZ format")
+	write_mgs3_huffman_graph(amz_core, amz_rcore, AMZ_DATASET_OUT)
 	# serialize_to_jld(amz_core, "core", AMZ_DATASET_OUT)
+	
+	@info("Loading Amazon dataset (core) from MGS format")
+	amz_core_mgs = load_mgs3_graph(AMZ_DATASET_OUT * ".mgs")
+	@test 395234 == convert(Int,nv(amz_core_mgs))
+	@test 3301092 == ne(amz_core_mgs)
+
+	@info("Loading Amazon dataset (core) from MGZ format")
+	amz_core_mgz = load_mgs3_huffman_graph(AMZ_DATASET_OUT * ".mgz")
+	@test 395234 == convert(Int,nv(amz_core_mgz))
+	@test 3301092 == ne(amz_core_mgz)
 end
 
 
