@@ -1,6 +1,6 @@
 #
 # Adjacently: Julia Complex Directed Networks Library
-# Copyright (C) 2016-2024 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
+# Copyright (C) 2016-2025 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -25,11 +25,9 @@ end
 module io
 
 export load_jls_serialized, serialize_to_jls, load_jld_serialized, 
-    serialize_to_jld, load_mgs1_graph_index, load_mgs2_graph_index,
-    write_mgs1_graph_index, write_mgs2_graph_index, load_graph_data, 
-    write_graph_data, load_mgs1_graph, load_mgs2_graph, 
-    write_mgs3_graph, load_mgs3_graph, write_mgs4_graph, 
-    load_mgs4_graph, load_adjacency_list_from_csv, load_graph_from_pajek, load_triangles
+    serialize_to_jld, write_mgs3_graph, load_mgs3_graph, 
+    write_mgs3_huffman_graph, load_mgs3_huffman_graph, load_adjacency_list_from_csv, 
+    load_graph_from_pajek
 
 include("io.jl")
 end
@@ -43,7 +41,7 @@ end
 
 module util
 
-export quicksort_iterative!, bottom_up_sort, binary_search, huffman_encoding
+export quicksort_iterative_permutation!, bottom_up_sort, binary_search, huffman_encoding
 
 include("util.jl")
 end

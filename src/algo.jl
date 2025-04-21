@@ -1,6 +1,6 @@
 #
 # Adjacently: Julia Complex Directed Networks Library
-# Copyright (C) 2016-2024 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
+# Copyright (C) 2016-2025 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -24,7 +24,7 @@ NB: successfully tested with FA core
 NB: the recursive calls may create a stack overflow error
 """
 function tarjan(g::AbstractGraph{T}) where {T<:Unsigned}
-	sccs = Array(Array{T,1},0)
+	sccs = Vector{Vector{T}}()
 	n = nv(g)
 	indices = zeros(T,n)
 	lowlinks = zeros(T,n)
@@ -122,6 +122,17 @@ mutable struct State{T}
 	v::T
 	stage::T
 	root::Bool
+end
+
+# Make State constructor handle type conversion for custom types UInt24 and UInt40
+# Direct constructor - no recursion
+function State(x::T, y::T, visited::Bool) where T <: Unsigned
+    return State{T}(x, y, visited)
+end
+
+# Type conversion constructor
+function State(x::Integer, y::T, visited::Bool) where T <: Unsigned
+    return State{T}(convert(T, x), y, visited)
 end
 
 """
