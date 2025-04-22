@@ -1,6 +1,6 @@
 #
 # Adjacently: Julia Complex Directed Networks Library
-# Copyright (C) 2016-2024 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
+# Copyright (C) 2016-2025 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -22,23 +22,22 @@ include("../src/graph.jl")
 
 #Logging.configure(level=Debug)
 
-using GraphPlot
+using GraphPlot, Match
 
-function manage_dataset(input_path::AbstractString, output_filename::AbstractString; is_pajek=false) where {T<:Unsigned}
-	g = SimpleDiGraph{UInt32}()
+function manage_dataset(input_path::AbstractString, output_filename::AbstractString; is_pajek=false, separator::AbstractChar=',')
 	if !is_pajek
-		load_adjacency_list_from_csv(UInt32, g, input_path)
+		g = load_adjacency_list_from_csv(input_path, separator)
 	else
-	    load_graph_from_pajek(UInt32, g, input_path)
+	    g = load_graph_from_pajek(input_path)
 	end
 
 	# display basic stats
-	@info("Full graph #v:", convert(Int,nv(g)))
+	@info("Full graph #v:", convert(Int, nv(g)))
 	@info("Full graph #e:", ne(g))
 
 	@info("getting core")
 	core,oni,noi = get_core(g)
-	@info("Core #v:", convert(Int,nv(core)))
+	@info("Core #v:", convert(Int, nv(core)))
 	@info("Core #e:", ne(core))
 
 	@info("getting reverse core")
@@ -47,11 +46,11 @@ function manage_dataset(input_path::AbstractString, output_filename::AbstractStr
 
 	# export graph data of core and reverse core
 	write_mgs3_graph(core, output_filename)
-	write_mgs4_graph(core, rcore, output_filename)
+	write_mgs3_huffman_graph(core, rcore, output_filename)
 	#serialize_to_jld(core, "core", output_filename)
 	
-	write_mgs3_graph(rcore, output_filename)
-	write_mgs4_graph(rcore, core, output_filename)
+	write_mgs3_graph(rcore, replace(output_filename, "core" => "rcore"))
+	write_mgs3_huffman_graph(rcore, core, replace(output_filename, "core" => "rcore"))
 	#serialize_to_jld(rcore, "rcore", output_filename)
 end
 
@@ -60,18 +59,33 @@ end
 ###
 
 # amazon_0601, web_google, arxiv_hep-ph, eat
-dataset = "eat"
+if length(ARGS) == 0 || ARGS[1] == "-h"
+    println("Usage: julia load_datasets.jl [dataset]")
+    println("Available datasets:")
+    println("  amazon - Amazon_0601 graph")
+    println("  google - Web_Google graph")
+    println("  arxiv  - Arxiv_HEP-PH graph")
+    println("  eat    - EAT (new) graph")
+    exit(0)
+end
 
-if dataset == "amazon"
-	@info("loading Amazon_0601 graph")
-	load_dataset("../datasets/Amazon_0601/Amazon0601.txt", "Amazon_0601_core")
-elseif dataset == "google"
-	@info("loading Web_Google graph")
-	load_dataset("../datasets/Web_Google/web-Google.txt","Web_Google_core")
-elseif dataset == "arxiv"
-	@info("loading Arxiv_HEP-PH graph")
-	load_dataset("../datasets/Arxiv_HEP-PH/Cit-HepPh.txt", "Arxiv_HEP-PH_core")
-elseif dataset == "eat"
-	@info("loading EAT (new) graph")
-	load_dataset("../datasets/EAT/EATnew.net", "EAT_rcore", is_pajek=true)
+dataset = ARGS[1]
+
+@match dataset begin
+    "amazon" => begin
+        @info("loading Amazon_0601 graph")
+        manage_dataset("../datasets/Amazon_0601/Amazon0601.txt", "Amazon_0601_core", separator='\t')
+    end
+    "google" => begin
+        @info("loading Web_Google graph")
+        manage_dataset("../datasets/Web_Google/web-Google.txt","Web_Google_core", separator='\t')
+    end
+    "arxiv" => begin
+        @info("loading Arxiv_HEP-PH graph")
+        manage_dataset("../datasets/Arxiv_HEP-PH/Cit-HepPh.txt", "Arxiv_HEP-PH_core", separator='\t')
+    end
+    "eat" => begin
+        @info("loading EAT (new) graph")
+        manage_dataset("../datasets/EAT/EATnew.net", "EAT_core", is_pajek=true)
+    end
 end

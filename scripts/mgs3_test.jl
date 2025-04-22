@@ -1,6 +1,6 @@
 #
 # Adjacently: Julia Complex Dorected Networks Library
-# Copyright (C) 2016-2024 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
+# Copyright (C) 2016-2025 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -19,12 +19,10 @@ Pkg.activate(normpath(joinpath(@__DIR__, "..")))
 include("../src/io.jl")
 include("../src/graph.jl")
 
-g = SimpleDiGraph{UInt32}()
-
 filename = ARGS[1]
 
 # load CSV adjacency list
-load_adjacency_list_from_csv(UInt32, g, filename, '\t')
+g = load_adjacency_list_from_csv(filename, '\t')
 
 nvs,nes,dens = get_basic_stats(g)
 
@@ -32,8 +30,7 @@ nvs,nes,dens = get_basic_stats(g)
 write_mgs3_graph(g, "Arxiv_HEP-PH")
 
 # load graph in MGSv3 format
-gb = SimpleDiGraph{UInt32}()
-load_mgs3_graph(gb, "Arxiv_HEP-PH.mgs")
+gb = load_mgs3_graph("Arxiv_HEP-PH.mgs")
 
 println(nv(g))
 println(outneighbors(g,vertices(g)[1]))

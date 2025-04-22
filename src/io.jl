@@ -724,11 +724,11 @@ function load_adjacency_list(adj_list::Array{Unsigned,2})
 end
 
 """ 
-    load_graph_from_pajek(::Type{T},g::AbstractGraph{T},filename::AbstractString) where {T<:Unsigned}
+    load_graph_from_pajek(filename::AbstractString)
 
 Load net Pajek file
 """
-function load_graph_from_pajek(::Type{T}, g::AbstractGraph{T}, filename::AbstractString) where {T<:Unsigned}
+function load_graph_from_pajek(filename::AbstractString)
 	f = open(filename,"r")
 	
 	inside_vertices_section = false
