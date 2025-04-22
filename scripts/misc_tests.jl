@@ -28,26 +28,26 @@ include("../src/graph.jl")
 
 @info("############ Testing sorting functions")
 
-A = Int[3,6,4,7,1,9,2,12,10]
+A = UInt8[3,6,4,7,1,9,2,12,10]
 
 @info("mergesort algorithm")
 R = bottom_up_sort(A)	
 
 @info("quicksort algorithm")
 A2 = copy(A)
-R2 = quicksort_iterative!(A2)	
+R2 = quicksort_iterative_permutation!(A2)	
 
 # permutation array
-PA = [5,7,1,3,2,4,6,9,8]
+PA = UInt8[5, 7, 1, 3, 2, 4, 6, 9, 8]
 
 @assert R == R2 == PA
 
 # sorted arrays
-SA1 = [1,2,3,4,6,7,9,10,12] 
-SA2 = [12,10,9,7,6,4,3,2,1]
+SA1 = UInt8[1, 2, 3, 4, 6, 7, 9, 10, 12] 
+SA2 = UInt8[12, 10, 9, 7, 6, 4, 3, 2, 1]
 
-S = get_sorted_array(A,R)
-S2 = get_sorted_array(A,R,false)
+S = get_sorted_array(A, R)
+S2 = get_sorted_array(A, R, false)
 
 @info("original array: ", A)
 @info("permutation array (merge sort): ", R)
@@ -66,12 +66,12 @@ S2 = get_sorted_array(A,R,false)
 
 @info("############ Testing search functions")
 
-v = Int[1,2,4,6,8]
-i = binary_search(v,3)
-i2 = searchsortedfirst(v,3)
-i3 = searchsortedfirst(v,4)
-i4 = searchsortedfirst(v,9)
-i5 = searchsortedfirst(v,0)
+v = UInt8[1, 2, 4, 6, 8]
+i = binary_search(v, UInt8(3))
+i2 = searchsortedfirst(v, UInt8(3))
+i3 = searchsortedfirst(v, UInt8(4))
+i4 = searchsortedfirst(v, UInt8(9))
+i5 = searchsortedfirst(v, UInt8(0))
 
 @info("original array: ", v)
 @info("position of 3: ", i)
@@ -88,7 +88,7 @@ i5 = searchsortedfirst(v,0)
 
 @info("############ Testing Huffman encoding functions")
 
-v = UInt8[1,6,3,7,2,8,5,18,12,17,13,24,12,1,4]
+v = UInt8[1, 6, 3, 7, 2, 8, 5, 18, 12, 17, 13, 24, 12, 1, 4]
 #v = UInt8[1,1,1,1]
 
 t = huffman_encoding(v)
@@ -124,9 +124,7 @@ get_huffman_codes!(t2, C, B)
 
 # load graph
 @info("loading MGS3 graph")
-g = SimpleDiGraph{UInt32}()
-
-load_mgs3_graph(g, "../datasets/Arxiv_HEP-PH/Arxiv_HEP-PH_core.mgs")
+g = load_mgs3_graph("../datasets/Arxiv_HEP-PH/Arxiv_HEP-PH_core.mgs")
 
 @info("Core #v:", nv(g))
 @info("Core #e:", ne(g))
@@ -136,12 +134,13 @@ rg = get_reverse_graph(g)
 @info("RCore #e:", ne(rg))
 
 @info("writing MGS4 graph")
-write_mgs4_graph(g, rg, "test")
+write_mgs3_huffman_graph(g, rg, "test")
 
 @info("loading MGS4 graph")
-gb = SimpleDiGraph{UInt32}()
-load_mgs4_graph(gb,"test.mgz")
+gb = load_mgs3_huffman_graph("test.mgz")
 @info("# vertices:", nv(gb))
 @info("# edges:", ne(gb))
+
+rm("test.mgz", force=true)
 
 @info("##########")
