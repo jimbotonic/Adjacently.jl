@@ -1,6 +1,6 @@
 #
 # Adjacently: Julia Complex Directed Networks Library
-# Copyright (C) 2016-2024 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
+# Copyright (C) 2016-2025 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -13,33 +13,37 @@
 # GNU General Public License for more details.
 #
 
-using Pkg
+using Pkg, Match
 Pkg.activate(normpath(joinpath(@__DIR__, "..")))
 
 include("../src/io.jl")
 include("../src/graph.jl")
 
-g = SimpleDiGraph{UInt32}()
-
 filename = ARGS[1]
 
-# load CSV adjacency list
-load_graph_from_pajek(UInt32, g, filename)
+# Load graph
+g = load_graph_from_pajek(filename)
 
-nvs,nes,dens = get_basic_stats(g)
-println(nvs, " ", nes," ", dens)
+# Get stats
+nvs, nes, dens = get_basic_stats(g)
+println("Vertices: $nvs, Edges: $nes, Density: $dens")
+
+# Process vertices
+for v in vertices(g)[1:100]
+    println("Neighbors of $v: ", LightGraphs.outneighbors(g, v))
+end
 
 # save graph in MGSv3 format
 write_mgs3_graph(g, "EAT")
 
 # load graph in MGSv3 format
-g2 = SimpleDiGraph{UInt32}()
-load_mgs3_graph(g2, "EAT.mgs")
+g2 = load_mgs3_graph("EAT.mgs")
 
-nvs,nes,dens = get_basic_stats(g2)
-println(nvs, " ", nes," ", dens)
+# Get stats for loaded graph
+nvs, nes, dens = get_basic_stats(g2)
+println("Vertices: $nvs, Edges: $nes, Density: $dens")
 
-vs = vertices(g2)
+# Process vertices
 for v in vertices(g2)[1:100]
-	println(outneighbors(g2,v))
+    println("Neighbors of $v: ", LightGraphs.outneighbors(g2, v))
 end
