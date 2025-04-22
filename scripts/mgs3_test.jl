@@ -19,10 +19,10 @@ Pkg.activate(normpath(joinpath(@__DIR__, "..")))
 include("../src/io.jl")
 include("../src/graph.jl")
 
-filename = ARGS[1]
+using Statistics
 
 # load CSV adjacency list
-g = load_adjacency_list_from_csv(filename, '\t')
+g = load_adjacency_list_from_csv("../datasets/Arxiv_HEP-PH/Cit-HepPh.txt", '\t')
 
 nvs,nes,dens = get_basic_stats(g)
 
@@ -32,8 +32,28 @@ write_mgs3_graph(g, "Arxiv_HEP-PH")
 # load graph in MGSv3 format
 gb = load_mgs3_graph("Arxiv_HEP-PH.mgs")
 
-println(nv(g))
-println(outneighbors(g,vertices(g)[1]))
-println(nv(gb))
-println(outneighbors(gb,vertices(gb)[1]))
-#println(ne(gb))
+println("Original graph:")
+println("# vertices: ", nv(g))
+println("# edges: ", ne(g))
+println("density: ", density(g))
+println("max degree: ", maximum(outdegree(g)))
+println("min degree: ", minimum(outdegree(g)))
+println("avg degree: ", mean(outdegree(g)))
+println("median degree: ", median(outdegree(g)))
+println("std degree: ", std(outdegree(g)))
+println("outneighbors of vertex 1: ", outneighbors(g,vertices(g)[1]))
+
+println("--------------------------------")
+
+println("MGSv3 graph:")
+println("# vertices: ", nv(gb))
+println("# edges: ", ne(gb))
+println("density: ", density(gb))
+println("max degree: ", maximum(outdegree(gb)))
+println("min degree: ", minimum(outdegree(gb)))
+println("avg degree: ", mean(outdegree(gb)))
+println("median degree: ", median(outdegree(gb)))
+println("std degree: ", std(outdegree(gb)))
+println("outneighbors of vertex 1: ", outneighbors(gb,vertices(gb)[1]))
+
+rm("Arxiv_HEP-PH.mgs", force=true)
