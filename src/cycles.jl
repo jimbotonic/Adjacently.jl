@@ -13,7 +13,17 @@
 # GNU General Public License for more details.
 #
 
+module Cycles
+
 using LightGraphs, DataStructures, Logging
+using ..CustomTypes: UInt24, UInt40
+using ..CustomLightGraphs: SimpleDiGraph, SimpleGraph, SimpleEdge
+
+# Export the functions we want to make available
+export list_colinks, 
+       list_triangles, 
+       load_colinks_distribution, 
+       load_triangles_distribution
 
 """
     list_colinks(g::AbstractGraph{T},rg::AbstractGraph{T},filename::String) where {T<:Unsigned}
@@ -324,3 +334,5 @@ function load_triangles_distribution(size::T,filename::String) where {T<:Unsigne
 	end
 	return t_stats
 end
+
+end # module Cycles

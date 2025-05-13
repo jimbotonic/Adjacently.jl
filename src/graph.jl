@@ -13,10 +13,35 @@
 # GNU General Public License for more details.
 #
 
-using LightGraphs, DataStructures, SparseArrays, 
-	LinearAlgebra, Logging
+module Graph
 
-include("algo.jl")
+using LightGraphs, DataStructures, SparseArrays, LinearAlgebra, Logging
+using ..CustomTypes: UInt24, UInt40
+using ..CustomLightGraphs: SimpleDiGraph, SimpleGraph, SimpleEdge
+using ..Util: infer_uint_custom_type
+using ..Algo: pearce_iterative
+using ..RandomWalks: RW, RW_aggregated
+
+# Export the functions we want to make available
+export get_basic_stats, 
+       display_basic_stats, 
+       get_out_degree_stats, 
+       get_sinks, 
+       get_sources, 
+       subgraph, 
+       subgraph_streamed, 
+       get_core, 
+       get_core_streamed, 
+       get_reverse_graph, 
+       get_vertex_in_degrees, 
+       get_in_out_degrees, 
+       get_avg_out_degree, 
+       get_forward_ball, 
+       get_clustering_coefficients, 
+       get_colink_coefficients, 
+       get_inclist_from_adjlist, 
+       get_sparse_adj_matrix, 
+       get_sparse_P_matrix
 
 ###
 # Basic stats for directed graphs
@@ -560,4 +585,6 @@ function get_sparse_symmetric_P_matrix(g::AbstractGraph{T}) where {T<:Unsigned}
 	D = sparse(range, range, S)
 	return D*A*D
 end
+
+end # module Graph
 

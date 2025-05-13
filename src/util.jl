@@ -13,9 +13,32 @@
 # GNU General Public License for more details.
 #
 
+module Util
+
 using DataStructures, Logging
 
-include("node_types.jl")
+using ..NodeTypes: AbstractNode, Node, EmptyNode
+using ..CustomTypes: UInt24, UInt40
+
+# Export the functions we want to make available
+export swap, 
+       partition_permutation!, 
+       quicksort_iterative_permutation!,
+       partition!,
+       quicksort_iterative!,
+       bottom_up_sort,
+       bottom_up_merge,
+       binary_search,
+       get_sorted_array,
+       encode_tree!,
+       get_huffman_codes!,
+       decode_tree!,
+       decode_values,
+       huffman_encoding,
+       get_next_smallest,
+       infer_uint_custom_type,
+       infer_uint_std_type,
+       to_bytes
 
 ##### custom implementation of QuickSort
 """
@@ -527,4 +550,50 @@ function infer_uint_std_type(n_bits::UInt8)
         throw(ArgumentError("List size is too large. Maximum supported bits are 64."))
     end
 end
+
+"""
+    to_bytes(x::T) where T <: Unsigned
+
+Convert unsigned integer to array of bytes in big-endian order.
+"""
+function to_bytes(x::T) where T <: Unsigned
+    n = sizeof(T)
+    bytes = Vector{UInt8}(undef, n)
+    for i in 1:n
+        bytes[i] = (x >> (8 * (n - i))) & 0xFF
+    end
+    return bytes
+end
+
+"""
+    to_bytes(x::UInt24)
+
+Convert UInt24 to array of 3 bytes in big-endian order.
+"""
+function to_bytes(x::UInt24)
+    val = reinterpret(UInt32, x) & 0xFFFFFF
+    return UInt8[
+        (val >> 16) & 0xFF,
+        (val >> 8) & 0xFF,
+        val & 0xFF
+    ]
+end
+
+"""
+    to_bytes(x::UInt40)
+
+Convert UInt40 to array of 5 bytes in big-endian order.
+"""
+function to_bytes(x::UInt40)
+    val = reinterpret(UInt64, x) & 0xFFFFFFFFFF
+    return UInt8[
+        (val >> 32) & 0xFF,
+        (val >> 24) & 0xFF,
+        (val >> 16) & 0xFF,
+        (val >> 8) & 0xFF,
+        val & 0xFF
+    ]
+end
+
+end # module Util
 

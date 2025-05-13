@@ -15,10 +15,13 @@
 
 using Pkg
 Pkg.activate(normpath(joinpath(@__DIR__, "..")))
+Pkg.add("Adjacently")
 
-include("../src/util.jl")
-include("../src/io.jl")
-include("../src/graph.jl")
+using Adjacently
+using Adjacently.Util
+using Adjacently.IO
+using Adjacently.Graph
+
 
 #using Base.Test
 

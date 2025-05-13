@@ -13,16 +13,18 @@
 # GNU General Public License for more details.
 #
 
-using Pkg
+using Pkg, Match
 Pkg.activate(normpath(joinpath(@__DIR__, "..")))
 
-include("../src/util.jl")
-include("../src/io.jl")
-include("../src/graph.jl")
+using Adjacently
+using Adjacently.IO: load_adjacency_list_from_csv, load_graph_from_pajek
+using Adjacently.Graph: get_core, get_reverse_graph, get_basic_stats
+using Adjacently.MGS: write_mgs3_graph, write_mgs3_huffman_graph
+using LightGraphs: nv, ne
 
 #Logging.configure(level=Debug)
 
-using GraphPlot, Match
+using GraphPlot
 
 function manage_dataset(input_path::AbstractString, output_filename::AbstractString; is_pajek=false, separator::AbstractChar=',')
 	if !is_pajek

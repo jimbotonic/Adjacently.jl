@@ -13,9 +13,15 @@
 # GNU General Public License for more details.
 #
 
-include("rw.jl")
+module PageRank
 
-using LightGraphs, DataStructures, Logging, Distances, SparseArrays
+using LightGraphs, DataStructures, Logging, SparseArrays, LinearAlgebra
+using ..CustomTypes: UInt24, UInt40
+using ..CustomLightGraphs: SimpleDiGraph, SimpleGraph, SimpleEdge
+using ..RandomWalks: RW_aggregated  # Import only what we need from RandomWalks
+
+# Export the functions we want to make available
+export PR, PPR
 
 DAMPING_FACTOR = 0.85
 EPSILON = 1e-6
@@ -256,3 +262,5 @@ function PR(P::SparseMatrixCSC{Float64,T},fun::Function;ppr::Array{Float64,1}=Fl
 	end
 	return pr
 end
+
+end # module PageRank

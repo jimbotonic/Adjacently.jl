@@ -13,8 +13,15 @@
 # GNU General Public License for more details.
 #
 
+module CustomLightGraphs
+
 import LightGraphs
 import LightGraphs.SimpleGraphs: SimpleDiGraph, SimpleGraph, SimpleEdge
+import LightGraphs: src, dst
+using ..CustomTypes: UInt24, UInt40
+
+# Export the functions we want to make available
+export SimpleDiGraph, SimpleGraph, SimpleEdge
 
 # Implement nv for our custom types
 LightGraphs.nv(g::SimpleDiGraph{UInt24}) = convert(Int, g.ne)
@@ -254,7 +261,7 @@ import LightGraphs: AbstractGraphFormat
 LightGraphs.is_directed(::Type{UInt24}) = true
 LightGraphs.is_directed(::Type{UInt40}) = true
 
-#####
+end # module CustomLightGraphs
 
 
 

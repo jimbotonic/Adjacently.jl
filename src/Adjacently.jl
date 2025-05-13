@@ -15,64 +15,49 @@
 
 module Adjacently
 
-module algo
+# First include and export the base types that other modules depend on
+include("custom_types.jl")  # Move CustomTypes first since other modules depend on it
+using .CustomTypes: UInt24, UInt40
+export UInt24, UInt40
 
-export tarjan, pearce, pearce_iterative
+include("node_types.jl")
+using .NodeTypes: Node, EmptyNode, AbstractNode
+export Node, EmptyNode, AbstractNode
 
-include("algo.jl")
-end
-
-module io
-
-export load_jls_serialized, serialize_to_jls, load_jld_serialized, 
-    serialize_to_jld, write_mgs3_graph, load_mgs3_graph, 
-    write_mgs3_huffman_graph, load_mgs3_huffman_graph, load_adjacency_list_from_csv, 
-    load_graph_from_pajek
-
-include("io.jl")
-end
-
-module pr
-
-export PR, PPR
-
-include("pr.jl")
-end
-
-module util
-
-export quicksort_iterative_permutation!, bottom_up_sort, binary_search, huffman_encoding
+include("custom_lightgraphs.jl")
+using .CustomLightGraphs: SimpleDiGraph, SimpleGraph, SimpleEdge
+export SimpleDiGraph, SimpleGraph, SimpleEdge
 
 include("util.jl")
-end
+using .Util
+export Util
 
-module rw
+include("io.jl")
+using .IO
+export IO
 
-export RW, RW_aggregated, RW_aggregated, 
-    US, ARW, ARW_flying, MHRW, MHRW_flying, CC_MHRW_flying
+include("algo.jl")
+using .Algo
+export Algo
 
-include("rw.jl")
-end
+include("rw.jl")  # Load RandomWalks before PageRank
+using .RandomWalks
+export RandomWalks
 
-module graph
-
-export get_basic_stats, display_basic_stats, get_out_degree_stats, 
-    get_sinks, get_sources, subgraph, 
-    subgraph_streamed, get_core, get_core_streamed, 
-    get_reverse_graph, get_vertex_in_degrees, get_in_out_degrees, 
-    get_avg_out_degree, get_forward_ball, get_clustering_coefficients, 
-    get_colink_coefficients, get_inclist_from_adjlist, get_sparse_adj_matrix, 
-    get_sparse_P_matrix
+include("pr.jl")  # Now PageRank will have access to both CustomTypes and RandomWalks
+using .PageRank
+export PageRank
 
 include("graph.jl")
-end
-
-module cycles
-
-export list_colinks, list_triangles, load_colinks_distribution, 
-    load_triangles_distribution
+using .Graph
+export Graph
 
 include("cycles.jl")
-end
+using .Cycles
+export Cycles
 
-end
+include("mgs.jl")
+using .MGS
+export MGS
+
+end # module Adjacently
