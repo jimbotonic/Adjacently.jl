@@ -13,7 +13,21 @@
 # GNU General Public License for more details.
 #
 
-using LightGraphs
+module RandomWalks
+
+using LightGraphs, DataStructures, Logging
+using ..CustomTypes: UInt24, UInt40
+using ..CustomLightGraphs: SimpleDiGraph, SimpleGraph, SimpleEdge
+
+# Export the functions we want to make available
+export RW, 
+       RW_aggregated, 
+       US, 
+       ARW, 
+       ARW_flying, 
+       MHRW, 
+       MHRW_flying, 
+       CC_MHRW_flying
 
 """ 
     RW(g::AbstractGraph{T},n_steps::UInt64,starting_v::T=convert(T,1)) where {T<:Unsigned}
@@ -398,3 +412,5 @@ function get_CC_MHRW_flying_ball(g::AbstractGraph{T},n_vertices::T,ccs::Array{Fl
 	end
 	return collect(visited_nodes)
 end
+
+end # module RandomWalks
