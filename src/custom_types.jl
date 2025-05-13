@@ -13,10 +13,16 @@
 # GNU General Public License for more details.
 #
 
+module CustomTypes
+
+# Export the custom types
+export UInt24, UInt40
+
 # Trailing zeros
 import Base: trailing_zeros, convert, reinterpret, >>, <<, Float64, Float32, 
     lastindex, firstindex, promote_rule, convert, AbstractFloat, Int64, UInt32, UInt64
 
+# All the existing type definitions and implementations
 primitive type UInt24 <: Unsigned 24 end
 primitive type UInt40 <: Unsigned 40 end
 
@@ -76,7 +82,6 @@ Base.:<(x::UInt40, y::UInt40) = reinterpret(UInt64, x) < reinterpret(UInt64, y)
 Base.:<=(x::UInt40, y::UInt40) = reinterpret(UInt64, x) <= reinterpret(UInt64, y)
 Base.:>(x::UInt40, y::UInt40) = reinterpret(UInt64, x) > reinterpret(UInt64, y)
 Base.:>=(x::UInt40, y::UInt40) = reinterpret(UInt64, x) >= reinterpret(UInt64, y)
-
 
 # Display and utility functions
 Base.show(io::IO, x::UInt24) = print(io, "UInt24(", reinterpret(UInt32, x), ")")
@@ -275,46 +280,4 @@ end
 
 #####
 
-"""
-    to_bytes(x::T) where T <: Unsigned
-
-Convert unsigned integer to array of bytes in big-endian order.
-"""
-function to_bytes(x::T) where T <: Unsigned
-    n = sizeof(T)
-    bytes = Vector{UInt8}(undef, n)
-    for i in 1:n
-        bytes[i] = (x >> (8 * (n - i))) & 0xFF
-    end
-    return bytes
-end
-
-"""
-    to_bytes(x::UInt24)
-
-Convert UInt24 to array of 3 bytes in big-endian order.
-"""
-function to_bytes(x::UInt24)
-    val = reinterpret(UInt32, x) & 0xFFFFFF
-    return UInt8[
-        (val >> 16) & 0xFF,
-        (val >> 8) & 0xFF,
-        val & 0xFF
-    ]
-end
-
-"""
-    to_bytes(x::UInt40)
-
-Convert UInt40 to array of 5 bytes in big-endian order.
-"""
-function to_bytes(x::UInt40)
-    val = reinterpret(UInt64, x) & 0xFFFFFFFFFF
-    return UInt8[
-        (val >> 32) & 0xFF,
-        (val >> 24) & 0xFF,
-        (val >> 16) & 0xFF,
-        (val >> 8) & 0xFF,
-        val & 0xFF
-    ]
-end
+end # module CustomTypes

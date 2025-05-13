@@ -7,11 +7,16 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
-# This program is distributed in the hope that it should be useful,
+# This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
 #
+
+module NodeTypes
+
+# Export the types and functions we want to make available
+export AbstractNode, Node, EmptyNode
 
 # Binary tree node type declarations
 abstract type AbstractNode end
@@ -24,3 +29,5 @@ mutable struct Node{T} <: AbstractNode
     left::AbstractNode
     right::AbstractNode
 end 
+
+end # module NodeTypes 

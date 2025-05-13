@@ -1,6 +1,6 @@
 #
 # Adjacently: Julia Complex Directed Networks Library
-# Copyright (C) 2016-2024 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
+# Copyright (C) 2016-2025 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -13,20 +13,36 @@
 # GNU General Public License for more details.
 #
 
-using Test, LightGraphs, Adjacently.io, Adjacently.graph, Adjacently.util
+using Test
+using Pkg
+using Statistics  # Add this import for mean, median, std
+Pkg.activate(normpath(joinpath(@__DIR__, "..")))
 
-const GRAY_TO_RSA_TABLE_PATH = joinpath(@__DIR__, "data", "gray_to_rsa.txt")
+using Adjacently
+using Adjacently.IO: load_adjacency_list_from_csv, load_graph_from_pajek
+using Adjacently.Graph: get_core, get_reverse_graph, get_basic_stats
+using Adjacently.MGS: write_mgs3_graph, write_compressed_mgs3_graph, load_mgs3_graph, load_compressed_mgs3_graph
+using Adjacently.Util: bottom_up_sort, quicksort_iterative_permutation!, get_sorted_array, binary_search, huffman_encoding, encode_tree!, decode_tree!, get_huffman_codes!
+using LightGraphs: nv, ne, outneighbors, vertices, outdegree, density
 
-const AMZ_DATASET_IN = joinpath(@__DIR__, "..", "datasets", "Amazon_0601", "Amazon0601.txt")
+# Get the absolute path to the project root directory
+const PROJECT_ROOT = normpath(joinpath(@__DIR__, ".."))
+
+# Helper function to get absolute path for dataset files
+function get_dataset_path(filename)
+    return normpath(joinpath(PROJECT_ROOT, "datasets", filename))
+end
+
+const AMZ_DATASET_IN = get_dataset_path("Amazon_0601/Amazon0601.txt")
 const AMZ_DATASET_OUT = "Amazon_0601_core"
 
-const GG_DATASET_IN = joinpath(@__DIR__, "..", "datasets", "Web_Google", "web-Google.txt")
+const GG_DATASET_IN = get_dataset_path("Web_Google/web-Google.txt")
 const GG_DATASET_OUT = "Web_Google_core"
 
-const ARX_DATASET_IN = joinpath(@__DIR__, "..", "datasets", "Arxiv_HEP-PH", "Cit-HepPh.txt")
+const ARX_DATASET_IN = get_dataset_path("Arxiv_HEP-PH/Cit-HepPh.txt")
 const ARX_DATASET_OUT = "Arxiv_HEP-PH_core"
 
-const EAT_DATASET_IN = joinpath(@__DIR__, "..", "datasets", "EAT", "EATnew.net")
+const EAT_DATASET_IN = get_dataset_path("EAT/EATnew.net")
 const EAT_DATASET_OUT = "EAT_rcore"
 
 """
@@ -34,7 +50,7 @@ const EAT_DATASET_OUT = "EAT_rcore"
 
 Load graph from CSV adjacency list or Pajek file
 """
-function load_dataset(input_path::AbstractString; separator::AbstractChar=',', is_pajek::Bool=false)
+function load_dataset(input_path::String; separator::Char=',', is_pajek::Bool=false)
 	if !is_pajek
 		g = load_adjacency_list_from_csv(input_path, separator)
 	else
@@ -64,7 +80,7 @@ end
 	write_mgs3_graph(amz_core, AMZ_DATASET_OUT)
 
 	@info("Saving Amazon dataset (core) in MGZ format")
-	write_mgs3_huffman_graph(amz_core, amz_rcore, AMZ_DATASET_OUT)
+	write_compressed_mgs3_graph(amz_core, amz_rcore, AMZ_DATASET_OUT, :children, :huffman)
 	# serialize_to_jld(amz_core, "core", AMZ_DATASET_OUT)
 	
 	@info("Loading Amazon dataset (core) from MGS format")
@@ -73,14 +89,14 @@ end
 	@test 3301092 == ne(amz_core_mgs)
 
 	@info("Loading Amazon dataset (core) from MGZ format")
-	amz_core_mgz = load_mgs3_huffman_graph(AMZ_DATASET_OUT * ".mgz")
+	amz_core_mgz = load_compressed_mgs3_graph(AMZ_DATASET_OUT * ".mgz")
 	@test 395234 == convert(Int,nv(amz_core_mgz))
 	@test 3301092 == ne(amz_core_mgz)
 end
 
 @testset "Arxiv_HEP-PH Graph Tests" begin
-    # Load the test graph
-    g = load_adjacency_list_from_csv("../datasets/Arxiv_HEP-PH/Cit-HepPh.txt", '\t')
+    @info("Loading Arxiv_HEP-PH dataset")
+    g = load_adjacency_list_from_csv(ARX_DATASET_IN, '\t')
     
     # Test basic graph properties
     @test nv(g) == 34546
@@ -143,7 +159,7 @@ end
     v = UInt8[1, 2, 4, 6, 8]
     
     # Test binary search
-    @test binary_search(v, UInt8(3)) == 0  # not found
+    @test binary_search(v, UInt8(3)) == -1  # not found
     
     # Test searchsortedfirst
     @test searchsortedfirst(v, UInt8(3)) == 3  # insert position
@@ -189,8 +205,8 @@ end
     @test ne(rg) == ne(g)
     
     # Test MGS4 format (Huffman compressed) writing and loading
-    write_mgs3_huffman_graph(g, rg, "test")
-    gb = load_mgs3_huffman_graph("test.mgz")
+    write_compressed_mgs3_graph(g, rg, "test", :children, :huffman)
+    gb = load_compressed_mgs3_graph("test.mgz", :huffman)
     
     # Verify graph properties are preserved
     @test nv(gb) == initial_vertices

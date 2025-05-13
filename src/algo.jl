@@ -13,7 +13,13 @@
 # GNU General Public License for more details.
 #
 
+module Algo
+
 using LightGraphs, DataStructures, Logging
+using ..CustomTypes: UInt24, UInt40
+
+# Export the functions we want to make available
+export tarjan, pearce, pearce_iterative
 
 """
     tarjan(g::AbstractGraph{T}) where {T<:Unsigned}
@@ -202,3 +208,5 @@ function pearce_iterative(g::AbstractGraph{T}) where {T<:Unsigned}
 
 	return rindex
 end
+
+end # module Algo
