@@ -16,13 +16,13 @@
 module Adjacently
 
 # First include and export the base types that other modules depend on
-include("custom_types.jl")  # Move CustomTypes first since other modules depend on it
-using .CustomTypes: UInt24, UInt40
-export UInt24, UInt40
-
 include("node_types.jl")
 using .NodeTypes: Node, EmptyNode, AbstractNode
 export Node, EmptyNode, AbstractNode
+
+include("custom_types.jl")
+using .CustomTypes: UInt24, UInt40
+export UInt24, UInt40
 
 include("custom_lightgraphs.jl")
 using .CustomLightGraphs: SimpleDiGraph, SimpleGraph, SimpleEdge
