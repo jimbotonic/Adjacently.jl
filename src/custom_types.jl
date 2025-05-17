@@ -280,4 +280,22 @@ end
 
 #####
 
+# Add these hash implementations for UInt24 and UInt40
+function Base.hash(x::UInt24, h::UInt64)
+    # Convert to UInt32 first to ensure proper hashing
+    return hash(reinterpret(UInt32, x), h)
+end
+
+function Base.hash(x::UInt40, h::UInt64)
+    # Convert to UInt64 first to ensure proper hashing
+    return hash(reinterpret(UInt64, x), h)
+end
+
+# Also add isequal and == for proper dictionary operations
+Base.isequal(x::UInt24, y::UInt24) = reinterpret(UInt32, x) == reinterpret(UInt32, y)
+Base.isequal(x::UInt40, y::UInt40) = reinterpret(UInt64, x) == reinterpret(UInt64, y)
+
+Base.:(==)(x::UInt24, y::UInt24) = reinterpret(UInt32, x) == reinterpret(UInt32, y)
+Base.:(==)(x::UInt40, y::UInt40) = reinterpret(UInt64, x) == reinterpret(UInt64, y)
+
 end # module CustomTypes

@@ -100,7 +100,8 @@ function write_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, encodin
   		version = HEADER_MGS3_D0_CS1
 	end
 
-	f = open("$filename.mgs", "w")
+	# create the output file (with extension .mgs)
+	f = open(filename * ".mgs", "w")
 	
 	### write header
 	# MGS version + parameters (7 bytes)
@@ -198,7 +199,7 @@ function load_mgs3_graph(filename::AbstractString)
 	# 0x0: directed graph | 0x1: undirected graph
 	graph_type = version[6] >> 4
 	# coding scheme is 4 first bits of 7th byte of header	
-	coding_scheme = version[7] >> 4
+	encoding = version[7] >> 4 == 0x0 ? :children : :index
 
 	# intialize graph g according to graph type
 	g = if graph_type == 0x0
@@ -215,7 +216,7 @@ function load_mgs3_graph(filename::AbstractString)
 
 	# coding scheme: data section only with implicit numbering of vertices
 	# NB: each list of children is terminated with 0
-	if coding_scheme == 0x00
+	if encoding == :children
 		# read data
 		children = V[]
 		while !eof(f)
@@ -245,7 +246,7 @@ function load_mgs3_graph(filename::AbstractString)
 			end
 		end
 	# coding scheme: index+data sections with implicit numbering of vertices
-	elseif coding_scheme == 0x01
+	elseif encoding == :index
 		# read index
 		# NB: 
 		# - position indices are 1-based
@@ -264,16 +265,16 @@ function load_mgs3_graph(filename::AbstractString)
 
 		# add edges
 		current_pos = 1
-		for i in 1:length(vs)
-			source = convert(V, i)
+		for v in vs
+			source = convert(V, v)
 			# if we reached the last parent vertex
-			if i == length(vs)
+			if v == length(vs)
 				pos1 = current_pos
 				pos2 = length(children)
 			else
 				pos1 = current_pos
-				# position of the last child of vertex i
-				pos2 = current_pos + ods[i+1] - 1
+				# position of the last child of vertex v
+				pos2 = current_pos + ods[v] - 1
 				current_pos = pos2 + 1
 			end
 			# add edges for each child
@@ -365,7 +366,6 @@ function write_huffman_compressed_mgs3_graph(g::AbstractGraph{T}, rg::AbstractGr
 	
 	#  The difference of size should >= 0 
 	diff_size = p_size_t - n_size_t
-	
 
 	if encoding == :children
 		# 'MGS' + 0x0300 + 0x00 (directed graph + compression) + 0x00 (data section only + reserved)
@@ -377,31 +377,32 @@ function write_huffman_compressed_mgs3_graph(g::AbstractGraph{T}, rg::AbstractGr
   		version = HEADER_MGS3_DH_CS1
 	end
 
-	f = open("$filename.mgz", "w")
+	# create the output file (with extension .mgz)
+	f = open(filename * ".mgz", "w")
 
-	# vertices in-degree
-	in_degrees = T[]
-	# number of children for each vertex
-	# NB: `T` should have a sufficient size to store the number of children
-	ods = T[]
-	# flattened list of children for all the vertices
-	# NB: `T` should have a sufficient size to store the children indices
-	children = T[]
+	# flattened list of children for the whole graph
+	children = V[]
 
+	# frequencies of each vertex (in-degree)
+	in_degrees = Dict{V,V}()
+	# frequencies of each vertex (out-degree)
+	out_degrees = Dict{V,V}()
+
+	# collect all children and in-degrees
 	for v in vs
 		ovs = outneighbors(g, v)
-		push!(ods, convert(T, length(ovs)))
-		push!(in_degrees, length(outneighbors(rg, v)))
+		out_degrees[convert(V, v)] = convert(V, length(ovs))
+		in_degrees[convert(V, v)] = convert(V, length(outneighbors(rg, v)))
 		for o in ovs
-			push!(children, o)	
+			push!(children, convert(V, o))
 		end
 	end
 
-	# if coding scheme is :children, we need a special stop sequence for each vertex in the data section
+	# if coding scheme is :children, we need a special stop sequence equal to the number of vertices
+	# NB: frequencies are in the range [0, gs-1] and the stop sequence is the code associated to `gs`
 	if encoding == :children
-		# this stop sequence will appear `gs` times in the data section
-		# let's add to the in-degrees list the number of vertices
-		push!(in_degrees, convert(T, gs))
+		# add the stop sequence typemax(V) to the frequencies
+		in_degrees[typemax(V)] = convert(V, gs)
 	end
 
 	@info("generating Huffman tree")
@@ -430,37 +431,36 @@ function write_huffman_compressed_mgs3_graph(g::AbstractGraph{T}, rg::AbstractGr
 	
 	@info("writing frequency section")
 	### write frequency section
-	for p in in_degrees
-		#bytes = reverse(reinterpret(UInt8, [p]))[diff_size+1:end]
-		bytes = to_bytes(p)[(diff_size+1):end]
+	for v in vs
+		bytes = to_bytes(in_degrees[v])[(diff_size+1):end]
 		write(f, bytes)
 	end
 
 	if encoding == :children
+		# write stop sequence in frequency section
+		bytes = to_bytes(in_degrees[typemax(V)])[(diff_size+1):end]
+		write(f, bytes)
+		
 		@info("writing data section with stop sequence")
 		### write data section
 		cdata = BitArray{1}()
-		# stop sequence is the code associated to the number of vertices `gs`
-		# NB: frequencies are in the range [0, gs-1] and the stop sequence is the code associated to `gs`
+		# stop sequence is the code associated to typemax(V)
 		# NB: R has a length of `gs+1` because of the stop sequence
-		stop_seq_code = R[gs+1]
+		stop_seq_code = R[typemax(V)] 
 		
 		for v in vs
 			ovs = outneighbors(g, v)
 			for c in ovs
-				# get code associated to child vertex id
-				code = R[c]
+				code = R[convert(V, c)]
 				append!(cdata, code)
 			end
 			append!(cdata, stop_seq_code)
 		end
 	elseif encoding == :index
-		# if coding scheme is 0x01, we need to write the index section
 		@info("writing index section")
 		### write index section
-		for p in ods
-			#bytes = reverse(reinterpret(UInt8, [p]))[diff_size+1:end]
-			bytes = to_bytes(p)[(diff_size+1):end]
+		for v in vs
+			bytes = to_bytes(out_degrees[v])[(diff_size+1):end]
 			write(f, bytes)
 		end
 		
@@ -468,12 +468,12 @@ function write_huffman_compressed_mgs3_graph(g::AbstractGraph{T}, rg::AbstractGr
 		### write data section
 		cdata = BitArray{1}()
 		for c in children
-			# get code associated to child id
-			code = R[c]
+			code = R[convert(V, c)]
 			append!(cdata, code)
 		end
 	end
 	
+	# write the final padding
 	# add padding if necessary to make the data section a multiple of 8 bytes
 	scd = convert(UInt32, length(cdata))
 	sp = 8 - scd%8
@@ -546,7 +546,7 @@ function load_huffman_compressed_mgs3_graph(filename::AbstractString)
 	graph_type = version[6] >> 4
 
 	# coding scheme is 4 first bits of 7th byte of header	
-	coding_scheme = version[7] >> 4
+	encoding = version[7] >> 4 == 0x0 ? :children : :index
 
 	# intialize graph g according to graph type
 	g = if graph_type == 0x0
@@ -557,28 +557,37 @@ function load_huffman_compressed_mgs3_graph(filename::AbstractString)
 	
 	# vertex set
 	vs = range(1, stop=gs)
+	# NB: stop sequence is the code associated to typemax(V)
+	stop_seq = typemax(V)
 
 	@info("generating graph")
 	@info("adding vertices")
 	# add vertices to graph
     add_vertices!(g, gs)
+	
+	# frequencies of each vertex (in-degree)
+	in_degrees = Dict{V,V}()
 
 	# read frequency section
-	F = V[]
-	for i in 1:(gs+1)
+	for v in vs
 		p = read(f, sizeof(V))
-		push!(F, reinterpret(V, reverse(p))[1])
+		in_degrees[v] = reinterpret(V, reverse(p))[1]
 	end
-	
-	ods = V[]
-	if coding_scheme == 0x01
+
+	if encoding == :children
+		# read stop sequence from frequency section
+		p = read(f, sizeof(V))
+		stop_seq_value = reinterpret(V, reverse(p))[1]
+		in_degrees[stop_seq] = stop_seq_value
+	end
+
+	out_degrees = Dict{V,V}()
+	if encoding == :index
 		@info("reading index section")
 		# read index
-		# NB: 
-		# - position indices are 1-based
-		for i in 1:gs
+		for v in vs
 			p = read(f, sizeof(V))
-			push!(ods, reinterpret(V, reverse(p))[1])
+			out_degrees[v] = reinterpret(V, reverse(p))[1]
 		end
 	end
 
@@ -586,7 +595,9 @@ function load_huffman_compressed_mgs3_graph(filename::AbstractString)
 	# read data section
 	CDATA = BitArray{1}()
 	while !eof(f)
+		# read a byte
 		b = read(f, 1)[1]
+		# read each bit of the byte
 		for j in 0:7
 			if ((b >> j) & 0x01) == 1
 				push!(CDATA, true)
@@ -602,48 +613,39 @@ function load_huffman_compressed_mgs3_graph(filename::AbstractString)
 	CDATA = CDATA[1:end-(7+sp)]
 	
 	@info("generating Huffman tree")
-	# get Huffman encoding tree
-	tree = huffman_encoding(F)
+	tree = huffman_encoding(in_degrees)
 	
 	@info("decoding values")
-	# decode values
 	children = decode_values(tree, CDATA)
 
-	@info("adding edges")
-	# add edges
-	if coding_scheme == 0x00
-		pos = 1
-		n_children = length(children)
-		# NB: stop sequence is the code associated to `gs+1`
-		stop_seq = convert(V, gs+1)
+	# number of children
+	n_children = length(children)
 
-		for i in 1:length(vs)
-			if pos <= n_children
-				source = convert(V,i)
-				while children[pos] != stop_seq
-					target = children[pos]
-					add_edge!(g, source, target)
-					pos += 1
-				end
-				# skip stop sequence
+	@info("adding edges")
+	if encoding == :children
+		pos = 1
+		for v in vs
+			source = convert(V, v)
+			while pos <= n_children && children[pos] != stop_seq
+				target = children[pos]
+				add_edge!(g, source, target)
 				pos += 1
-			else
-				# if we reached the last child, we are done
-				break
 			end
+			# skip stop sequence
+			pos += 1
 		end
-	elseif coding_scheme == 0x01
+	elseif encoding == :index
 		current_pos = 1
-		for i in 1:length(vs)
-			source = convert(V,i)
+		for v in vs
+			source = convert(V,v)
 			# if we reached the last parent vertex
-			if i == length(vs)
+			if v == length(vs)
 				pos1 = current_pos
-				pos2 = length(children)
+				pos2 = n_children
 			else
 				pos1 = current_pos
-				# position of the last child of vertex i
-				pos2 = current_pos + ods[i+1] - 1
+				# position of the last child of vertex v
+				pos2 = current_pos + out_degrees[v] - 1
 				current_pos = pos2 + 1
 			end
 			# add edges for each child
