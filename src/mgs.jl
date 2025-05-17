@@ -20,7 +20,7 @@ using ..CustomTypes: UInt24, UInt40
 using ..NodeTypes: Node, EmptyNode
 using ..CustomLightGraphs: SimpleDiGraph, SimpleGraph, SimpleEdge
 using ..Util: infer_uint_custom_type, to_bytes, huffman_encoding, encode_tree!, decode_tree!, get_huffman_codes!, decode_values  # Add these imports
-using ..Graph: get_basic_stats  # Add specific imports from Graph if needed
+using ..Graph: get_basic_stats, get_in_out_degrees  # Add specific imports from Graph if needed
 
 # constants
 # 'MGS' + 0x0300 (major=3, minor=0) 
@@ -289,9 +289,15 @@ function load_mgs3_graph(filename::AbstractString)
 end
 
 """
-    write_compressed_mgs3_graph(g::AbstractGraph{T}, rg::AbstractGraph{T}, filename::AbstractString, compression::Symbol=:huffman, coding_scheme::UInt8=0x00) where {T<:Unsigned}
+    write_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, compression::Symbol=:huffman, coding_scheme::UInt8=0x00) where {T<:Unsigned}
 
 Write graph in MGS v3 format with specified encoding and compression scheme
+
+Parameters:
+- g: Input graph
+- filename: Output filename
+- compression: Compression scheme to use (default: :huffman)
+- encoding: Coding scheme (:children for children section only, :index for index+children sections)
 
 Supported encoding schemes:
 - :children
@@ -302,16 +308,11 @@ Supported compression schemes:
 - :elias - Elias gamma coding
 - :golomb - Golomb coding
 
-Parameters:
-- g: Input graph
-- rg: Reverse graph (required for some compression schemes)
-- filename: Output filename
-- encoding: Coding scheme (:children for children section only, :index for index+children sections)
-- compression: Compression scheme to use (default: :huffman)
+@returns nothing
 """
-function write_compressed_mgs3_graph(g::AbstractGraph{T}, rg::AbstractGraph{T}, filename::AbstractString, encoding::Symbol=:children, compression::Symbol=:huffman) where {T<:Unsigned}
+function write_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, encoding::Symbol=:children, compression::Symbol=:huffman) where {T<:Unsigned}
     if compression == :huffman
-        write_huffman_compressed_mgs3_graph(g, rg, filename, encoding)
+        write_huffman_compressed_mgs3_graph(g, filename, encoding)
     elseif compression == :elias
         error("Elias gamma coding not yet implemented")
     elseif compression == :golomb
@@ -323,15 +324,18 @@ end
 
 
 """
-    write_huffman_compressed_mgs3_graph(g::AbstractGraph{T}, rg::AbstractGraph{T}, filename::AbstractString, coding_scheme::UInt8=0x00) where {T<:Unsigned}
+    write_huffman_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, coding_scheme::UInt8=0x00) where {T<:Unsigned}
 
 write graph in a compressed MGS v3 (Huffman compression scheme)
 
-Supported encoding schemes:
-- :children
-- :index
+Parameters:
+- g: Input graph
+- filename: Output filename
+- encoding: Coding scheme (:children for children section only, :index for index+children sections)
+
+@returns nothing
 """
-function write_huffman_compressed_mgs3_graph(g::AbstractGraph{T}, rg::AbstractGraph{T}, filename::AbstractString, encoding::Symbol=:children) where {T<:Unsigned}
+function write_huffman_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, encoding::Symbol=:children) where {T<:Unsigned}
 	# Header 12 bytes: 
 	# -> version: 'MGS' 3 bytes string
 	# -> major + minor version: 2 bytes
@@ -383,16 +387,15 @@ function write_huffman_compressed_mgs3_graph(g::AbstractGraph{T}, rg::AbstractGr
 	# flattened list of children for the whole graph
 	children = V[]
 
-	# frequencies of each vertex (in-degree)
-	in_degrees = Dict{V,V}()
-	# frequencies of each vertex (out-degree)
-	out_degrees = Dict{V,V}()
+	# frequencies of each vertex (in- and out- degrees)
+	in_degrees, out_degrees = get_in_out_degrees(g, V)
 
+	println("in_degrees: $in_degrees")
+	println("out_degrees: $out_degrees")
+	
 	# collect all children and in-degrees
 	for v in vs
 		ovs = outneighbors(g, v)
-		out_degrees[convert(V, v)] = convert(V, length(ovs))
-		in_degrees[convert(V, v)] = convert(V, length(outneighbors(rg, v)))
 		for o in ovs
 			push!(children, convert(V, o))
 		end

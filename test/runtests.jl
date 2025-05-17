@@ -153,26 +153,35 @@ end
 	amz_rcore = get_reverse_graph(amz_core) 
 	@test 395234 == convert(Int,nv(amz_rcore))
 	@test 3301092 == ne(amz_rcore)
+    
+    # Create test directory if it doesn't exist
+    test_dir = joinpath(PROJECT_ROOT, "test", "test_data")
+    mkpath(test_dir)
 
 	@info("Saving Amazon dataset (core) in MGS format")
 	# NB: the output file is created with extension .mgs
-	write_mgs3_graph(amz_core, AMZ_DATASET_OUT)
+	write_mgs3_graph(amz_core, joinpath(test_dir, AMZ_DATASET_OUT))
 
 	@info("Saving Amazon dataset (core) in MGZ format")
 	# NB: the output file is created with extension .mgz
-	write_compressed_mgs3_graph(amz_core, amz_rcore, AMZ_DATASET_OUT, :children, :huffman)
+	write_compressed_mgs3_graph(amz_core, joinpath(test_dir, AMZ_DATASET_OUT), :children, :huffman)
 	
 	@info("Loading Amazon dataset (core) from MGS format")
 	# NB: the input file is created with extension .mgs
-	amz_core_mgs = load_mgs3_graph(AMZ_DATASET_OUT * ".mgs")
+	amz_core_mgs = load_mgs3_graph(joinpath(test_dir, AMZ_DATASET_OUT * ".mgs"))
 	@test 395234 == convert(Int,nv(amz_core_mgs))
 	@test 3301092 == ne(amz_core_mgs)
 
 	@info("Loading Amazon dataset (core) from MGZ format")
 	# NB: the input file is created with extension .mgz
-	amz_core_mgz = load_compressed_mgs3_graph(AMZ_DATASET_OUT * ".mgz")
+	amz_core_mgz = load_compressed_mgs3_graph(joinpath(test_dir, AMZ_DATASET_OUT * ".mgz"), :huffman)
 	@test 395234 == convert(Int,nv(amz_core_mgz))
 	@test 3301092 == ne(amz_core_mgz)
+
+    # Clean up test files
+    rm(joinpath(test_dir, AMZ_DATASET_OUT * ".mgs"), force=true)
+    rm(joinpath(test_dir, AMZ_DATASET_OUT * ".mgz"), force=true)
+    rm(test_dir, force=true, recursive=true)  # Clean up the test directory
 end
 
 @testset "Arxiv_HEP-PH Graph Tests" begin
@@ -245,7 +254,7 @@ end
     
     # Test MGS4 format (Huffman compressed) writing and loading
     # NB: the output file is created with extension .mgz
-    write_compressed_mgs3_graph(g_loaded, rg, mgz_output_file, :children, :huffman)
+    write_compressed_mgs3_graph(g_loaded, mgz_output_file, :children, :huffman)
     gb = load_compressed_mgs3_graph(mgz_output_file * ".mgz", :huffman)
     
     # Verify graph properties are preserved
