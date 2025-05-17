@@ -15,7 +15,9 @@
 
 module Util
 
-using DataStructures, Logging
+using Base.Order
+using DataStructures
+using Logging
 
 using ..NodeTypes: AbstractNode, Node, EmptyNode
 using ..CustomTypes: UInt24, UInt40
@@ -40,7 +42,10 @@ export swap,
        infer_uint_std_type,
        to_bytes
 
-##### custom implementation of QuickSort
+################################################################################    
+# custom implementation of QuickSort
+################################################################################
+
 """
     swap(A::Vector{T}, i::T, j::T) where {T<:Unsigned}
 
@@ -192,7 +197,9 @@ function quicksort_iterative!(A::Vector{T}) where T <: Unsigned
     return A
 end
 
-##### custom implementation of MergeSort
+################################################################################
+# custom implementation of MergeSort
+################################################################################
 
 """
     bottom_up_sort(A::Vector{T}) where {T<:Unsigned}
@@ -293,15 +300,14 @@ function binary_search(A::Vector{T}, x::T) where {T<:Unsigned}
 	end
 end
 
-##### custom implementation of Huffman encoding 
-
 """
     get_sorted_array(A::Vector{T}, R::Vector{T}, asc::Bool=true) where {T}
 
 get sorted array
 
-A: initial array
-R: permutation array
+@param A: initial array
+@param R: permutation array
+@param asc: ascending order
 """
 function get_sorted_array(A::Vector{T}, R::Vector{T}, asc::Bool=true) where {T}
 	S = zeros(Int,length(A))
@@ -320,191 +326,200 @@ function get_sorted_array(A::Vector{T}, R::Vector{T}, asc::Bool=true) where {T}
 	return S
 end
 
-"""
-    encode_tree!(root::AbstractNode, S::BitArray{1} , D::Array{T,1}) where {T}
+################################################################################
+# custom implementation of Huffman encoding 
+################################################################################
 
-encode binary tree
-
-the tree is encoded in
-S: bits array
-D: array of leaf node values 
 """
-function encode_tree!(root::AbstractNode, S::BitArray{1} , D::Array{T,1}) where {T}
-	if root == EmptyNode
-        	push!(S, 0)
-        	return
-	else
-		push!(S, 1)
-		push!(D, root.key)
-		encode_tree!(root.left,S,D) 
-		encode_tree!(root.right,S,D) 
-	end
+    _sorted_pairs(frequencies)
+
+Helper – turn the Dict into a sorted Vector of (sym,weight) pairs
+"""
+function _sorted_pairs(freqs::Dict{T, T}) where {T<:Unsigned}
+    pairs = collect(freqs)                         # Vector{Pair{T,T}}
+    sort!(pairs, by = x -> (x.second, x.first))     
+    return pairs
+end
+
+"""
+    huffman_encoding(data::Vector{T}) where {T<:Unsigned}
+
+Build a Huffman tree from an array of symbols (any Unsigned type)
+"""
+function huffman_encoding(data::Vector{T}) where {T<:Unsigned}
+    isempty(data) && throw(ArgumentError("Input array must not be empty"))
+
+    # Build frequency dictionary
+    freqs = Dict{T, T}()
+    for s in data
+        freqs[s] = get(freqs, s, zero(T)) + one(T)     
+    end
+
+    # Use the dictionary-based implementation
+    return huffman_encoding(freqs)
+end
+
+"""
+    huffman_encoding(frequencies::Dict{T,T}; use_heap::Bool = true) where {T<:Unsigned}
+
+Build and return a Huffman tree from a dictionary that maps each symbol ID
+to its frequency.
+
+* **`use_heap = true` (default)** – use an incremental binary min-heap.
+  Good for medium-to-huge tables because each push / pop is *O(log n)* and no
+  full vector re-sorts are needed.
+
+* **`use_heap = false`** – fall back to the fully sorted-vector algorithm you
+  already had.  Usually fastest for very small dictionaries because the heap
+  setup costs more than one quick sort.
+
+The function handles all corner cases (0, 1, 2 symbols) just like the other
+overloads.
+"""
+function huffman_encoding(freqs::Dict{T,T}; use_heap::Bool = true) where {T<:Unsigned}
+    isempty(freqs) &&
+        throw(ArgumentError("Frequency table must contain at least one symbol"))
+
+    # Handle trivial cases first
+    if length(freqs) == 1
+        (sym, _) = first(freqs)
+        return Node{T}(sym, EmptyNode, EmptyNode)
+    elseif length(freqs) == 2
+        (sym1, w1), (sym2, w2) = collect(freqs)
+        left, right = w1 < w2 || (w1 == w2 && sym1 < sym2) ?
+                      (Node{T}(sym1, EmptyNode, EmptyNode), Node{T}(sym2, EmptyNode, EmptyNode))  :
+                      (Node{T}(sym2, EmptyNode, EmptyNode), Node{T}(sym1, EmptyNode, EmptyNode))
+        return Node{T}(zero(T), left, right)
+    end
+
+    # fast path: using heap
+    if use_heap
+        # Each heap element is (weight, seq, Node).
+        # • weight : the Huffman weight (frequency sum)
+        # • seq    : a strictly increasing counter → guarantees uniqueness,
+        #            so Node is never looked at when two weights are equal.
+        #            That keeps the default tuple ordering well-defined.
+        # • Node   : the actual tree node
+        #
+        HeapElem{T} = Tuple{T, Int, Node{T}}
+        heap        = BinaryMinHeap{HeapElem{T}}()      # default ForwardOrdering
+
+        seq = 0
+        for (sym, w) in freqs
+            seq += 1
+            push!(heap, (w, seq, Node{T}(sym, EmptyNode, EmptyNode)))
+        end
+
+        while length(heap) > 1
+            (w1, _, n1) = pop!(heap)
+            (w2, _, n2) = pop!(heap)
+
+            # deterministic left / right choice
+            left, right = w1 < w2 || (w1 == w2 && n1.key < n2.key) ? (n1, n2) : (n2, n1)
+
+            seq += 1
+            push!(heap, (w1 + w2, seq, Node{T}(zero(T), left, right)))
+        end
+
+        return pop!(heap)[3]            # the single remaining Node
+    else
+        # slow-but-simple path: fully sort once, then vector queue
+        pairs = _sorted_pairs(freqs)                   # sorted vector of (symbol, weight) pairs
+        pq = [(p.second, Node{T}(p.first, EmptyNode, EmptyNode)) for p in pairs]   # priority queue
+
+        while length(pq) > 1
+            (w1, n1) = popfirst!(pq)
+            (w2, n2) = popfirst!(pq)
+
+            left, right = w1 < w2 || (w1 == w2 && n1.key < n2.key) ? (n1, n2) : (n2, n1)
+            new = (w1 + w2, Node{T}(zero(T), left, right))
+
+            # Insert in sorted order
+            pos = searchsortedfirst(pq, new; by = x -> x[1])
+            insert!(pq, pos, new)
+        end
+        return pq[1][2]
+    end
+end
+
+"""
+    encode_tree!(root::AbstractNode, S::BitArray{1}, D::Vector{T}) where {T}
+
+Encode a binary tree into a bitarray and a vector of leaf node values
+
+@param root: root of the tree
+@param S: bitarray to store the encoded tree
+@param D: vector to store the leaf node values
+"""
+function encode_tree!(root::AbstractNode, S::BitArray{1}, D::Vector{T}) where {T}
+    root === EmptyNode && return
+    if root.left === EmptyNode && root.right === EmptyNode      # leaf
+        push!(S, true);   push!(D, root.key)
+    else                                                        # internal
+        push!(S, false)
+        encode_tree!(root.left,  S, D)
+        encode_tree!(root.right, S, D)
+    end
+end
+
+function decode_tree!(S::BitArray{1}, D::Vector{T}) where {T}
+    isempty(S) && return EmptyNode
+    b = popfirst!(S)
+    if b == 1                           # leaf
+        return Node{T}(popfirst!(D), EmptyNode, EmptyNode)
+    else                                # internal
+        left  = decode_tree!(S, D)
+        right = decode_tree!(S, D)
+        return Node{T}(zero(T), left, right)
+    end
 end
 
 """
     get_huffman_codes!(root::AbstractNode, C::Dict{BitArray{1},T}, B::BitArray{1}) where {T}
 
-get Huffman prefix codes dictionary
+Produce the canonical "code → symbol" dictionary
 
-C: dictionary (bitarray -> value::T)
+@param root: root of the tree
+@param C: dictionary (bitarray -> value::T)
+@param B: current bitarray
 """
 function get_huffman_codes!(root::AbstractNode, C::Dict{BitArray{1},T}, B::BitArray{1}) where {T}
-	if root.key != 0
-        	C[B] = root.key
-	else
-		B1 = copy(B)
-		get_huffman_codes!(root.left, C, push!(B1,false)) 
-		B2 = copy(B)
-		get_huffman_codes!(root.right, C, push!(B2,true)) 
-	end
+    root === EmptyNode && return
+    if root.left === EmptyNode && root.right === EmptyNode      # leaf
+        C[copy(B)] = root.key
+        return
+    end
+    push!(B, false);  get_huffman_codes!(root.left,  C, B);  pop!(B)
+    push!(B, true);   get_huffman_codes!(root.right, C, B);  pop!(B)
 end
 
 """
-    decode_tree!(S::BitArray{1}, D::Array{T,1}) where {T}
+    decode_values(tree::Node{T}, bits::BitArray{1}) where {T}
 
-decode binary tree
+Decode a bit-stream of data with the tree
 
-S: bits array
-D: array of leaf node values 
+@param tree: root of the tree
+@param bits: bitarray to decode
 """
-function decode_tree!(S::BitArray{1}, D::Array{T,1}) where {T}
-	length(S) == 0 && return EmptyNode
-	b = popfirst!(S)
-	if b == 1 
-        	key = popfirst!(D)
-        	root = Node{T}(key,EmptyNode,EmptyNode)
-        	root.left = decode_tree!(S,D)
-        	root.right = decode_tree!(S,D)
-        	return root
-	end
-	return EmptyNode
-end
-
-"""
-    decode_values(tree::Node{T}, CDATA::BitArray{1}) where {T}
-
-decode values
-
-C: code -> value dictionary
-"""
-function decode_values(tree::Node{T}, CDATA::BitArray{1}) where {T}
-	children = T[]
-	cnode = tree
-	for bit in CDATA
-		if cnode.left == EmptyNode && cnode.right == EmptyNode
-			push!(children, cnode.key)
-			cnode = tree
-		end
-		if bit == 0
-			cnode = cnode.left
-		else
-			cnode = cnode.right
-		end
-	end
-	return children
-end
-
-"""
-    huffman_encoding(A::Vector{T}) where {T<:Unsigned}
-
-@return huffman tree
-
-A is assumed to have a length >= 2
-A[i] is the value associated to element having index i (e.g. A[i] could be the in-degree of vertex i)
-
-conventions
--> lowest child is assigned to the left leaf, and highest child to the right leaf
--> 0: left branch, 1: right branch
-"""
-function huffman_encoding(A::Vector{T}) where {T<:Unsigned}
-    # Check for empty array
-    if isempty(A)
-        throw(ArgumentError("Input array must not be empty"))
-    end
-    
-    # Handle single element
-    if length(A) == 1
-        return Node{T}(A[1], EmptyNode, EmptyNode)
-    end
-    
-    # Handle two elements
-    if length(A) == 2
-        # Create leaf nodes with the two values
-        # Put smaller value on the left by convention
-        left_val, right_val = A[1] <= A[2] ? (A[1], A[2]) : (A[2], A[1])
-        left = Node{T}(left_val, EmptyNode, EmptyNode)
-        right = Node{T}(right_val, EmptyNode, EmptyNode)
-        return Node{T}(zero(T), left, right)
-    end
-
-    # Sort the input array and keep track of original values
-    S = copy(A)
-    R = quicksort_iterative_permutation!(S)
-    
-    # Initialize priority queues for nodes and their frequencies
-    nodes = Node{T}[]
-    freqs = T[]
-    
-    # Create initial tree from two smallest frequencies
-    freq1 = popfirst!(S)
-    freq2 = popfirst!(S)
-    val1 = popfirst!(R)
-    val2 = popfirst!(R)
-    
-    left = Node{T}(val1, EmptyNode, EmptyNode)
-    right = Node{T}(val2, EmptyNode, EmptyNode)
-    new_freq = freq1 + freq2
-    root = Node{T}(zero(T), left, right)
-    
-    # Insert initial node into queues
-    pos = searchsortedfirst(freqs, new_freq)
-    insert!(freqs, pos, new_freq)
-    insert!(nodes, pos, root)
-    
-    # Build Huffman tree
-    while !isempty(S) || !isempty(nodes)
-        # Get next two smallest frequencies
-        node1, freq1 = get_next_smallest(S, R, freqs, nodes)
-        node2, freq2 = get_next_smallest(S, R, freqs, nodes)
-        
-        # Create new internal node
-        new_freq = freq1 + freq2
-        if freq1 > freq2
-            new_node = Node{T}(zero(T), node2, node1)
-        else
-            new_node = Node{T}(zero(T), node1, node2)
-        end
-        
-        # Insert new node into queues if there are more elements to process
-        if !isempty(S) || !isempty(nodes)
-            pos = searchsortedfirst(freqs, new_freq)
-            insert!(freqs, pos, new_freq)
-            insert!(nodes, pos, new_node)
-        else
-            root = new_node
+function decode_values(tree::Node{T}, bits::BitArray{1}) where {T}
+    out  = T[];        node = tree
+    for bit in bits
+        node = (bit == 0) ? node.left : node.right
+        if node.left === EmptyNode && node.right === EmptyNode
+            push!(out, node.key)
+            node = tree                       # restart for next symbol
         end
     end
-    
-    return root
-end
-
-"""
-    get_next_smallest(S::Vector{T}, R::Vector{T}, freqs::Vector{T}, nodes::Vector{Node{T}}) where {T<:Unsigned}
-
-get next smallest frequency node
-
-S: array of frequencies
-R: array of original values
-"""
-function get_next_smallest(S::Vector{T}, R::Vector{T}, freqs::Vector{T}, nodes::Vector{Node{T}}) where {T<:Unsigned}
-    if !isempty(S) && (isempty(freqs) || S[1] <= freqs[1])
-        freq = popfirst!(S)
-        val = popfirst!(R)
-        return Node{T}(val, EmptyNode, EmptyNode), freq
-    else
-        return popfirst!(nodes), popfirst!(freqs)
+    # the last symbol is still in 'node' if the stream ended on a leaf
+    if node.left === EmptyNode && node.right === EmptyNode && node ≠ tree
+        push!(out, node.key)
     end
+    return out
 end
+
+################################################################################
+# custom unsigned integer types
+################################################################################
 
 """
 	infer_uint_custom_type(n::UInt8)
