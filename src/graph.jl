@@ -32,9 +32,9 @@ export get_basic_stats,
        subgraph_streamed, 
        get_core, 
        get_core_streamed, 
-       get_reverse_graph, 
-       get_vertex_in_degrees, 
-       get_in_out_degrees, 
+       get_reverse_graph,
+       get_in_degrees,
+       get_in_out_degrees,
        get_avg_out_degree, 
        get_forward_ball, 
        get_clustering_coefficients, 
@@ -347,41 +347,76 @@ function get_reverse_graph(g::AbstractGraph{T}) where {T<:Unsigned}
 end
 
 """ 
-    get_vertex_in_degrees(g::AbstractGraph{T}) where {T<:Unsigned}
+    get_vertex_in_degrees(g::AbstractGraph{T}, V::Type{<:Unsigned}=T) where {T<:Unsigned}
 
 get in-degree of g vertices
 
+@param g: the graph
+@param V: the type of the vertices
+
 @returns dictionary (vertex_id -> in-degree)
 """
-function get_vertex_in_degrees(g::AbstractGraph{T}) where {T<:Unsigned}
-	vin = Dict{T,T}()
-	for v in vertices(g)
-		ovs = outneighbors(g,v)
-		for o in ovs
-			if !haskey(vin,o)
-				vin[o] = convert(T,1)
-			else
-				vin[o] = convert(T,vin[o]+1)
+function get_in_degrees(g::AbstractGraph{T}, V::Type{<:Unsigned}=T) where {T<:Unsigned}
+	# if g is a directed graph, compute the in-degrees
+	if typeof(g) == SimpleDiGraph{T}
+		in_degrees = Dict{T,T}()
+
+		# initialize frequencies for all vertices to ensure every vertex has an entry
+		for v in vertices(g)
+			if !haskey(in_degrees, v)
+				in_degrees[v] = zero(V)
 			end
 		end
+
+		for v in vertices(g)
+			ovs = outneighbors(g, v)
+			for o in ovs
+				if !haskey(in_degrees, o)
+					in_degrees[o] = convert(V, 1)
+				else
+					in_degrees[o] = convert(V, in_degrees[o]+1)
+				end
+			end
+		end
+		return in_degrees
+	# if g is undirected
+	else
+		# NB: in this case, in- and out- degrees are the same
+		out_degrees = Dict{V,V}()
+		for v in vertices(g)
+			out_degrees[v] = convert(V, length(outneighbors(g,v)))
+		end
+		return out_degrees
 	end
-	return vin
 end
 
 """ 
-    get_in_out_degrees(g::AbstractGraph{T}) where {T<:Unsigned}
+    get_in_out_degrees(g::AbstractGraph{T}, V::Type{<:Unsigned}=T) where {T<:Unsigned}
 
-get in- and out- degree arrays of specified graph
+get in- and out- degree dictionaries of specified graph
+
+@param g: the graph
+@param V: the type of the vertices
+
+@returns in-degree dictionary (vertex_id -> in-degree), out-degree dictionary (vertex_id -> out-degree)
 """
-function get_in_out_degrees(g::AbstractGraph{T}) where {T<:Unsigned}
-	vin = get_vertex_in_degrees(g)
-	in_degrees = T[]
-	out_degrees = T[]
-	for v in vertices(g)
-		push!(in_degrees,vin[v])
-		push!(out_degrees,convert(T,length(outneighbors(g,v))))
+function get_in_out_degrees(g::AbstractGraph{T}, V::Type{<:Unsigned}=T) where {T<:Unsigned}
+	# if g is a directed graph, compute the in- and out- degrees
+	if typeof(g) == SimpleDiGraph{T}
+		in_degrees = get_in_degrees(g, V)
+		out_degrees = Dict{V,V}()
+		for v in vertices(g)
+			out_degrees[v] = convert(V, length(outneighbors(g, v)))
+		end
+		return in_degrees, out_degrees
+	# if g is undirected, in- and out- degrees are the same
+	else
+		out_degrees = Dict{V,V}()
+		for v in vertices(g)
+			out_degrees[v] = convert(V, length(outneighbors(g, v)))
+		end
+		return out_degrees, out_degrees
 	end
-	return in_degrees,out_degrees
 end
 
 """ 
@@ -389,12 +424,14 @@ end
 
 get the avg out-degree of the specified set of visited nodes
 
-p_avg: current average
-nb_steps: number of points used to compute p_avg
+@param g: the graph
+@param visited: the set of visited nodes
+@param p_avg: current average
+@param np_steps: number of points used to compute p_avg
 
 NB: to get the avg in-degree of visited nodes, one can use the reverse graph of g
 """
-function get_avg_out_degree(g::AbstractGraph{T},visited::Array{T,1},p_avg::Float64=float64(-1),np_steps::UInt64=uint64(0)) where {T<:Unsigned}
+function get_avg_out_degree(g::AbstractGraph{T}, visited::Array{T,1}, p_avg::Float64=-1, np_steps::UInt64=0) where {T<:Unsigned}
 	sum = 0.
 	for v in visited
 		sum += length(outneighbors(g,v))
@@ -410,8 +447,15 @@ end
     get_forward_ball(v::T,g::AbstractGraph{T},radius::Int=2,p::Float64=1) where {T<:Unsigned}
 
 get a forward ball centered at the specified vertex
+
+@param v: the vertex
+@param g: the graph
+@param radius: the radius of the ball
+@param p: the probability of adding a child
+
+@returns the set of vertex ids in the ball
 """
-function get_forward_ball(v::T,g::AbstractGraph{T},radius::Int=2,p::Float64=1) where {T<:Unsigned}
+function get_forward_ball(v::T, g::AbstractGraph{T}, radius::Int=2, p::Float64=1) where {T<:Unsigned}
 	# vertex ids of the ball
 	subids = T[]
 	push!(subids,v)
@@ -457,7 +501,12 @@ end
 
 get the array of clustering coefficients
 
-ncolinks: array of the number of colinks for each vertex
+@param g: the graph
+@param rg: the reverse graph
+@param ntriangles: the number of triangles for each vertex
+@param density: the density of the graph
+
+@returns the array of clustering coefficients
 """
 function get_clustering_coefficients(g::AbstractGraph{T},rg::AbstractGraph{T},ntriangles::Array{T,1},density::Float64=-1.) where {T<:Unsigned}
 	vs = vertices(g)
@@ -493,9 +542,14 @@ end
 
 get the array of colink coefficients
 
-ncolinks: array of the number of colinks for each vertex
+@param g: the graph
+@param rg: the reverse graph
+@param ncolinks: array of the number of colinks for each vertex
+@param density: the density of the graph
+
+@returns the array of colink coefficients
 """
-function get_colink_coefficients(g::AbstractGraph{T},rg::AbstractGraph{T},ncolinks::Array{T,1},density::Float64=-1.) where {T<:Unsigned}
+function get_colink_coefficients(g::AbstractGraph{T}, rg::AbstractGraph{T}, ncolinks::Array{T,1}, density::Float64=-1.) where {T<:Unsigned}
 	vs = vertices(g)
 	n = nv(g)
 	ccs = zeros(Float64,n)
@@ -522,6 +576,8 @@ end
     get_sparse_adj_matrix(g::AbstractGraph{T}) where {T<:Unsigned}
 
 get sparse adjacency matrix A
+
+@returns the sparse adjacency matrix
 """
 function get_sparse_adj_matrix(g::AbstractGraph{T}) where {T<:Unsigned}
 	I = Array{T,1}()
@@ -541,6 +597,8 @@ end
     get_adj_matrix(g::AbstractGraph{T}) where {T<:Unsigned}
 
 get adjacency matrix A
+
+@returns the adjacency matrix
 """
 function get_adj_matrix(g::AbstractGraph{T}) where {T<:Unsigned}
 	n = nv(g) 
@@ -557,6 +615,8 @@ end
     get_sparse_P_matrix(g::AbstractGraph{T}) where {T<:Unsigned}
 
 get P = D^-1 * A matrix
+
+@returns the sparse P matrix
 """
 function get_sparse_P_matrix(g::AbstractGraph{T}) where {T<:Unsigned}
 	n = nv(g)
@@ -574,6 +634,10 @@ end
 get P = D*^(-1/2) A* D*^(-1/2) matrix with A* = (A+I)
 
 NB: we assume there is no sink in the graph
+
+@param g: the graph
+
+@returns the sparse P matrix
 """
 function get_sparse_symmetric_P_matrix(g::AbstractGraph{T}) where {T<:Unsigned}
 	n = length(G.vertices(g))
