@@ -19,8 +19,9 @@ using LightGraphs, DataStructures, Logging
 using ..CustomTypes: UInt24, UInt40
 using ..NodeTypes: Node, EmptyNode
 using ..CustomLightGraphs: SimpleDiGraph, SimpleGraph, SimpleEdge
-using ..Util: infer_uint_custom_type, to_bytes, huffman_encoding, encode_tree!, decode_tree!, get_huffman_codes!, decode_values  # Add these imports
-using ..Graph: get_basic_stats, get_in_out_degrees  # Add specific imports from Graph if needed
+using ..Util: infer_uint_custom_type, to_bytes
+using ..Compression: huffman_encoding, encode_tree!, decode_tree!, get_huffman_codes!, decode_values
+using ..Graph: get_basic_stats, get_in_out_degrees
 
 # constants
 # 'MGS' + 0x0300 (major=3, minor=0) 
@@ -389,9 +390,6 @@ function write_huffman_compressed_mgs3_graph(g::AbstractGraph{T}, filename::Abst
 
 	# frequencies of each vertex (in- and out- degrees)
 	in_degrees, out_degrees = get_in_out_degrees(g, V)
-
-	println("in_degrees: $in_degrees")
-	println("out_degrees: $out_degrees")
 	
 	# collect all children and in-degrees
 	for v in vs
