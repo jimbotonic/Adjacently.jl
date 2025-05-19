@@ -22,7 +22,8 @@ using Adjacently
 using Adjacently.IO: load_adjacency_list_from_csv, load_graph_from_pajek
 using Adjacently.Graph: get_core, get_reverse_graph, get_basic_stats
 using Adjacently.MGS: write_mgs3_graph, write_compressed_mgs3_graph, load_mgs3_graph, load_compressed_mgs3_graph
-using Adjacently.Util: bottom_up_sort, quicksort_iterative_permutation!, get_sorted_array, binary_search, huffman_encoding, encode_tree!, decode_tree!, get_huffman_codes!
+using Adjacently.Util: bottom_up_sort, quicksort_iterative_permutation!, get_sorted_array, binary_search
+using Adjacently.Compression: huffman_encoding, encode_tree!, decode_tree!, get_huffman_codes!
 using LightGraphs: nv, ne, outneighbors, vertices, outdegree, density
 
 # Get the absolute path to the project root directory
