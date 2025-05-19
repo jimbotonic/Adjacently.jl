@@ -36,6 +36,10 @@ include("io.jl")
 using .IO
 export IO
 
+include("compression.jl")
+using .Compression
+export Compression
+
 include("algo.jl")
 using .Algo
 export Algo
