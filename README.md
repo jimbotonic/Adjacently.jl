@@ -8,7 +8,7 @@ The test suite is organized into several distinct test sets that can be run indi
 
 ### Run all tests
 ```
-julia test/runtests.jl
+julia --project=. test/runtests.jl
 ```
 
 ### Run specific test sets
