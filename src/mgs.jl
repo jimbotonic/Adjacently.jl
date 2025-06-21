@@ -645,6 +645,10 @@ function write_elias_compressed_mgs3_graph(g::AbstractGraph{T}, filename::Abstra
 			end
 		end
 	elseif encoding == :index
+		# frequencies of each vertex (out- degrees)
+		_, out_degrees = get_in_out_degrees(g, V)
+
+		
 		@info("writing index section")
 		### write index section
 		for v in vs

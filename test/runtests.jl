@@ -208,10 +208,10 @@ end
 	@test 3301092 == ne(amz_core_mgz)
 
     # Clean up test files
-    rm(joinpath(TEST_DIR, AMZ_DATASET_OUT * ".mgs"), force=true)
-    rm(joinpath(TEST_DIR, AMZ_DATASET_OUT * ".mgz"), force=true)
+    #rm(joinpath(TEST_DIR, AMZ_DATASET_OUT * ".mgs"), force=true)
+    #rm(joinpath(TEST_DIR, AMZ_DATASET_OUT * ".mgz"), force=true)
     # clean up the test directory
-    rm(TEST_DIR, force=true, recursive=true)  
+    #rm(TEST_DIR, force=true, recursive=true)  
 end
 
 @testset "Arxiv_HEP-PH Graph Tests" begin
@@ -257,9 +257,9 @@ end
     @test outneighbors(g, vertices(g)[1]) == outneighbors(g2, vertices(g2)[1])
     
     # clean up test file
-    rm(mgs_output_file * ".mgs", force=true)
+    #rm(mgs_output_file * ".mgs", force=true)
     # clean up the test directory
-    rm(TEST_DIR, force=true, recursive=true)  
+    #rm(TEST_DIR, force=true, recursive=true)  
 end
 
 @testset "Arxiv_HEP-PH Graph Tests 2" begin
@@ -299,10 +299,10 @@ end
     @test ne(gb) == initial_edges
     
     # clean up test files
-    rm(mgs_output_file * ".mgs", force=true)
-    rm(mgz_output_file * ".mgz", force=true)
+    #rm(mgs_output_file * ".mgs", force=true)
+    #rm(mgz_output_file * ".mgz", force=true)
     # clean up the test directory
-    rm(TEST_DIR, force=true, recursive=true)  
+    #rm(TEST_DIR, force=true, recursive=true)  
 end
 
 @testset "Pajek Graph Format" begin
@@ -373,9 +373,9 @@ end
     @test sort(outneighbors(g2, 88)) == sort(expected_nv88)
     
     # Clean up test file
-    rm(mgs_output_file * ".mgs", force=true)
+    #rm(mgs_output_file * ".mgs", force=true)
     # clean up the test directory
-    rm(TEST_DIR, force=true, recursive=true)  
+    #rm(TEST_DIR, force=true, recursive=true)  
 end
 
 @testset "Elias encoding" begin
@@ -394,12 +394,19 @@ end
     mkpath(TEST_DIR)
     
     # Use test directory for output files
-    mgs_output_file = joinpath(TEST_DIR, "amz_core_elias_gamma")
+    mgs_output_file = joinpath(TEST_DIR, "amz_core_elias")
 
     # Test MGS3 format preservation
     # NB: the output file is created with extension .mgs
-    write_compressed_mgs3_graph(amz_core, mgs_output_file, :children, :elias_gamma)
-    g2 = load_compressed_mgs3_graph(mgs_output_file * ".mgz", :elias_gamma)
+    write_compressed_mgs3_graph(amz_core, mgs_output_file * "_children_gamma", :children, :elias_gamma)
+    write_compressed_mgs3_graph(amz_core, mgs_output_file * "_index_gamma", :index, :elias_gamma)
+    write_compressed_mgs3_graph(amz_core, mgs_output_file * "_children_delta", :children, :elias_delta)
+    write_compressed_mgs3_graph(amz_core, mgs_output_file * "_index_delta", :index, :elias_delta)
+
+    g2 = load_compressed_mgs3_graph(mgs_output_file * "_children_gamma.mgz", :elias_gamma)
+    g3 = load_compressed_mgs3_graph(mgs_output_file * "_index_gamma.mgz", :elias_gamma)
+    g4 = load_compressed_mgs3_graph(mgs_output_file * "_children_delta.mgz", :elias_delta)
+    g5 = load_compressed_mgs3_graph(mgs_output_file * "_index_delta.mgz", :elias_delta)
     
     # verify the graph properties are preserved
     @test nv(g2) == nv(amz_core)
