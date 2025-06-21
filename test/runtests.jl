@@ -19,11 +19,13 @@ using Statistics  # Add this import for mean, median, std
 Pkg.activate(normpath(joinpath(@__DIR__, "..")))
 
 using Adjacently
-using Adjacently.IO: load_adjacency_list_from_csv, load_graph_from_pajek
+using Adjacently.IO: load_adjacency_list_from_csv, load_graph_from_pajek, BitWriter, BitReader, read_bits, flush_bitwriter
 using Adjacently.Graph: get_core, get_reverse_graph, get_basic_stats
 using Adjacently.MGS: write_mgs3_graph, write_compressed_mgs3_graph, load_mgs3_graph, load_compressed_mgs3_graph
 using Adjacently.Util: bottom_up_sort, quicksort_iterative_permutation!, get_sorted_array, binary_search
-using Adjacently.Compression: huffman_encoding, encode_tree!, decode_tree!, get_huffman_codes!
+using Adjacently.Compression: huffman_encoding, encode_huffman_tree!, decode_huffman_tree!, get_huffman_codes!, 
+write_elias_gamma, write_elias_delta, write_golomb, read_elias_gamma, read_elias_delta, read_golomb, 
+write_fibonacci_code, read_fibonacci_code
 using LightGraphs: nv, ne, outneighbors, vertices, outdegree, density
 
 # Get the absolute path to the project root directory
@@ -45,6 +47,8 @@ const ARX_DATASET_OUT = "Arxiv_HEP-PH_core"
 
 const EAT_DATASET_IN = get_dataset_path("EAT/EATnew.net")
 const EAT_DATASET_OUT = "EAT_rcore"
+
+const TEST_DIR = joinpath(PROJECT_ROOT, "test_data")
 
 """
 	load_dataset(input_path::AbstractString; separator::AbstractChar=',', is_pajek::Bool=false)
@@ -95,6 +99,31 @@ end
     @test searchsortedfirst(v, UInt8(0)) == 1  # before start
 end
 
+"Return Elias gamma code as a BitVector for a given value."
+function gamma_bits(v::T) where {T<:Unsigned}
+    io = IOBuffer()
+    writer = BitWriter(io)
+    write_elias_gamma(writer, v)
+    nbits = writer.index - 1 # capture number of bits before flush resets it
+    flush_bitwriter(writer; flush_last_bits=true)
+    # read the bits from the buffer
+    seekstart(io)
+    reader = BitReader(io)
+    return read_bits(reader, nbits)
+end
+
+@testset "Elias Encoding" begin
+    @test_throws ArgumentError write_elias_gamma(BitWriter(IOBuffer()), UInt8(0))
+
+    @test gamma_bits(UInt8(1)) == BitVector([1])
+    @test gamma_bits(UInt8(2)) == BitVector([0, 1, 0])
+    @test gamma_bits(UInt8(3)) == BitVector([0, 1, 1])
+    @test gamma_bits(UInt8(4)) == BitVector([0, 0, 1, 0, 0])
+    @test gamma_bits(UInt8(5)) == BitVector([0, 0, 1, 0, 1])
+    @test gamma_bits(UInt8(6)) == BitVector([0, 0, 1, 1, 0])
+    @test gamma_bits(UInt8(7)) == BitVector([0, 0, 1, 1, 1])
+end
+
 @testset "Huffman Encoding" begin
     v = UInt8[1, 6, 3, 7, 2, 8, 5, 18, 12, 17, 13, 24, 12, 1, 4]
     
@@ -105,10 +134,10 @@ end
     # encode the Huffman tree
     S = BitArray{1}()
     D = Array{UInt8,1}()
-    encode_tree!(t, S, D)
+    encode_huffman_tree!(t, S, D)
 
     # decode the Huffman tree
-    t2 = decode_tree!(S, D)
+    t2 = decode_huffman_tree!(S, D)
     @test t2 !== nothing
     
     # get the Huffman codes for the given values
@@ -156,33 +185,33 @@ end
 	@test 3301092 == ne(amz_rcore)
     
     # Create test directory if it doesn't exist
-    test_dir = joinpath(PROJECT_ROOT, "test", "test_data")
-    mkpath(test_dir)
+    mkpath(TEST_DIR)
 
 	@info("Saving Amazon dataset (core) in MGS format")
 	# NB: the output file is created with extension .mgs
-	write_mgs3_graph(amz_core, joinpath(test_dir, AMZ_DATASET_OUT))
+	write_mgs3_graph(amz_core, joinpath(TEST_DIR, AMZ_DATASET_OUT))
 
 	@info("Saving Amazon dataset (core) in MGZ format")
 	# NB: the output file is created with extension .mgz
-	write_compressed_mgs3_graph(amz_core, joinpath(test_dir, AMZ_DATASET_OUT), :children, :huffman)
+	write_compressed_mgs3_graph(amz_core, joinpath(TEST_DIR, AMZ_DATASET_OUT), :children, :huffman)
 	
 	@info("Loading Amazon dataset (core) from MGS format")
 	# NB: the input file is created with extension .mgs
-	amz_core_mgs = load_mgs3_graph(joinpath(test_dir, AMZ_DATASET_OUT * ".mgs"))
+	amz_core_mgs = load_mgs3_graph(joinpath(TEST_DIR, AMZ_DATASET_OUT * ".mgs"))
 	@test 395234 == convert(Int,nv(amz_core_mgs))
 	@test 3301092 == ne(amz_core_mgs)
 
 	@info("Loading Amazon dataset (core) from MGZ format")
 	# NB: the input file is created with extension .mgz
-	amz_core_mgz = load_compressed_mgs3_graph(joinpath(test_dir, AMZ_DATASET_OUT * ".mgz"), :huffman)
+	amz_core_mgz = load_compressed_mgs3_graph(joinpath(TEST_DIR, AMZ_DATASET_OUT * ".mgz"), :huffman)
 	@test 395234 == convert(Int,nv(amz_core_mgz))
 	@test 3301092 == ne(amz_core_mgz)
 
     # Clean up test files
-    rm(joinpath(test_dir, AMZ_DATASET_OUT * ".mgs"), force=true)
-    rm(joinpath(test_dir, AMZ_DATASET_OUT * ".mgz"), force=true)
-    rm(test_dir, force=true, recursive=true)  # Clean up the test directory
+    rm(joinpath(TEST_DIR, AMZ_DATASET_OUT * ".mgs"), force=true)
+    rm(joinpath(TEST_DIR, AMZ_DATASET_OUT * ".mgz"), force=true)
+    # clean up the test directory
+    rm(TEST_DIR, force=true, recursive=true)  
 end
 
 @testset "Arxiv_HEP-PH Graph Tests" begin
@@ -205,10 +234,16 @@ end
     expected_neighbors = UInt16[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     @test outneighbors(g, vertices(g)[1]) == expected_neighbors
     
+    # Create test directory if it doesn't exist
+    mkpath(TEST_DIR)
+    
+    # Use test directory for output files
+    mgs_output_file = joinpath(TEST_DIR, "Arxiv_HEP-PH_test")
+
     # Test MGS3 format preservation
     # NB: the output file is created with extension .mgs
-    write_mgs3_graph(g, "test_graph")
-    g2 = load_mgs3_graph("test_graph.mgs")
+    write_mgs3_graph(g, mgs_output_file)
+    g2 = load_mgs3_graph(mgs_output_file * ".mgs")
     
     # Verify graph properties are preserved
     @test nv(g) == nv(g2)
@@ -221,8 +256,10 @@ end
     @test std(outdegree(g)) ≈ std(outdegree(g2))
     @test outneighbors(g, vertices(g)[1]) == outneighbors(g2, vertices(g2)[1])
     
-    # Clean up test file
-    rm("test_graph.mgs", force=true)
+    # clean up test file
+    rm(mgs_output_file * ".mgs", force=true)
+    # clean up the test directory
+    rm(TEST_DIR, force=true, recursive=true)  
 end
 
 @testset "Arxiv_HEP-PH Graph Tests 2" begin
@@ -231,12 +268,11 @@ end
     g = load_dataset(ARX_DATASET_IN; separator='\t')
     
     # Create test directory if it doesn't exist
-    test_dir = joinpath(PROJECT_ROOT, "test", "test_data")
-    mkpath(test_dir)
+    mkpath(TEST_DIR)
     
     # Use test directory for output files
-    mgs_output_file = joinpath(test_dir, "Arxiv_HEP-PH_core")
-    mgz_output_file = joinpath(test_dir, "Arxiv_HEP-PH_core_compressed")
+    mgs_output_file = joinpath(TEST_DIR, "Arxiv_HEP-PH_core")
+    mgz_output_file = joinpath(TEST_DIR, "Arxiv_HEP-PH_core_compressed")
     
     # Save the graph in MGS format
     # NB: the output file is created with extension .mgs
@@ -262,10 +298,11 @@ end
     @test nv(gb) == initial_vertices
     @test ne(gb) == initial_edges
     
-    # Clean up test files
+    # clean up test files
     rm(mgs_output_file * ".mgs", force=true)
     rm(mgz_output_file * ".mgz", force=true)
-    rm(test_dir, force=true, recursive=true)  # Clean up the test directory
+    # clean up the test directory
+    rm(TEST_DIR, force=true, recursive=true)  
 end
 
 @testset "Pajek Graph Format" begin
@@ -311,11 +348,17 @@ end
         0x3a2a, 0x3c91, 0x454e, 0x46cf, 0x4a79, 0x50ca, 0x540c, 
         0x54f6, 0x5998, 0x5a4d, 0x5a51]
     @test sort(outneighbors(g, 88)) == sort(expected_nv88)
+
+    # create test directory if it doesn't exist
+    mkpath(TEST_DIR)
+    
+    # Use test directory for output files
+    mgs_output_file = joinpath(TEST_DIR, "test_eat")
     
     # Test MGS3 format preservation
     # NB: the output file is created with extension .mgs
-    write_mgs3_graph(g, "test_eat")
-    g2 = load_mgs3_graph("test_eat.mgs")
+    write_mgs3_graph(g, mgs_output_file)
+    g2 = load_mgs3_graph(mgs_output_file * ".mgs")
     
     # Verify graph properties are preserved
     nvs2, nes2, dens2 = get_basic_stats(g2)
@@ -330,7 +373,45 @@ end
     @test sort(outneighbors(g2, 88)) == sort(expected_nv88)
     
     # Clean up test file
-    rm("test_eat.mgs", force=true)
+    rm(mgs_output_file * ".mgs", force=true)
+    # clean up the test directory
+    rm(TEST_DIR, force=true, recursive=true)  
+end
+
+@testset "Elias encoding" begin
+    @info("Loading Amazon dataset")
+	amz_g = load_dataset(AMZ_DATASET_IN; separator='\t')
+	# number of vertices and edges
+	#@test 403394 == convert(Int,nv(amz_g))
+	#@test 3387388 == ne(amz_g)
+	
+	@info("Getting core")
+	amz_core, oni, noi = get_core(amz_g)
+	#@test 395234 == convert(Int,nv(amz_core))
+	#@test 3301092 == ne(amz_core)
+
+    # create test directory if it doesn't exist
+    mkpath(TEST_DIR)
+    
+    # Use test directory for output files
+    mgs_output_file = joinpath(TEST_DIR, "amz_core_elias_gamma")
+
+    # Test MGS3 format preservation
+    # NB: the output file is created with extension .mgs
+    write_compressed_mgs3_graph(amz_core, mgs_output_file, :children, :elias_gamma)
+    g2 = load_compressed_mgs3_graph(mgs_output_file * ".mgz", :elias_gamma)
+    
+    # verify the graph properties are preserved
+    @test nv(g2) == nv(amz_core)
+    @test ne(g2) == ne(amz_core)
+    @test density(g2) ≈ density(amz_core)
+    @test maximum(outdegree(g2)) == maximum(outdegree(amz_core))
+    @test minimum(outdegree(g2)) == minimum(outdegree(amz_core))
+    @test mean(outdegree(g2)) ≈ mean(outdegree(amz_core))
+    @test median(outdegree(g2)) ≈ median(outdegree(amz_core))
+
+    # clean up the test directory
+    # rm(TEST_DIR, force=true, recursive=true)  
 end
 
 
