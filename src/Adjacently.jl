@@ -15,7 +15,10 @@
 
 module Adjacently
 
-# First include and export the base types that other modules depend on
+include("constants.jl")
+using .Constants
+export Constants
+
 include("node_types.jl")
 using .NodeTypes: Node, EmptyNode, AbstractNode
 export Node, EmptyNode, AbstractNode

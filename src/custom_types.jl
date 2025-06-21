@@ -20,7 +20,8 @@ export UInt24, UInt40
 
 # Trailing zeros
 import Base: trailing_zeros, convert, reinterpret, >>, <<, Float64, Float32, 
-    lastindex, firstindex, promote_rule, convert, AbstractFloat, Int64, UInt32, UInt64
+    lastindex, firstindex, promote_rule, convert, AbstractFloat, Int64, 
+    UInt32, UInt64, leading_zeros, &
 
 # All the existing type definitions and implementations
 primitive type UInt24 <: Unsigned 24 end
@@ -31,7 +32,12 @@ function Base.convert(::Type{UInt24}, x::Int64)
     if x < 0 || x > 0xFFFFFF
         throw(InexactError(:convert, UInt24, x))
     end
-    return reinterpret(UInt24, UInt32(x) & 0xFFFFFF)
+    # Create a temporary UInt32 value
+    tmp = UInt32(x) & 0xFFFFFF
+    # Create a pointer to the temporary value
+    ptr = pointer_from_objref(Ref(tmp))
+    # Load the UInt24 value from the pointer
+    return unsafe_load(Ptr{UInt24}(ptr))
 end
 
 # Implement convert from Int64 to UInt40
@@ -39,7 +45,12 @@ function Base.convert(::Type{UInt40}, x::Int64)
     if x < 0 || x > 0xFFFFFFFFFF
         throw(InexactError(:convert, UInt40, x))
     end
-    return reinterpret(UInt40, UInt64(x) & 0xFFFFFFFFFF)
+    # Create a temporary UInt64 value
+    tmp = UInt64(x) & 0xFFFFFFFFFF
+    # Create a pointer to the temporary value
+    ptr = pointer_from_objref(Ref(tmp))
+    # Load the UInt40 value from the pointer
+    return unsafe_load(Ptr{UInt40}(ptr))
 end
 
 # STD -> Custom conversion
@@ -254,6 +265,31 @@ function (::Type{UInt40})(x::UInt64)
     return reinterpret(UInt40, x & 0xFFFFFFFFFF)
 end
 
+# Add constructors for Int64
+function (::Type{UInt24})(x::Int64)
+    if x < 0 || x > 0xFFFFFF
+        throw(InexactError(:UInt24, UInt24, x))
+    end
+    # Create a temporary UInt32 value
+    tmp = UInt32(x) & 0xFFFFFF
+    # Create a pointer to the temporary value
+    ptr = pointer_from_objref(Ref(tmp))
+    # Load the UInt24 value from the pointer
+    return unsafe_load(Ptr{UInt24}(ptr))
+end
+
+function (::Type{UInt40})(x::Int64)
+    if x < 0 || x > 0xFFFFFFFFFF
+        throw(InexactError(:UInt40, UInt40, x))
+    end
+    # Create a temporary UInt64 value
+    tmp = UInt64(x) & 0xFFFFFFFFFF
+    # Create a pointer to the temporary value
+    ptr = pointer_from_objref(Ref(tmp))
+    # Load the UInt40 value from the pointer
+    return unsafe_load(Ptr{UInt40}(ptr))
+end
+
 function Int64(x::UInt24)
     return Int64(reinterpret(UInt32, x))
 end
@@ -297,5 +333,35 @@ Base.isequal(x::UInt40, y::UInt40) = reinterpret(UInt64, x) == reinterpret(UInt6
 
 Base.:(==)(x::UInt24, y::UInt24) = reinterpret(UInt32, x) == reinterpret(UInt32, y)
 Base.:(==)(x::UInt40, y::UInt40) = reinterpret(UInt64, x) == reinterpret(UInt64, y)
+
+# Add leading zeros for UInt24 and UInt40
+function leading_zeros(x::UInt24)
+    for i in 23:-1:0
+        if (x >> i) & 0x1 != 0
+            return 23 - i
+        end
+    end
+    return 24
+end
+
+function leading_zeros(x::UInt40)
+    for i in 39:-1:0
+        if (x >> i) & 0x1 != 0
+            return 39 - i
+        end
+    end
+    return 40
+end
+
+# Define bitwise and (&) for UInt24 so that (x >> i) & 0x1 is defined.
+function (&)(a::UInt24, b::UInt24)
+    return UInt24(convert(UInt, a) & convert(UInt, b))
+end
+
+function (&)(a::UInt40, b::UInt40)
+    return UInt40(convert(UInt, a) & convert(UInt, b))
+end
+
+
 
 end # module CustomTypes
