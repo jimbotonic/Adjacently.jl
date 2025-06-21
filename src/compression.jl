@@ -374,11 +374,11 @@ function write_elias_delta(w::BitWriter, v::T) where {T<:Unsigned}
     bits_len = sizeof(T) * 8 - leading_zeros(v)
 
     # Step 1: write bits_len using Elias gamma
-    write_elias_gamma!(w, T(bits_len))
+    write_elias_gamma(w, T(bits_len))
 
     # Step 2: write the binary of v without the leading 1
     mask = (T(1) << (bits_len - 1)) - 1
-    tail_bits = v & mask
+    tail_bits = convert(T, v & mask)
     write_value(w, tail_bits, bits_len - 1)
 end
 
