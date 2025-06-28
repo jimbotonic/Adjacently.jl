@@ -396,26 +396,33 @@ end
     # Use test directory for output files
     mgs_output_file = joinpath(TEST_DIR, "amz_core_elias")
 
+    encoding_types = [:children, :index]
+    compression_types = [:elias_gamma, :elias_delta]
+    for encoding_type in encoding_types
+        for compression_type in compression_types
+            @info("Writing compressed MGS3 graph with $encoding_type encoding and $compression_type compression")
+            write_compressed_mgs3_graph(amz_core, mgs_output_file * "_" * string(encoding_type) * "_" * string(compression_type), encoding_type, compression_type)
+        end
+    end
+
     # Test MGS3 format preservation
     # NB: the output file is created with extension .mgs
-    write_compressed_mgs3_graph(amz_core, mgs_output_file * "_children_gamma", :children, :elias_gamma)
-    write_compressed_mgs3_graph(amz_core, mgs_output_file * "_index_gamma", :index, :elias_gamma)
-    write_compressed_mgs3_graph(amz_core, mgs_output_file * "_children_delta", :children, :elias_delta)
-    write_compressed_mgs3_graph(amz_core, mgs_output_file * "_index_delta", :index, :elias_delta)
-
-    g2 = load_compressed_mgs3_graph(mgs_output_file * "_children_gamma.mgz", :elias_gamma)
-    g3 = load_compressed_mgs3_graph(mgs_output_file * "_index_gamma.mgz", :elias_gamma)
-    g4 = load_compressed_mgs3_graph(mgs_output_file * "_children_delta.mgz", :elias_delta)
-    g5 = load_compressed_mgs3_graph(mgs_output_file * "_index_delta.mgz", :elias_delta)
-    
-    # verify the graph properties are preserved
-    @test nv(g2) == nv(amz_core)
-    @test ne(g2) == ne(amz_core)
-    @test density(g2) ≈ density(amz_core)
-    @test maximum(outdegree(g2)) == maximum(outdegree(amz_core))
-    @test minimum(outdegree(g2)) == minimum(outdegree(amz_core))
-    @test mean(outdegree(g2)) ≈ mean(outdegree(amz_core))
-    @test median(outdegree(g2)) ≈ median(outdegree(amz_core))
+    for encoding_type in encoding_types
+        for compression_type in compression_types
+            @info("Loading compressed MGS3 graph with $encoding_type encoding and $compression_type compression")
+            g = load_compressed_mgs3_graph(mgs_output_file * "_" * string(encoding_type) * "_" * string(compression_type) * ".mgz", compression_type)
+            
+            @info("Verifying graph properties")
+            @test nv(g) == nv(amz_core)
+            @test ne(g) == ne(amz_core)
+            @test density(g) ≈ density(amz_core)
+            @test maximum(outdegree(g)) == maximum(outdegree(amz_core))
+            @test minimum(outdegree(g)) == minimum(outdegree(amz_core))
+            @test mean(outdegree(g)) ≈ mean(outdegree(amz_core))
+            @test median(outdegree(g)) ≈ median(outdegree(amz_core))
+            @test std(outdegree(g)) ≈ std(outdegree(amz_core))
+        end
+    end
 
     # clean up the test directory
     # rm(TEST_DIR, force=true, recursive=true)  
