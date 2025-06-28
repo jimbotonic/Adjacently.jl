@@ -35,17 +35,21 @@ export get_basic_stats,
        get_reverse_graph,
        get_in_degrees,
        get_in_out_degrees,
-       get_avg_out_degree, 
+       get_out_degrees,
+	   get_avg_out_degree, 
        get_forward_ball, 
        get_clustering_coefficients, 
        get_colink_coefficients, 
        get_inclist_from_adjlist, 
        get_sparse_adj_matrix, 
-       get_sparse_P_matrix
+       get_sparse_P_matrix,
+       remap_vertices,
+       relabel_graph,
+       get_sparse_symmetric_P_matrix
 
-###
+########################################################
 # Basic stats for directed graphs
-###
+########################################################
 
 """ 
     display_basic_stats(g,rg)
@@ -146,9 +150,9 @@ function get_sources(g::AbstractGraph{T}) where {T<:Unsigned}
 	return setdiff(vs,achildren)
 end
 
-###
+########################################################
 # Subgraphs && SCCs
-###
+########################################################
 
 """ 
     subgraph(g::AbstractGraph{T},sids::Array{T,1}) where {T<:Unsigned}
@@ -183,7 +187,6 @@ function subgraph(g::AbstractGraph{T},sids::Array{T,1}) where {T<:Unsigned}
 		children = outneighbors(g,v)
 		source = oni[v]
 		for c in children
-			#if index_sorted(nvs,c) != 0
 			if haskey(oni,c)
 				target = oni[c]
 				add_edge!(ng,source,target)
@@ -226,7 +229,6 @@ function subgraph_streamed(g::AbstractGraph{T},sids::Array{T,1},name::String) wh
 				target = oni[c]
 				bytes = reinterpret(Uint8, [target])
                 		write(f2, reverse(bytes))
-				# pos += convert(Uint32, 1) -> 8 bytes!?
 				pos = convert(T,pos+1)
 			end
 		end
@@ -346,76 +348,79 @@ function get_reverse_graph(g::AbstractGraph{T}) where {T<:Unsigned}
 	return ng
 end
 
+########################################################
+# Degree stats
+########################################################
+
 """ 
-    get_vertex_in_degrees(g::AbstractGraph{T}, V::Type{<:Unsigned}=T) where {T<:Unsigned}
+    get_in_degrees(g::AbstractGraph{T}, V::Type{<:Unsigned}=T) where {T<:Unsigned}
 
 get in-degree of g vertices
 
 @param g: the graph
-@param V: the type of the vertices
 
 @returns dictionary (vertex_id -> in-degree)
 """
-function get_in_degrees(g::AbstractGraph{T}, V::Type{<:Unsigned}=T) where {T<:Unsigned}
+function get_in_degrees(g::AbstractGraph{T}) where {T<:Unsigned}
 	# if g is a directed graph, compute the in-degrees
-	if typeof(g) == SimpleDiGraph{T}
+	if is_directed(g)
 		in_degrees = Dict{T,T}()
 
 		# initialize frequencies for all vertices to ensure every vertex has an entry
 		for v in vertices(g)
 			if !haskey(in_degrees, v)
-				in_degrees[v] = zero(V)
+				in_degrees[v] = zero(T)
 			end
 		end
 
 		for v in vertices(g)
-			ovs = outneighbors(g, v)
-			for o in ovs
+			for o in outneighbors(g, v)
 				if !haskey(in_degrees, o)
-					in_degrees[o] = convert(V, 1)
+					in_degrees[o] = one(T)
 				else
-					in_degrees[o] = convert(V, in_degrees[o]+1)
+					in_degrees[o] += one(T)
 				end
 			end
 		end
 		return in_degrees
-	# if g is undirected
 	else
-		# NB: in this case, in- and out- degrees are the same
-		out_degrees = Dict{V,V}()
-		for v in vertices(g)
-			out_degrees[v] = convert(V, length(outneighbors(g,v)))
-		end
-		return out_degrees
+		return get_out_degrees(g)
 	end
 end
 
+"""
+    get_out_degrees(g::AbstractGraph{T}) where {T<:Unsigned}
+
+get out-degree of g vertices
+
+@param g: the graph
+
+@returns dictionary (vertex_id -> out-degree)
+"""
+function get_out_degrees(g::AbstractGraph{T}) where {T<:Unsigned}
+	out_degrees = Dict{T,T}()
+	for v in vertices(g)
+		out_degrees[v] = convert(T, length(outneighbors(g, v)))
+	end
+	return out_degrees
+end
+
 """ 
-    get_in_out_degrees(g::AbstractGraph{T}, V::Type{<:Unsigned}=T) where {T<:Unsigned}
+    get_in_out_degrees(g::AbstractGraph{T}) where {T<:Unsigned}
 
 get in- and out- degree dictionaries of specified graph
 
 @param g: the graph
-@param V: the type of the vertices
 
 @returns in-degree dictionary (vertex_id -> in-degree), out-degree dictionary (vertex_id -> out-degree)
 """
-function get_in_out_degrees(g::AbstractGraph{T}, V::Type{<:Unsigned}=T) where {T<:Unsigned}
-	# if g is a directed graph, compute the in- and out- degrees
-	if typeof(g) == SimpleDiGraph{T}
-		in_degrees = get_in_degrees(g, V)
-		out_degrees = Dict{V,V}()
-		for v in vertices(g)
-			out_degrees[v] = convert(V, length(outneighbors(g, v)))
-		end
+function get_in_out_degrees(g::AbstractGraph{T}) where {T<:Unsigned}
+	if is_directed(g)
+		in_degrees = get_in_degrees(g)
+		out_degrees = get_out_degrees(g)
 		return in_degrees, out_degrees
-	# if g is undirected, in- and out- degrees are the same
 	else
-		out_degrees = Dict{V,V}()
-		for v in vertices(g)
-			out_degrees[v] = convert(V, length(outneighbors(g, v)))
-		end
-		return out_degrees, out_degrees
+		return get_out_degrees(g), get_out_degrees(g)
 	end
 end
 
@@ -648,6 +653,74 @@ function get_sparse_symmetric_P_matrix(g::AbstractGraph{T}) where {T<:Unsigned}
 	range = convert(Array{T,1}, 1:n)
 	D = sparse(range, range, S)
 	return D*A*D
+end
+
+#######
+# Graph relabeling
+#######
+
+"""
+    relabel_graph(g::AbstractGraph{T}, vertex_mapping::Vector{T}) where {T<:Unsigned}
+
+relabel the graph vertices according to the specified mapping
+
+@param g: the graph
+@param vertex_mapping: the mapping of the vertices (vertex_id[old_id] -> new_id)
+
+@returns the relabeled graph
+"""
+function relabel_graph(g::AbstractGraph{T}, vertex_mapping::Dict{T,T}) where {T<:Unsigned}
+	if is_directed(g)
+		ng = SimpleDiGraph{T}()
+	else
+		ng = SimpleGraph{T}()
+	end
+	add_vertices!(ng, length(vertex_mapping))
+	for e in edges(g)
+		src_id = vertex_mapping[src(e)]
+		dst_id = vertex_mapping[dst(e)]
+		add_edge!(ng, src_id, dst_id)
+	end
+	return ng
+end 
+
+"""
+    remap_vertices(g::AbstractGraph{T}, criterion::Symbol=:in_degree) where {T<:Unsigned}
+
+remap the vertices of the graph according to the specified criterion
+
+@param g: the graph
+@param criterion: the criterion to remap the vertices (in_degree, out_degree, degree)
+
+@returns the mapping of the vertices (vertex_id[old_id] -> new_id)
+"""
+function remap_vertices(g::AbstractGraph{T}, criterion::Symbol=:in_degree) where {T<:Unsigned}
+	# compute the degrees of the vertices
+	if criterion == :in_degree
+		degrees = get_in_degrees(g)
+	elseif criterion == :out_degree
+		degrees = get_out_degrees(g)
+	elseif criterion == :degree
+		if is_directed(g)
+			degrees = get_in_degrees(g) + get_out_degrees(g)
+		else
+			degrees = get_out_degrees(g)
+		end
+	else
+		@error("Invalid criterion: $criterion")
+	end
+
+	# create a vector of (vertex, degree) pairs and sort by degree
+	vertex_degree_pairs = [(v, degrees[v]) for v in vertices(g)]
+	sort!(vertex_degree_pairs, by=x->x[2])
+	
+	# create the mapping dictionary: old_id -> new_id
+	vertex_mapping = Dict{T,T}()
+	for (new_id, (old_id, _)) in enumerate(vertex_degree_pairs)
+		vertex_mapping[old_id] = convert(T, new_id)
+	end
+	
+	return vertex_mapping
 end
 
 end # module Graph

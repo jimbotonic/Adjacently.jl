@@ -431,7 +431,10 @@ function write_huffman_compressed_mgs3_graph(g::AbstractGraph{T}, filename::Abst
 	children = V[]
 
 	# frequencies of each vertex (in- and out- degrees)
-	in_degrees, out_degrees = get_in_out_degrees(g, V)
+	in_degrees, out_degrees = get_in_out_degrees(g)
+	# convert the degrees to the custom type `V`
+	in_degrees = Dict{V,V}(k => convert(V, v) for (k, v) in in_degrees)
+	out_degrees = Dict{V,V}(k => convert(V, v) for (k, v) in out_degrees)
 	
 	# collect all children and in-degrees
 	for v in vs
@@ -646,7 +649,8 @@ function write_elias_compressed_mgs3_graph(g::AbstractGraph{T}, filename::Abstra
 		end
 	elseif encoding == :index
 		# frequencies of each vertex (out- degrees)
-		_, out_degrees = get_in_out_degrees(g, V)
+		_, out_degrees = get_in_out_degrees(g)
+		out_degrees = Dict{V,V}(k => convert(V, v) for (k, v) in out_degrees)
 		
 		@info("writing index section")
 		### write index section

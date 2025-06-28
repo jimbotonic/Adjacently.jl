@@ -20,7 +20,7 @@ Pkg.activate(normpath(joinpath(@__DIR__, "..")))
 
 using Adjacently
 using Adjacently.IO: load_adjacency_list_from_csv, load_graph_from_pajek, BitWriter, BitReader, read_bits, flush_bitwriter
-using Adjacently.Graph: get_core, get_reverse_graph, get_basic_stats
+using Adjacently.Graph: get_core, get_reverse_graph, get_basic_stats, remap_vertices, relabel_graph
 using Adjacently.MGS: write_mgs3_graph, write_compressed_mgs3_graph, load_mgs3_graph, load_compressed_mgs3_graph
 using Adjacently.Util: bottom_up_sort, quicksort_iterative_permutation!, get_sorted_array, binary_search
 using Adjacently.Compression: huffman_encoding, encode_huffman_tree!, decode_huffman_tree!, get_huffman_codes!, 
@@ -165,6 +165,21 @@ end
             end
         end
     end
+end
+
+@testset "Remapping Vertices" begin
+    g = load_dataset(AMZ_DATASET_IN; separator='\t')
+    @test nv(g) == 403394
+    @test ne(g) == 3387388
+    @test isapprox(density(g), 2.0816473245108078e-5, rtol=1e-10)
+
+    # remap the vertices according to the in-degree
+    remapped_vertices = remap_vertices(g, :in_degree)
+    remapped_g = relabel_graph(g, remapped_vertices)
+
+    @test nv(remapped_g) == nv(g)
+    @test ne(remapped_g) == ne(g)
+    @test isapprox(density(remapped_g), density(g), rtol=1e-10)
 end
 
 @testset "Amazon_0601 Graph Tests" begin
@@ -394,7 +409,7 @@ end
     mkpath(TEST_DIR)
     
     # Use test directory for output files
-    mgs_output_file = joinpath(TEST_DIR, "amz_core_elias")
+    mgs_output_file = joinpath(TEST_DIR, "amz_core")
 
     encoding_types = [:children, :index]
     compression_types = [:elias_gamma, :elias_delta]
