@@ -20,7 +20,7 @@ using ..CustomTypes: UInt24, UInt40
 using ..NodeTypes: Node, EmptyNode
 using ..CustomLightGraphs: SimpleDiGraph, SimpleGraph, SimpleEdge
 using ..Util: infer_uint_custom_type, to_bytes
-using ..IO: BitWriter, write_bytes, flush_bitwriter
+using ..IO: BitWriter, write_bytes, flush_bitwriter, BitReader
 using ..Compression: huffman_encoding, get_huffman_codes!, decode_huffman_values, 
 	delta_encode_vector, write_elias_coding, read_elias_coding, 
 	write_golomb, read_golomb, write_fibonacci_code, read_fibonacci_code
@@ -629,16 +629,16 @@ function write_elias_compressed_mgs3_graph(g::AbstractGraph{T}, filename::Abstra
 		for v in vs
 			# get the outneighbors of the vertex
 			# sort the outneighbors in ascending order
-        	ovs = sort(collect(UInt, outneighbors(g, v)))
+			ovs = sort(collect(UInt, outneighbors(g, v)))
 			# delta encode the neighbors
-        	diffs = delta_encode_vector(ovs)
-			# write the first element of the outneighbors using Elias coding
-			write_elias_coding(bw, ovs[1], compression)
+			# NB: the starting value is the first element of the `diffs` vector
+			diffs = delta_encode_vector(ovs)
 			# write the diffs using Elias coding
-        	for d in diffs
-         	   write_elias_coding(bw, d, compression)
-        	end
-			# if we did not reached the last parent vertex, write the stop sequence
+			# NB: the starting value is the first outneighbor of the vertex
+			for d in diffs
+				write_elias_coding(bw, d, compression)
+			end
+			# if we did not reach the last parent vertex, write the stop sequence
 			if v < gs
 				# write the stop sequence
 				write_elias_coding(bw, stop_seq, compression)
@@ -647,7 +647,6 @@ function write_elias_compressed_mgs3_graph(g::AbstractGraph{T}, filename::Abstra
 	elseif encoding == :index
 		# frequencies of each vertex (out- degrees)
 		_, out_degrees = get_in_out_degrees(g, V)
-
 		
 		@info("writing index section")
 		### write index section
@@ -734,9 +733,9 @@ function load_compressed_mgs3_graph(filename::AbstractString, compression::Symbo
 	gs = reinterpret(UInt64, vcat(reverse(read(f,5)),[0x00,0x00,0x00]))[1]
 	
 	# `n_size_u` is the number of bits needed to represent the graph vertices
-	n_bits_v = convert(UInt8, ceil(log(2, gs)))
+	#n_bits_v = convert(UInt8, ceil(log(2, gs)))
 	# Get appropriate unsigned int type based on number of bits needed
-	V = infer_uint_custom_type(n_bits_v)
+	#V = infer_uint_custom_type(n_bits_v)
 	
 	if compression_scheme == 0x1
 		g = load_huffman_compressed_mgs3_graph(f, graph_type, encoding, gs)
@@ -787,7 +786,7 @@ function load_huffman_compressed_mgs3_graph(f::IO, graph_type::Symbol, encoding:
 	# frequencies of each vertex (in-degree)
 	in_degrees = Dict{V,V}()
 
-	# read frequency section
+	# read frequency section for Huffman decoding
 	for v in vs
 		p = read(f, sizeof(V))
 		in_degrees[v] = reinterpret(V, reverse(p))[1]
@@ -812,7 +811,7 @@ function load_huffman_compressed_mgs3_graph(f::IO, graph_type::Symbol, encoding:
 
 	@info("reading data section")
 	# read data section
-	cdata = BitArray{1}()
+	cdata = BitVector()
 	while !eof(f)
 		# read a byte
 		b = read(f, 1)[1]
@@ -877,7 +876,7 @@ function load_huffman_compressed_mgs3_graph(f::IO, graph_type::Symbol, encoding:
 end
 
 """
-    load_elias_compressed_mgs3_graph(f::IO, graph_type::Symbol, encoding::Symbol, gs::UInt64, compression::Symbol)
+    load_elias_compressed_mgs3_graph(io::IO, graph_type::Symbol, encoding::Symbol, gs::UInt64, compression::Symbol)
 
 Load graph in compressed MGS v3 format with Elias coding scheme.
 
@@ -888,7 +887,7 @@ Parameters:
 - gs: Number of vertices
 - compression: Compression scheme (:elias_gamma or :elias_delta)
 """
-function load_elias_compressed_mgs3_graph(f::IO, graph_type::Symbol, encoding::Symbol, gs::UInt64, compression::Symbol)
+function load_elias_compressed_mgs3_graph(io::IO, graph_type::Symbol, encoding::Symbol, gs::UInt64, compression::Symbol)
 	# `n_size_u` is the number of bits needed to represent the graph vertices
 	n_bits_v = convert(UInt8, ceil(log(2, gs)))
 	# Get appropriate unsigned int type based on number of bits needed
@@ -899,14 +898,61 @@ function load_elias_compressed_mgs3_graph(f::IO, graph_type::Symbol, encoding::S
 	
 	# vertex set
 	vs = range(1, stop=gs)
-	# NB: stop sequence is the code associated to typemax(V)
-	stop_seq = typemax(V)
 
 	@info("generating graph")
 	@info("adding vertices")
 	# add vertices to graph
     add_vertices!(g, gs)
-	
+
+	reader = BitReader(io)
+
+	if encoding == :children
+		# NB: stop sequence is the code associated to typemax(V)
+		stop_seq = typemax(V)
+
+		@info("reading data section")
+		for v in vs
+			source = convert(V, v)
+			try
+				first_value = read_elias_coding(reader, compression, V)
+				if first_value == stop_seq
+					# go to next vertex
+					continue
+				end
+				add_edge!(g, source, first_value)
+				prev_value = first_value
+				while true
+					delta = read_elias_coding(reader, compression, V)
+					if delta == stop_seq
+						# go to next vertex
+						break
+					end
+					prev_value += delta
+					add_edge!(g, source, prev_value)
+				end
+			catch e
+				# do nothing
+				#if !(isa(e, EOFError) || isa(e, ArgumentError))
+				#	rethrow(e)
+				#end
+			end
+		end
+	elseif encoding == :index
+		out_degrees = Dict{V,V}()
+		@info("reading index section")
+		for v in vs
+			out_degrees[v] = read_elias_coding(reader, compression, V)
+		end
+		@info("reading data section")
+		for v in vs
+			for _ in 1:out_degrees[v]
+				target = read_elias_coding(reader, compression, V)
+				add_edge!(g, v, target)
+			end
+		end
+	end
+
+	return g
 end
 
 end
