@@ -21,7 +21,7 @@ export UInt24, UInt40
 # Trailing zeros
 import Base: trailing_zeros, convert, reinterpret, >>, <<, Float64, Float32, 
     lastindex, firstindex, promote_rule, convert, AbstractFloat, Int64, 
-    UInt32, UInt64, leading_zeros, &
+    UInt32, UInt64, leading_zeros, &, |
 
 # All the existing type definitions and implementations
 primitive type UInt24 <: Unsigned 24 end
@@ -107,22 +107,26 @@ Base.:-(x::UInt24, y::UInt24) = reinterpret(UInt24, (reinterpret(UInt32, x) - re
 Base.:+(x::UInt40, y::UInt40) = reinterpret(UInt40, (reinterpret(UInt64, x) + reinterpret(UInt64, y)) & 0xFFFFFFFFFF)
 Base.:-(x::UInt40, y::UInt40) = reinterpret(UInt40, (reinterpret(UInt64, x) - reinterpret(UInt64, y)) & 0xFFFFFFFFFF)
 
-function >>(x::UInt24, n::Int)
+# Implement right shift for UInt24
+function >>(x::UInt24, n::Unsigned)
     result = reinterpret(UInt32, x) >> n
     return reinterpret(UInt24, result & 0xFFFFFF)
 end
 
-function <<(x::UInt24, n::Int)
+# Implement left shift for UInt24
+function <<(x::UInt24, n::Unsigned)
     result = reinterpret(UInt32, x) << n
     return reinterpret(UInt24, result & 0xFFFFFF)
 end
 
-function >>(x::UInt40, n::Int)
+# Implement right shift for UInt40
+function >>(x::UInt40, n::Unsigned)
     result = reinterpret(UInt64, x) >> n
     return reinterpret(UInt40, result & 0xFFFFFFFFFF)
 end
 
-function <<(x::UInt40, n::Int)
+# Implement left shift for UInt40
+function <<(x::UInt40, n::Unsigned)
     result = reinterpret(UInt64, x) << n
     return reinterpret(UInt40, result & 0xFFFFFFFFFF)
 end
@@ -166,36 +170,6 @@ function trailing_zeros(x::UInt40)
     # Convert to UInt64 and mask the relevant bits
     return trailing_zeros(reinterpret(UInt64, x) & 0xFFFFFFFFFF)
 end
-
-# Implement right shift for UInt24
-function >>(x::UInt24, n::Unsigned)
-    result = reinterpret(UInt32, x) >> n
-    return reinterpret(UInt24, result & 0xFFFFFF)
-end
-
-# Implement left shift for UInt24
-function <<(x::UInt24, n::Unsigned)
-    result = reinterpret(UInt32, x) << n
-    return reinterpret(UInt24, result & 0xFFFFFF)
-end
-
-# Implement right shift for UInt40
-function >>(x::UInt40, n::Unsigned)
-    result = reinterpret(UInt64, x) >> n
-    return reinterpret(UInt40, result & 0xFFFFFFFFFF)
-end
-
-# Implement left shift for UInt40
-function <<(x::UInt40, n::Unsigned)
-    result = reinterpret(UInt64, x) << n
-    return reinterpret(UInt40, result & 0xFFFFFFFFFF)
-end
-
-# Also implement versions that accept Integer for the shift amount
->>(x::UInt24, n::Integer) = >>(x, convert(UInt, n))
-<<(x::UInt24, n::Integer) = <<(x, convert(UInt, n))
->>(x::UInt40, n::Integer) = >>(x, convert(UInt, n))
-<<(x::UInt40, n::Integer) = <<(x, convert(UInt, n))
 
 # Implement AbstractFloat conversion for UInt24 and UInt40
 function AbstractFloat(x::UInt24)
@@ -263,6 +237,15 @@ function (::Type{UInt40})(x::UInt64)
         throw(InexactError(:UInt40, UInt40, x))
     end
     return reinterpret(UInt40, x & 0xFFFFFFFFFF)
+end
+
+# Add constructors for Bool
+function (::Type{UInt24})(x::Bool)
+    return UInt24(x ? 1 : 0)
+end
+
+function (::Type{UInt40})(x::Bool)
+    return UInt40(x ? 1 : 0)
 end
 
 # Add constructors for Int64
@@ -353,15 +336,20 @@ function leading_zeros(x::UInt40)
     return 40
 end
 
-# Define bitwise and (&) for UInt24 so that (x >> i) & 0x1 is defined.
-function (&)(a::UInt24, b::UInt24)
-    return UInt24(convert(UInt, a) & convert(UInt, b))
-end
+# Bitwise AND
+Base.:&(a::UInt24, b::UInt24) = UInt24(reinterpret(UInt32, a) & reinterpret(UInt32, b))
+Base.:&(a::UInt40, b::UInt40) = UInt40(reinterpret(UInt64, a) & reinterpret(UInt64, b))
+Base.:&(a::UInt24, b::Bool) = a & UInt24(b ? 1 : 0)
+Base.:&(a::Bool, b::UInt24) = UInt24(a ? 1 : 0) & b
+Base.:&(a::UInt40, b::Bool) = a & UInt40(b ? 1 : 0)
+Base.:&(a::Bool, b::UInt40) = UInt40(a ? 1 : 0) & b
 
-function (&)(a::UInt40, b::UInt40)
-    return UInt40(convert(UInt, a) & convert(UInt, b))
-end
-
-
+# Bitwise OR
+Base.:|(a::UInt24, b::UInt24) = UInt24(reinterpret(UInt32, a) | reinterpret(UInt32, b))
+Base.:|(a::UInt40, b::UInt40) = UInt40(reinterpret(UInt64, a) | reinterpret(UInt64, b))
+Base.:|(a::UInt24, b::Bool) = a | UInt24(b ? 1 : 0)
+Base.:|(a::Bool, b::UInt24) = UInt24(a ? 1 : 0) | b
+Base.:|(a::UInt40, b::Bool) = a | UInt40(b ? 1 : 0)
+Base.:|(a::Bool, b::UInt40) = UInt40(a ? 1 : 0) | b
 
 end # module CustomTypes
