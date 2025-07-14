@@ -175,6 +175,62 @@ end
     @test golomb_bits(UInt8(7), 4) == BitVector([0, 1, 1, 1])
 end
 
+@testset "Pajek simple graph" begin
+    g = load_graph_from_pajek(EAT_DATASET_IN)
+
+    @test nv(g) == 23219
+    @test ne(g) == 325593
+    @test density(g) == 0.0006039580036712458
+
+    nv1 = UInt16[]
+
+    nv45 = UInt16[0x002d, 0x0037, 0x00ac, 0x00bf, 0x00c7, 
+    0x03ed, 0x042a, 0x085a, 0x08be, 0x0ccc, 0x12a3, 0x14bc, 
+    0x2278, 0x25a4, 0x2c86, 0x2ffa, 0x3499, 0x35c4, 0x35e1, 
+    0x367c, 0x3737, 0x37bb, 0x3fed, 0x3fef, 0x436c, 0x4760, 
+    0x4987, 0x54f5, 0x59f0, 0x5aa2]
+
+    nv55 = UInt16[0x0003, 0x0037, 0x003b, 0x0044, 0x0046, 
+    0x0068, 0x0079, 0x0091, 0x0097, 0x00a7, 0x00b2, 0x00b7, 
+    0x09cf, 0x0add, 0x0e50, 0x0f59, 0x1004, 0x1071, 0x1495, 
+    0x14d7, 0x14f2, 0x1833, 0x183a, 0x1a05, 0x1ab4, 0x1e06, 
+    0x1e4d, 0x235e, 0x29f9, 0x2fd2, 0x3209, 0x32c8, 0x35c9, 
+    0x364d, 0x36ad, 0x36af, 0x36cf, 0x3a2a, 0x3ac6, 0x3c1b, 
+    0x3c1e, 0x45f9, 0x4748, 0x4f1f, 0x4ff4, 0x516a, 0x53ea, 
+    0x5a51, 0x5a7a, 0x5a7e]
+
+    nv88 = UInt16[0x0059, 0x005b, 0x005c, 0x00a9, 0x00b7, 
+    0x0368, 0x0ea9, 0x0eb3, 0x103e, 0x18e9, 0x1b7e, 0x1ebf, 
+    0x2078, 0x22a8, 0x22ae, 0x2653, 0x26fb, 0x2d31, 0x2d36, 
+    0x2d95, 0x2fb2, 0x307a, 0x36ad, 0x3735, 0x37cb, 0x37ef, 
+    0x3a2a, 0x3c91, 0x454e, 0x46cf, 0x4a79, 0x50ca, 0x540c, 
+    0x54f6, 0x5998, 0x5a4d, 0x5a51]
+
+    @test outneighbors(g, 1) == nv1
+    @test outneighbors(g, 45) == nv45
+    @test outneighbors(g, 55) == nv55
+    @test outneighbors(g, 88) == nv88
+
+    # save graph in MGSv3 format
+    write_mgs3_graph(g, "EAT")
+
+    # load graph in MGSv3 format
+    g2 = load_mgs3_graph("EAT.mgs")
+
+    @test nv(g2) == nv(g)
+    @test ne(g2) == ne(g)
+    @test density(g2) == density(g)
+
+    @test outneighbors(g2, 1) == nv1
+    @test outneighbors(g2, 45) == nv45
+    @test outneighbors(g2, 55) == nv55
+    @test outneighbors(g2, 88) == nv88
+
+    # clean up the test directory
+    #rm("EAT.mgs", force=true)
+end
+
+
 @testset "Golomb Encoding (small graph)" begin
     # Create a simple 10-vertex strongly connected directed graph
     # Each vertex connects to the next 3 vertices (wrapping around)
@@ -341,7 +397,7 @@ end
     #rm(TEST_DIR, force=true, recursive=true)  
 end
 
-@testset "Amazon Graph Tests 2" begin
+@testset "Amazon Graph Tests (relabeling vertices)" begin
 	@info("Loading Amazon dataset")
 	amz_g = load_dataset(AMZ_DATASET_IN; separator='\t')
 	
@@ -701,6 +757,43 @@ end
             @test mean(outdegree(loaded_graph)) ≈ mean(outdegree(amz_core))
             @test median(outdegree(loaded_graph)) ≈ median(outdegree(amz_core))
             @test std(outdegree(loaded_graph)) ≈ std(outdegree(amz_core))
+        end
+    end
+
+    # clean up the test directory
+    # rm(TEST_DIR, force=true, recursive=true)  
+end
+
+@testset "Remapping vertices" begin
+    @info("Loading Amazon dataset")
+	amz_g = load_dataset(AMZ_DATASET_IN; separator='\t')
+	
+	@info("Getting core")
+	amz_core,oni,noi = get_core(amz_g)
+
+    # create test directory if it doesn't exist
+    mkpath(TEST_DIR)
+    
+    # Use test directory for output files
+    mgs_output_file = joinpath(TEST_DIR, "amz_core_rl")
+
+    criterion = [:in_degree, :out_degree, :degree, :pagerank]
+    encoding = [:children, :index]
+    compression = [:elias_delta, :fibonacci]
+
+    for compression in compression
+        for encoding in encoding
+            for criterion in criterion
+                remapped_vertices = remap_vertices(amz_core, criterion)
+                amz_core_rl = relabel_graph(amz_core, remapped_vertices)
+
+                @info("Checking that the relabeled core has the same number of vertices and edges")
+                @test nv(amz_core_rl) == nv(amz_core)
+                @test ne(amz_core_rl) == ne(amz_core)
+
+                @info("Writing compressed MGS3 graph with $criterion criterion, $encoding encoding and $compression compression")
+                write_compressed_mgs3_graph(amz_core_rl, mgs_output_file * "_" * string(criterion) * "_" * string(encoding) * "_" * string(compression), encoding, compression)
+            end
         end
     end
 

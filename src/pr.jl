@@ -16,6 +16,7 @@
 module PageRank
 
 using LightGraphs, DataStructures, Logging, SparseArrays, LinearAlgebra
+using Distances: chebyshev
 using ..CustomTypes: UInt24, UInt40
 using ..CustomLightGraphs: SimpleDiGraph, SimpleGraph, SimpleEdge
 using ..RandomWalks: RW_aggregated  # Import only what we need from RandomWalks

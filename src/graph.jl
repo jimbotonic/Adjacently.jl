@@ -21,6 +21,7 @@ using ..CustomLightGraphs: SimpleDiGraph, SimpleGraph, SimpleEdge
 using ..Util: infer_uint_custom_type
 using ..Algo: pearce_iterative
 using ..RandomWalks: RW, RW_aggregated
+using ..PageRank: PR
 
 # Export the functions we want to make available
 export get_basic_stats, 
@@ -690,33 +691,46 @@ end
 remap the vertices of the graph according to the specified criterion
 
 @param g: the graph
-@param criterion: the criterion to remap the vertices (in_degree, out_degree, degree)
+@param criterion: the criterion to remap the vertices
+
+Possible criterion:
+- :in_degree
+- :out_degree
+- :degree
 
 @returns the mapping of the vertices (vertex_id[old_id] -> new_id)
 """
 function remap_vertices(g::AbstractGraph{T}, criterion::Symbol=:in_degree) where {T<:Unsigned}
 	# compute the degrees of the vertices
 	if criterion == :in_degree
-		degrees = get_in_degrees(g)
+		vertex_scores = get_in_degrees(g)
 	elseif criterion == :out_degree
-		degrees = get_out_degrees(g)
+		vertex_scores = get_out_degrees(g)
 	elseif criterion == :degree
 		if is_directed(g)
-			degrees = get_in_degrees(g) + get_out_degrees(g)
+			vertex_scores = Dict{T,T}()
+			in_degrees, out_degrees = get_in_out_degrees(g)
+			for v in vertices(g)
+				vertex_scores[v] = in_degrees[v] + out_degrees[v]
+			end
 		else
-			degrees = get_out_degrees(g)
+			vertex_scores = get_out_degrees(g)
 		end
+	elseif criterion == :pagerank
+		rg = get_reverse_graph(g)
+		vertex_scores = PR(g, rg)
 	else
 		@error("Invalid criterion: $criterion")
 	end
 
 	# create a vector of (vertex, degree) pairs and sort by degree
-	vertex_degree_pairs = [(v, degrees[v]) for v in vertices(g)]
-	sort!(vertex_degree_pairs, by=x->x[2])
+	vertex_scores_pairs = [(v, vertex_scores[v]) for v in vertices(g)]
+	# sort by score in descending order
+	sort!(vertex_scores_pairs, by=x->x[2], rev=true)
 	
 	# create the mapping dictionary: old_id -> new_id
 	vertex_mapping = Dict{T,T}()
-	for (new_id, (old_id, _)) in enumerate(vertex_degree_pairs)
+	for (new_id, (old_id, _)) in enumerate(vertex_scores_pairs)
 		vertex_mapping[old_id] = convert(T, new_id)
 	end
 	
