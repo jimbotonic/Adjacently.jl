@@ -482,7 +482,6 @@ Encoding steps:
 """
 function write_golomb(w::BitWriter, n::T, b::Int) where {T<:Unsigned}
     b <= 0 && throw(ArgumentError("Golomb base must be >= 1"))
-    n == 0 && return write_bit(w, true)  # shortcut for n = 0 if b = 1
 
     # Step 1: Unary representation of quotient
     q = div(n, b)

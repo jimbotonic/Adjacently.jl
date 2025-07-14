@@ -6,9 +6,10 @@ Adjancently.jl is Julia library for the analysis of large complex directed netwo
 
 The test suite is organized into several distinct test sets that can be run individually or all together. Use the following commands from the project root directory:
 
-### Run all tests
+### Run tests
 ```
 julia --project=. test/runtests.jl
+
 ```
 
 ### Run specific test sets
@@ -29,6 +30,9 @@ julia test/runtests.jl --testset "Graph Serialization"
 
 # Test Pajek graph format
 julia test/runtests.jl --testset "Pajek Graph Format"
+
+# Test Golomb encoding
+julia --project=. -e 'using Test; include("test/runtests.jl")' -- --testset="Golomb encoding"
 ```
 
 ### Run tests with verbose output
