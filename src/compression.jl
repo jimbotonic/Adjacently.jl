@@ -529,31 +529,45 @@ end
 ################################################################################
 
 """
-    write_fibonacci_code(w::BitWriter, n::UInt)
+    write_fibonacci_code(w::BitWriter, n::T) where {T<:Unsigned}
 
-Write `n` using Fibonacci coding (with '11' terminator), using precomputed FIB_NUMBERS.
+Write `n` using Fibonacci coding (with '1' stop bit), using precomputed FIB_NUMBERS.
 """
 function write_fibonacci_code(w::BitWriter, n::T) where {T<:Unsigned}
     n == 0 && throw(ArgumentError("Fibonacci code undefined for 0"))
 
-    bits = falses(length(FIB_NUMBERS))
+    # find which Fibonacci numbers we need
+    selected_indices = Int[]
     remaining = n
     i = length(FIB_NUMBERS)
 
-    while i >= 1
-        if FIB_NUMBERS[i] ≤ remaining
-            bits[i] = true
+    while i >= 1 && remaining > 0
+        if FIB_NUMBERS[i] <= remaining
+            push!(selected_indices, i)
             remaining -= FIB_NUMBERS[i]
             i -= 1  # skip next to avoid consecutive ones
         end
         i -= 1
     end
 
-    # write bits and final stop bit
-    for b in bits
-        write_bit(w, b)
+    # write bits in ascending order (index 1 first)
+    reverse!(selected_indices)
+    current_selected = 1
+    
+    for bit_pos in 1:length(FIB_NUMBERS)
+        if current_selected <= length(selected_indices) && selected_indices[current_selected] == bit_pos
+            write_bit(w, true)
+            current_selected += 1
+        else
+            write_bit(w, false)
+        end
+        
+        # if we've written all selected bits and the last bit was 1, we can add the stop bit
+        if current_selected > length(selected_indices) && !isempty(selected_indices) && selected_indices[end] == bit_pos
+            write_bit(w, true)  # stop bit
+            break
+        end
     end
-    write_bit(w, true)  # stop bit
 end
 
 """
@@ -568,14 +582,19 @@ function read_fibonacci_code(r::BitReader, ::Type{T}=UInt8) where {T<:Unsigned}
 
     while true
         b = read_bit(r)
+        # if the bit is 1 and the previous bit is 1, we have reached the stop bit
         if b && prev
             break  # stop bit
         end
+        # if the bit is 1, add the corresponding Fibonacci number to the value
         if b
             value += FIB_NUMBERS[i]
         end
+        # update the previous bit
         prev = b
+        # increment the index
         i += 1
+        # if the index is greater than the length of the Fibonacci numbers, we have reached the end of the Fibonacci numbers
         if i > length(FIB_NUMBERS)
             throw(ArgumentError("Fibonacci code exceeds supported range (>= 2^40)"))
         end
