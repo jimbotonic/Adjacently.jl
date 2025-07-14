@@ -26,7 +26,7 @@ using Adjacently.Util: bottom_up_sort, quicksort_iterative_permutation!, get_sor
 using Adjacently.Compression: huffman_encoding, encode_huffman_tree!, decode_huffman_tree!, get_huffman_codes!, 
 write_elias_gamma, write_elias_delta, write_golomb, read_elias_gamma, read_elias_delta, read_golomb, 
 write_fibonacci_code, read_fibonacci_code
-using LightGraphs: nv, ne, outneighbors, vertices, outdegree, density
+using LightGraphs: nv, ne, outneighbors, vertices, outdegree, density, add_vertices!, add_edge!
 
 # Get the absolute path to the project root directory
 const PROJECT_ROOT = normpath(joinpath(@__DIR__, ".."))
@@ -99,11 +99,23 @@ end
     @test searchsortedfirst(v, UInt8(0)) == 1  # before start
 end
 
-"Return Elias gamma code as a BitVector for a given value."
-function gamma_bits(v::T) where {T<:Unsigned}
+"""
+    elias_bits(v::T) where {T<:Unsigned}
+
+    Parameters:
+    - v: Value to encode
+    - encoding: Encoding scheme (:elias_gamma or :elias_delta)
+
+Return Elias code as a BitVector for a given value.
+"""
+function elias_bits(v::T, encoding::Symbol) where {T<:Unsigned}
     io = IOBuffer()
     writer = BitWriter(io)
-    write_elias_gamma(writer, v)
+    if encoding == :elias_gamma
+        write_elias_gamma(writer, v)
+    elseif encoding == :elias_delta
+        write_elias_delta(writer, v)
+    end
     nbits = writer.index - 1 # capture number of bits before flush resets it
     flush_bitwriter(writer; flush_last_bits=true)
     # read the bits from the buffer
@@ -112,16 +124,116 @@ function gamma_bits(v::T) where {T<:Unsigned}
     return read_bits(reader, nbits)
 end
 
+"""
+    golomb_bits(v::T, k::Int) where {T<:Unsigned}
+
+    Parameters:
+    - v: Value to encode
+    - k: Number of bits to use for the Golomb coding
+
+Return Golomb code as a BitVector for a given value.
+"""
+function golomb_bits(v::T, k::Int) where {T<:Unsigned}
+    io = IOBuffer()
+    writer = BitWriter(io)
+    write_golomb(writer, v, k)
+    nbits = writer.index - 1 # capture number of bits before flush resets it
+    flush_bitwriter(writer; flush_last_bits=true)
+    seekstart(io)
+    reader = BitReader(io)
+    return read_bits(reader, nbits)
+end
+
 @testset "Elias Encoding" begin
     @test_throws ArgumentError write_elias_gamma(BitWriter(IOBuffer()), UInt8(0))
 
-    @test gamma_bits(UInt8(1)) == BitVector([1])
-    @test gamma_bits(UInt8(2)) == BitVector([0, 1, 0])
-    @test gamma_bits(UInt8(3)) == BitVector([0, 1, 1])
-    @test gamma_bits(UInt8(4)) == BitVector([0, 0, 1, 0, 0])
-    @test gamma_bits(UInt8(5)) == BitVector([0, 0, 1, 0, 1])
-    @test gamma_bits(UInt8(6)) == BitVector([0, 0, 1, 1, 0])
-    @test gamma_bits(UInt8(7)) == BitVector([0, 0, 1, 1, 1])
+    @test elias_bits(UInt8(1), :elias_gamma) == BitVector([1])
+    @test elias_bits(UInt8(2), :elias_gamma) == BitVector([0, 1, 0])
+    @test elias_bits(UInt8(3), :elias_gamma) == BitVector([0, 1, 1])
+    @test elias_bits(UInt8(4), :elias_gamma) == BitVector([0, 0, 1, 0, 0])
+    @test elias_bits(UInt8(5), :elias_gamma) == BitVector([0, 0, 1, 0, 1])
+    @test elias_bits(UInt8(6), :elias_gamma) == BitVector([0, 0, 1, 1, 0])
+    @test elias_bits(UInt8(7), :elias_gamma) == BitVector([0, 0, 1, 1, 1])
+
+    @test elias_bits(UInt8(1), :elias_delta) == BitVector([1])
+    @test elias_bits(UInt8(2), :elias_delta) == BitVector([0, 1, 0, 0])
+    @test elias_bits(UInt8(3), :elias_delta) == BitVector([0, 1, 0, 1])
+    @test elias_bits(UInt8(4), :elias_delta) == BitVector([0, 1, 1, 0, 0])
+    @test elias_bits(UInt8(5), :elias_delta) == BitVector([0, 1, 1, 0, 1])
+    @test elias_bits(UInt8(6), :elias_delta) == BitVector([0, 1, 1, 1, 0])
+    @test elias_bits(UInt8(7), :elias_delta) == BitVector([0, 1, 1, 1, 1])
+end
+
+@testset "Golomb Encoding" begin
+    @test golomb_bits(UInt8(0), 4) == BitVector([1, 0, 0])
+    @test golomb_bits(UInt8(1), 4) == BitVector([1, 0, 1])
+    @test golomb_bits(UInt8(2), 4) == BitVector([1, 1, 0])
+    @test golomb_bits(UInt8(3), 4) == BitVector([1, 1, 1])
+    @test golomb_bits(UInt8(4), 4) == BitVector([0, 1, 0, 0])
+    @test golomb_bits(UInt8(5), 4) == BitVector([0, 1, 0, 1])
+    @test golomb_bits(UInt8(6), 4) == BitVector([0, 1, 1, 0])
+    @test golomb_bits(UInt8(7), 4) == BitVector([0, 1, 1, 1])
+end
+
+@testset "Golomb Encoding (small graph)" begin
+    # Create a simple 10-vertex strongly connected directed graph
+    # Each vertex connects to the next 3 vertices (wrapping around)
+    g = SimpleDiGraph{UInt8}(10)
+    
+    # create a strongly connected graph where each vertex connects to the next 3 vertices
+    for v in 1:10
+        for offset in 1:3
+            target = mod(v + offset - 1, 10) + 1  # wrap around
+            add_edge!(g, v, target)
+        end
+    end
+    
+    # verify the graph properties
+    @test nv(g) == 10
+    @test ne(g) == 30  # each vertex has 3 outgoing edges
+    
+    # Create test directory if it doesn't exist
+    mkpath(TEST_DIR)
+    
+    # Test both encoding schemes
+    encoding_types = [:children, :index]
+    
+    for encoding_type in encoding_types
+        @info("Testing Golomb compression with $encoding_type encoding on small graph")
+        
+        # create output filename
+        output_file = joinpath(TEST_DIR, "small_graph_golomb_$(encoding_type)")
+        
+        # write the graph using Golomb compression
+        write_compressed_mgs3_graph(g, output_file, encoding_type, :golomb)
+        
+        # load the graph back
+        loaded_graph = load_compressed_mgs3_graph(output_file * ".mgz")
+        
+        # Verify graph properties are preserved
+        @test nv(loaded_graph) == nv(g)
+        @test ne(loaded_graph) == ne(g)
+        @test density(loaded_graph) ≈ density(g)
+        
+        # Verify specific edges are preserved
+        for v in 1:10
+            original_neighbors = sort(collect(outneighbors(g, v)))
+            loaded_neighbors = sort(collect(outneighbors(loaded_graph, v)))
+            @test original_neighbors == loaded_neighbors
+        end
+        
+        # Verify degree statistics
+        @test maximum(outdegree(loaded_graph)) == maximum(outdegree(g))
+        @test minimum(outdegree(loaded_graph)) == minimum(outdegree(g))
+        @test mean(outdegree(loaded_graph)) ≈ mean(outdegree(g))
+        @test median(outdegree(loaded_graph)) ≈ median(outdegree(g))
+        @test std(outdegree(loaded_graph)) ≈ std(outdegree(g))
+        
+        @info("Golomb compression with $encoding_type encoding passed all tests")
+    end
+    
+    # Clean up test files
+    # rm(joinpath(TEST_DIR, "small_graph_golomb_*"), force=true)
 end
 
 @testset "Huffman Encoding" begin
@@ -182,7 +294,7 @@ end
     @test isapprox(density(remapped_g), density(g), rtol=1e-10)
 end
 
-@testset "Amazon_0601 Graph Tests" begin
+@testset "Amazon Graph Tests" begin
 	@info("Loading Amazon dataset")
 	amz_g = load_dataset(AMZ_DATASET_IN; separator='\t')
 	# number of vertices and edges
@@ -194,7 +306,7 @@ end
 	@test 395234 == convert(Int,nv(amz_core))
 	@test 3301092 == ne(amz_core)
 
-	@info("getting reverse graph")
+	@info("Getting reverse graph")
 	amz_rcore = get_reverse_graph(amz_core) 
 	@test 395234 == convert(Int,nv(amz_rcore))
 	@test 3301092 == ne(amz_rcore)
@@ -213,13 +325,13 @@ end
 	@info("Loading Amazon dataset (core) from MGS format")
 	# NB: the input file is created with extension .mgs
 	amz_core_mgs = load_mgs3_graph(joinpath(TEST_DIR, AMZ_DATASET_OUT * ".mgs"))
-	@test 395234 == convert(Int,nv(amz_core_mgs))
+	@test 395234 == convert(Int, nv(amz_core_mgs))
 	@test 3301092 == ne(amz_core_mgs)
 
 	@info("Loading Amazon dataset (core) from MGZ format")
 	# NB: the input file is created with extension .mgz
-	amz_core_mgz = load_compressed_mgs3_graph(joinpath(TEST_DIR, AMZ_DATASET_OUT * ".mgz"), :huffman)
-	@test 395234 == convert(Int,nv(amz_core_mgz))
+	amz_core_mgz = load_compressed_mgs3_graph(joinpath(TEST_DIR, AMZ_DATASET_OUT * ".mgz"))
+	@test 395234 == convert(Int, nv(amz_core_mgz))
 	@test 3301092 == ne(amz_core_mgz)
 
     # Clean up test files
@@ -229,7 +341,57 @@ end
     #rm(TEST_DIR, force=true, recursive=true)  
 end
 
-@testset "Arxiv_HEP-PH Graph Tests" begin
+@testset "Amazon Graph Tests 2" begin
+	@info("Loading Amazon dataset")
+	amz_g = load_dataset(AMZ_DATASET_IN; separator='\t')
+	
+	@info("Getting core")
+	amz_core,oni,noi = get_core(amz_g)
+
+	@info("Getting reverse graph")
+	amz_rcore = get_reverse_graph(amz_core) 
+
+    # relabel core according to in-degree
+    remapped_vertices = remap_vertices(amz_core, :in_degree)
+    amz_core_relabeled = relabel_graph(amz_core, remapped_vertices)
+
+    # check that the relabeled core has the same number of vertices and edges
+    @info("Checking that the relabeled core has the same number of vertices and edges")
+    @test nv(amz_core_relabeled) == nv(amz_core)
+    @test ne(amz_core_relabeled) == ne(amz_core)
+
+    # relabel reverse graph according to in-degree
+    remapped_vertices = remap_vertices(amz_rcore, :in_degree)
+    amz_rcore_relabeled = relabel_graph(amz_rcore, remapped_vertices)
+
+    # check that the relabeled reverse core has the same number of vertices and edges
+    @info("Checking that the relabeled reverse core has the same number of vertices and edges")
+    @test nv(amz_rcore_relabeled) == nv(amz_rcore)
+    @test ne(amz_rcore_relabeled) == ne(amz_rcore)
+
+    # save the relabeled graphs
+    @info("Saving relabeled core and reverse core (:children, :elias_delta)")
+    write_compressed_mgs3_graph(amz_core_relabeled, joinpath(TEST_DIR, AMZ_DATASET_OUT * "_core_elias_delta_relabeled"), :children, :elias_delta)
+    write_compressed_mgs3_graph(amz_rcore_relabeled, joinpath(TEST_DIR, AMZ_DATASET_OUT * "_rcore_elias_delta_relabeled"), :children, :elias_delta)
+    
+    # load the relabeled graphs
+    @info("Loading relabeled core and reverse core (:children, :elias_delta)")
+    amz_core_relabeled_mgz = load_compressed_mgs3_graph(joinpath(TEST_DIR, AMZ_DATASET_OUT * "_core_elias_delta_relabeled" * ".mgz"))
+    amz_rcore_relabeled_mgz = load_compressed_mgs3_graph(joinpath(TEST_DIR, AMZ_DATASET_OUT * "_rcore_elias_delta_relabeled" * ".mgz"))
+
+    # check that the loaded relabeled core and reverse core have the same number of vertices and edges
+    @info("Checking that the loaded relabeled core and reverse core have the same number of vertices and edges")
+    @test nv(amz_core_relabeled_mgz) == nv(amz_core_relabeled)
+    @test ne(amz_core_relabeled_mgz) == ne(amz_core_relabeled)
+    @test nv(amz_rcore_relabeled_mgz) == nv(amz_rcore_relabeled)
+    @test ne(amz_rcore_relabeled_mgz) == ne(amz_rcore_relabeled)
+
+    # clean up test files
+    #rm(joinpath(TEST_DIR, AMZ_DATASET_OUT * "_core_relabeled" * ".mgs"), force=true)
+    #rm(joinpath(TEST_DIR, AMZ_DATASET_OUT * "_rcore_relabeled" * ".mgs"), force=true)
+end
+
+@testset "Arxiv Graph Tests" begin
 	@info("Loading Arxiv_HEP-PH dataset")
 	g = load_dataset(ARX_DATASET_IN; separator='\t')
     
@@ -307,7 +469,7 @@ end
     # Test MGS4 format (Huffman compressed) writing and loading
     # NB: the output file is created with extension .mgz
     write_compressed_mgs3_graph(g_loaded, mgz_output_file, :children, :huffman)
-    gb = load_compressed_mgs3_graph(mgz_output_file * ".mgz", :huffman)
+    gb = load_compressed_mgs3_graph(mgz_output_file * ".mgz")
     
     # Verify graph properties are preserved
     @test nv(gb) == initial_vertices
@@ -393,17 +555,17 @@ end
     #rm(TEST_DIR, force=true, recursive=true)  
 end
 
-@testset "Elias encoding" begin
+@testset "Elias Compression" begin
     @info("Loading Amazon dataset")
 	amz_g = load_dataset(AMZ_DATASET_IN; separator='\t')
 	# number of vertices and edges
-	#@test 403394 == convert(Int,nv(amz_g))
-	#@test 3387388 == ne(amz_g)
+	@test 403394 == convert(Int,nv(amz_g))
+	@test 3387388 == ne(amz_g)
 	
 	@info("Getting core")
 	amz_core, oni, noi = get_core(amz_g)
-	#@test 395234 == convert(Int,nv(amz_core))
-	#@test 3301092 == ne(amz_core)
+	@test 395234 == convert(Int,nv(amz_core))
+	@test 3301092 == ne(amz_core)
 
     # create test directory if it doesn't exist
     mkpath(TEST_DIR)
@@ -413,6 +575,7 @@ end
 
     encoding_types = [:children, :index]
     compression_types = [:elias_gamma, :elias_delta]
+
     for encoding_type in encoding_types
         for compression_type in compression_types
             @info("Writing compressed MGS3 graph with $encoding_type encoding and $compression_type compression")
@@ -425,17 +588,17 @@ end
     for encoding_type in encoding_types
         for compression_type in compression_types
             @info("Loading compressed MGS3 graph with $encoding_type encoding and $compression_type compression")
-            g = load_compressed_mgs3_graph(mgs_output_file * "_" * string(encoding_type) * "_" * string(compression_type) * ".mgz", compression_type)
+            loaded_graph = load_compressed_mgs3_graph(mgs_output_file * "_" * string(encoding_type) * "_" * string(compression_type) * ".mgz")
             
             @info("Verifying graph properties")
-            @test nv(g) == nv(amz_core)
-            @test ne(g) == ne(amz_core)
-            @test density(g) ≈ density(amz_core)
-            @test maximum(outdegree(g)) == maximum(outdegree(amz_core))
-            @test minimum(outdegree(g)) == minimum(outdegree(amz_core))
-            @test mean(outdegree(g)) ≈ mean(outdegree(amz_core))
-            @test median(outdegree(g)) ≈ median(outdegree(amz_core))
-            @test std(outdegree(g)) ≈ std(outdegree(amz_core))
+            @test nv(loaded_graph) == nv(amz_core)
+            @test ne(loaded_graph) == ne(amz_core)
+            @test density(loaded_graph) ≈ density(amz_core)
+            @test maximum(outdegree(loaded_graph)) == maximum(outdegree(amz_core))
+            @test minimum(outdegree(loaded_graph)) == minimum(outdegree(amz_core))
+            @test mean(outdegree(loaded_graph)) ≈ mean(outdegree(amz_core))
+            @test median(outdegree(loaded_graph)) ≈ median(outdegree(amz_core))
+            @test std(outdegree(loaded_graph)) ≈ std(outdegree(amz_core))
         end
     end
 
@@ -443,4 +606,54 @@ end
     # rm(TEST_DIR, force=true, recursive=true)  
 end
 
+@testset "Golomb Compression" begin
+    @info("Loading Amazon dataset")
+	amz_g = load_dataset(AMZ_DATASET_IN; separator='\t')
+	# number of vertices and edges
+	@test 403394 == convert(Int,nv(amz_g))
+	@test 3387388 == ne(amz_g)
+	
+	@info("Getting core")
+	amz_core, oni, noi = get_core(amz_g)
+	@test 395234 == convert(Int,nv(amz_core))
+	@test 3301092 == ne(amz_core)
+
+    # create test directory if it doesn't exist
+    mkpath(TEST_DIR)
+    
+    # Use test directory for output files
+    mgs_output_file = joinpath(TEST_DIR, "amz_core")
+
+    encoding_types = [:children, :index]
+    compression_types = [:golomb]
+
+    for encoding_type in encoding_types
+        for compression_type in compression_types
+            @info("Writing compressed MGS3 graph with $encoding_type encoding and $compression_type compression")
+            write_compressed_mgs3_graph(amz_core, mgs_output_file * "_" * string(encoding_type) * "_" * string(compression_type), encoding_type, compression_type)
+        end
+    end
+
+    # Test MGS3 format preservation
+    # NB: the output file is created with extension .mgs
+    for encoding_type in encoding_types
+        for compression_type in compression_types
+            @info("Loading compressed MGS3 graph with $encoding_type encoding and $compression_type compression")
+            loaded_graph = load_compressed_mgs3_graph(mgs_output_file * "_" * string(encoding_type) * "_" * string(compression_type) * ".mgz")
+            
+            @info("Verifying graph properties")
+            @test nv(loaded_graph) == nv(amz_core)
+            @test ne(loaded_graph) == ne(amz_core)
+            @test density(loaded_graph) ≈ density(amz_core)
+            @test maximum(outdegree(loaded_graph)) == maximum(outdegree(amz_core))
+            @test minimum(outdegree(loaded_graph)) == minimum(outdegree(amz_core))
+            @test mean(outdegree(loaded_graph)) ≈ mean(outdegree(amz_core))
+            @test median(outdegree(loaded_graph)) ≈ median(outdegree(amz_core))
+            @test std(outdegree(loaded_graph)) ≈ std(outdegree(amz_core))
+        end
+    end
+
+    # clean up the test directory
+    # rm(TEST_DIR, force=true, recursive=true)  
+end
 
