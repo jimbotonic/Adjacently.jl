@@ -20,7 +20,7 @@ Pkg.activate(normpath(joinpath(@__DIR__, "..")))
 
 using Adjacently
 using Adjacently.IO: load_adjacency_list_from_csv, load_graph_from_pajek, BitWriter, BitReader, read_bits, flush_bitwriter
-using Adjacently.Graph: get_core, get_reverse_graph, get_basic_stats, remap_vertices, relabel_graph
+using Adjacently.Graph: get_core, get_reverse_graph, get_basic_stats, relabel_graph, relabel_vertices
 using Adjacently.MGS: write_mgs3_graph, write_compressed_mgs3_graph, load_mgs3_graph, load_compressed_mgs3_graph
 using Adjacently.Util: bottom_up_sort, quicksort_iterative_permutation!, get_sorted_array, binary_search
 using Adjacently.Compression: huffman_encoding, encode_huffman_tree!, decode_huffman_tree!, get_huffman_codes!, 
@@ -335,19 +335,19 @@ end
     end
 end
 
-@testset "Remapping Vertices" begin
+@testset "Relabeling Vertices 1" begin
     g = load_dataset(AMZ_DATASET_IN; separator='\t')
     @test nv(g) == 403394
     @test ne(g) == 3387388
     @test isapprox(density(g), 2.0816473245108078e-5, rtol=1e-10)
 
     # remap the vertices according to the in-degree
-    remapped_vertices = remap_vertices(g, :in_degree)
-    remapped_g = relabel_graph(g, remapped_vertices)
+    relabeled_vertices = relabel_vertices(g, :in_degree)
+    relabeled_g = relabel_graph(g, relabeled_vertices)
 
-    @test nv(remapped_g) == nv(g)
-    @test ne(remapped_g) == ne(g)
-    @test isapprox(density(remapped_g), density(g), rtol=1e-10)
+    @test nv(relabeled_g) == nv(g)
+    @test ne(relabeled_g) == ne(g)
+    @test isapprox(density(relabeled_g), density(g), rtol=1e-10)
 end
 
 @testset "Amazon Graph Tests" begin
@@ -408,8 +408,8 @@ end
 	amz_rcore = get_reverse_graph(amz_core) 
 
     # relabel core according to in-degree
-    remapped_vertices = remap_vertices(amz_core, :in_degree)
-    amz_core_relabeled = relabel_graph(amz_core, remapped_vertices)
+    relabeled_vertices = relabel_vertices(amz_core, :in_degree)
+    amz_core_relabeled = relabel_graph(amz_core, relabeled_vertices)
 
     # check that the relabeled core has the same number of vertices and edges
     @info("Checking that the relabeled core has the same number of vertices and edges")
@@ -417,8 +417,8 @@ end
     @test ne(amz_core_relabeled) == ne(amz_core)
 
     # relabel reverse graph according to in-degree
-    remapped_vertices = remap_vertices(amz_rcore, :in_degree)
-    amz_rcore_relabeled = relabel_graph(amz_rcore, remapped_vertices)
+    relabeled_vertices = relabel_vertices(amz_rcore, :in_degree)
+    amz_rcore_relabeled = relabel_graph(amz_rcore, relabeled_vertices)
 
     # check that the relabeled reverse core has the same number of vertices and edges
     @info("Checking that the relabeled reverse core has the same number of vertices and edges")
@@ -764,7 +764,7 @@ end
     # rm(TEST_DIR, force=true, recursive=true)  
 end
 
-@testset "Remapping vertices" begin
+@testset "Relabeling vertices 2" begin
     @info("Loading Amazon dataset")
 	amz_g = load_dataset(AMZ_DATASET_IN; separator='\t')
 	
@@ -784,8 +784,8 @@ end
     for compression in compression
         for encoding in encoding
             for criterion in criterion
-                remapped_vertices = remap_vertices(amz_core, criterion)
-                amz_core_rl = relabel_graph(amz_core, remapped_vertices)
+                relabeled_vertices = relabel_vertices(amz_core, criterion)
+                amz_core_rl = relabel_graph(amz_core, relabeled_vertices)
 
                 @info("Checking that the relabeled core has the same number of vertices and edges")
                 @test nv(amz_core_rl) == nv(amz_core)

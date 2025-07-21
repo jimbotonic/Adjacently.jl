@@ -24,7 +24,7 @@ using ..IO: BitWriter, write_bytes, flush_bitwriter, BitReader
 using ..Compression: huffman_encoding, get_huffman_codes!, decode_huffman_values, 
 	delta_encode_vector, write_elias_coding, read_elias_coding, 
 	write_golomb, read_golomb, write_fibonacci_code, read_fibonacci_code
-using ..Graph: get_basic_stats, get_in_out_degrees, get_out_degrees, remap_vertices, relabel_graph
+using ..Graph: get_basic_stats, get_in_out_degrees, get_out_degrees, relabel_vertices, relabel_graph
 using ..Constants: GOLOMB_BASE
 
 # constants

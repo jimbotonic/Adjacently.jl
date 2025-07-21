@@ -44,7 +44,7 @@ export get_basic_stats,
        get_inclist_from_adjlist, 
        get_sparse_adj_matrix, 
        get_sparse_P_matrix,
-       remap_vertices,
+       relabel_vertices,
        relabel_graph,
        get_sparse_symmetric_P_matrix
 
@@ -686,22 +686,52 @@ function relabel_graph(g::AbstractGraph{T}, vertex_mapping::Dict{T,T}) where {T<
 end 
 
 """
-    remap_vertices(g::AbstractGraph{T}, criterion::Symbol=:in_degree) where {T<:Unsigned}
+    relabel_vertices(g::AbstractGraph{T}, criterion::Symbol=:in_degree) where {T<:Unsigned}
 
-remap the vertices of the graph according to the specified criterion
+relabel the vertices of the graph according to the specified criterion
 
 @param g: the graph
-@param criterion: the criterion to remap the vertices
+@param criterion: the criterion to relabel the vertices
 
-Possible criterion:
+Vertices are first assigned a score according to the specified criterion.
+Then, they are sorted by score in descending order and relabeled accordingly.
+
+Possible score-based criterion:
 - :in_degree
 - :out_degree
 - :degree
+- :pagerank
+
+Possible lexicographic criterion:
+- :lexicographic
 
 @returns the mapping of the vertices (vertex_id[old_id] -> new_id)
 """
-function remap_vertices(g::AbstractGraph{T}, criterion::Symbol=:in_degree) where {T<:Unsigned}
-	# compute the degrees of the vertices
+function relabel_vertices(g::AbstractGraph{T}, criterion::Symbol=:in_degree) where {T<:Unsigned}
+	if criterion == :lexicographic
+		return relabel_vertices_lexicographic(g)
+	else
+		return relabel_vertices_score(g, criterion)
+	end
+end
+
+"""
+    relabel_vertices_score(g::AbstractGraph{T}, criterion::Symbol=:in_degree) where {T<:Unsigned}
+
+relabel the vertices of the graph according to the specified score-based criterion
+
+@param g: the graph
+@param criterion: the criterion to relabel the vertices
+
+Possible score-based criterion:
+- :in_degree
+- :out_degree
+- :degree
+- :pagerank
+
+@returns the mapping of the vertices (vertex_id[old_id] -> new_id)
+"""
+function relabel_vertices_score(g::AbstractGraph{T}, criterion::Symbol=:in_degree) where {T<:Unsigned}
 	if criterion == :in_degree
 		vertex_scores = get_in_degrees(g)
 	elseif criterion == :out_degree
@@ -731,6 +761,64 @@ function remap_vertices(g::AbstractGraph{T}, criterion::Symbol=:in_degree) where
 	# create the mapping dictionary: old_id -> new_id
 	vertex_mapping = Dict{T,T}()
 	for (new_id, (old_id, _)) in enumerate(vertex_scores_pairs)
+		vertex_mapping[old_id] = convert(T, new_id)
+	end
+	
+	return vertex_mapping
+end
+
+"""
+    relabel_vertices_lexicographic(g::AbstractGraph{T}) where {T<:Unsigned}
+
+relabel the vertices of the graph lexicographically
+
+@param g: the graph
+@returns the mapping of the vertices (vertex_id[old_id] -> new_id)
+"""
+function relabel_vertices_lexicographic(g::AbstractGraph{T}) where {T<:Unsigned}
+	vs = vertices(g)
+	n = nv(g)
+	vertex_mapping = Dict{T,T}()
+	
+	# Create sparse bit vectors for each vertex's out-neighbors
+	vertex_bitvectors = Vector{Tuple{T, SparseVector{Bool, T}}}()
+	
+	for v in vs
+		# Get out-neighbors for this vertex
+		out_neighbors = outneighbors(g, v)
+		
+		# Create sparse bit vector: 1 for each out-neighbor
+		I = T[]  # indices where bit is set to 1
+		V = Bool[]  # values (all true)
+		
+		for neighbor in out_neighbors
+			push!(I, neighbor)
+			push!(V, true)
+		end
+		
+		# Create sparse bit vector of size n
+		bitvector = sparsevec(I, V, n)
+		push!(vertex_bitvectors, (v, bitvector))
+	end
+	
+	# Sort vertices by their sparse bit vectors in lexicographic order
+	# Custom comparison function for sparse bit vectors
+	function lex_compare(bv1::SparseVector{Bool, T}, bv2::SparseVector{Bool, T})
+		# Compare element by element
+		for i in 1:n
+			val1 = i in bv1.nzind ? bv1[i] : false
+			val2 = i in bv2.nzind ? bv2[i] : false
+			if val1 != val2
+				return val1 < val2  # false < true
+			end
+		end
+		return false  # equal vectors
+	end
+	
+	sort!(vertex_bitvectors, by=x->x[2], lt=lex_compare)
+	
+	# Create the mapping dictionary: old_id -> new_id
+	for (new_id, (old_id, _)) in enumerate(vertex_bitvectors)
 		vertex_mapping[old_id] = convert(T, new_id)
 	end
 	
