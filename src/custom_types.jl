@@ -21,7 +21,7 @@ export UInt24, UInt40
 # Trailing zeros
 import Base: trailing_zeros, convert, reinterpret, >>, <<, Float64, Float32, 
     lastindex, firstindex, promote_rule, convert, AbstractFloat, Int64, 
-    UInt32, UInt64, leading_zeros, &, |
+    UInt32, UInt64, leading_zeros, &, |, sub_with_overflow, add_with_overflow, mul_with_overflow
 
 # All the existing type definitions and implementations
 primitive type UInt24 <: Unsigned 24 end
@@ -351,5 +351,36 @@ Base.:|(a::UInt24, b::Bool) = a | UInt24(b ? 1 : 0)
 Base.:|(a::Bool, b::UInt24) = UInt24(a ? 1 : 0) | b
 Base.:|(a::UInt40, b::Bool) = a | UInt40(b ? 1 : 0)
 Base.:|(a::Bool, b::UInt40) = UInt40(a ? 1 : 0) | b
+
+# implement sub_with_overflow for UInt24 and UInt40
+function sub_with_overflow(x::UInt24, y::UInt24)
+    return (x - y, x < y)
+end
+
+function sub_with_overflow(x::UInt40, y::UInt40)
+    return (x - y, x < y)
+end
+
+# addition with overflow: (result, overflowed)
+add_with_overflow(x::UInt24, y::UInt24) = begin
+    s = reinterpret(UInt32, x) + reinterpret(UInt32, y)
+    (reinterpret(UInt24, s & 0xFFFFFF), s > 0xFFFFFF)
+end
+
+add_with_overflow(x::UInt40, y::UInt40) = begin
+    s = reinterpret(UInt64, x) + reinterpret(UInt64, y)
+    (reinterpret(UInt40, s & 0xFFFFFFFFFF), s > 0xFFFFFFFFFF)
+end
+
+# multiplication with overflow: (result, overflowed)
+mul_with_overflow(x::UInt24, y::UInt24) = begin
+    p = reinterpret(UInt32, x) * reinterpret(UInt32, y)
+    (reinterpret(UInt24, p & 0xFFFFFF), p > 0xFFFFFF)
+end
+
+mul_with_overflow(x::UInt40, y::UInt40) = begin
+    p = reinterpret(UInt64, x) * reinterpret(UInt64, y)
+    (reinterpret(UInt40, p & 0xFFFFFFFFFF), p > 0xFFFFFFFFFF)
+end
 
 end # module CustomTypes

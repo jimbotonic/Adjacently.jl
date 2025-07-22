@@ -780,44 +780,49 @@ function relabel_vertices_lexicographic(g::AbstractGraph{T}) where {T<:Unsigned}
 	n = nv(g)
 	vertex_mapping = Dict{T,T}()
 	
-	# Create sparse bit vectors for each vertex's out-neighbors
+	# create sparse bit vectors for each vertex's out-neighbors
 	vertex_bitvectors = Vector{Tuple{T, SparseVector{Bool, T}}}()
 	
 	for v in vs
-		# Get out-neighbors for this vertex
 		out_neighbors = outneighbors(g, v)
-		
-		# Create sparse bit vector: 1 for each out-neighbor
-		I = T[]  # indices where bit is set to 1
-		V = Bool[]  # values (all true)
-		
+		# create sparse bit vector: 1 for each out-neighbor
+		# indices where bit is set to 1
+		I = T[]  
+		# values (all true)
+		V = Bool[]
+		# for each out-neighbor, set the bit to 1
 		for neighbor in out_neighbors
 			push!(I, neighbor)
 			push!(V, true)
 		end
 		
-		# Create sparse bit vector of size n
+		# create sparse bit vector of size n
 		bitvector = sparsevec(I, V, n)
 		push!(vertex_bitvectors, (v, bitvector))
 	end
 	
-	# Sort vertices by their sparse bit vectors in lexicographic order
-	# Custom comparison function for sparse bit vectors
+	# sort vertices by their sparse bit vectors in lexicographic order
+	# optimized comparison function for sparse bit vectors
 	function lex_compare(bv1::SparseVector{Bool, T}, bv2::SparseVector{Bool, T})
-		# Compare element by element
-		for i in 1:n
-			val1 = i in bv1.nzind ? bv1[i] : false
-			val2 = i in bv2.nzind ? bv2[i] : false
+		# get sorted unique indices from both vectors
+		all_indices = sort(union(bv1.nzind, bv2.nzind))
+		
+		# compare only at positions where at least one vector has a 1
+		for i in all_indices
+			val1 = i in bv1.nzind
+			val2 = i in bv2.nzind
 			if val1 != val2
-				return val1 < val2  # false < true
+				# false < true
+				return val1 < val2
 			end
 		end
-		return false  # equal vectors
+		# equal vectors
+		return false
 	end
 	
 	sort!(vertex_bitvectors, by=x->x[2], lt=lex_compare)
 	
-	# Create the mapping dictionary: old_id -> new_id
+	# create the mapping dictionary: old_id -> new_id
 	for (new_id, (old_id, _)) in enumerate(vertex_bitvectors)
 		vertex_mapping[old_id] = convert(T, new_id)
 	end
