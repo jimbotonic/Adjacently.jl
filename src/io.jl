@@ -103,9 +103,9 @@ end
 
 write a value to the writer
 
-@param writer::BitWriter: The bit writer to write to
-@param value::UInt: The value to write
-@param n::Int: The number of bits to write
+@param writer::BitWriter: the bit writer to write to
+@param value::UInt: the value to write
+@param n::Int: the number of bits to write
 """
 function write_value(writer::BitWriter, value::T, n::Int) where {T<:Unsigned}
     for i in (n-1):-1:0
@@ -118,8 +118,8 @@ end
 
 write bytes to the writer
 
-@param writer::BitWriter: The bit writer to write to
-@param bytes::Vector{UInt8}: The bytes to write
+@param writer::BitWriter: the bit writer to write to
+@param bytes::Vector{UInt8}: the bytes to write
 """
 function write_bytes(writer::BitWriter, bytes::Vector{UInt8})
     for byte in bytes
@@ -132,8 +132,8 @@ end
 
 flush the writer to the io
 
-@param writer::BitWriter: The bit writer to flush
-@param flush_last_bits::Bool: Whether to flush the last padded byte
+@param writer::BitWriter: the bit writer to flush
+@param flush_last_bits::Bool: whether to flush the last padded byte
 """
 function flush_bitwriter(writer::BitWriter; flush_last_bits::Bool = false)	
     n = writer.index - 1  # total valid bits
@@ -179,8 +179,8 @@ end
 
 constructor for BitReader
 
-@param io::Base.IO: The io to read from
-@param capacity::Int: The capacity of the buffer
+@param io::Base.IO: the io to read from
+@param capacity::Int: the capacity of the buffer
 """
 function BitReader(io::Base.IO; capacity=BUFFER_SIZE*8)
     bytes = read(io)
@@ -200,8 +200,8 @@ end
 
 read a bit from the reader
 
-@param reader::BitReader: The bit reader to read from
-@return::Bool: The bit read
+@param reader::BitReader: the bit reader to read from
+@return::Bool: the bit read
 """
 function read_bit(reader::BitReader)::Bool
     if reader.index > reader.length
@@ -217,9 +217,9 @@ end
 
 read bits from the reader
 
-@param reader::BitReader: The bit reader to read from
-@param n::Int: The number of bits to read
-@return::Vector{Bool}: The bits read
+@param reader::BitReader: the bit reader to read from
+@param n::Int: the number of bits to read
+@return::Vector{Bool}: the bits read
 """
 function read_bits(reader::BitReader, n::Int)::Vector{Bool}
     bits = Vector{Bool}(undef, n)
@@ -235,10 +235,10 @@ end
 Read the next `n` bits from the bit reader and return them
 as an unsigned integer of type `T`.
 
-@param reader::BitReader: The source of bits
-@param n::Int: Number of bits to read
-@param T::Type: Unsigned return type (default: UInt)
-@return::T: The reconstructed unsigned value
+@param reader::BitReader: the source of bits
+@param n::Int: the number of bits to read
+@param T::Type: the unsigned return type (default: UInt)
+@return::T: the reconstructed unsigned value
 """
 function read_value(reader::BitReader, n::Int, ::Type{T}=UInt8) where {T<:Unsigned}
     value = zero(T)

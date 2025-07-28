@@ -22,7 +22,9 @@ using ..IO: BitWriter, BitReader, write_bit, write_bits, read_bit, read_bits, fl
 using ..Constants: FIB_NUMBERS, BUFFER_SIZE
 
 # Export the functions we want to make available
-export huffman_encoding,
+export write_unary_coding,
+       write_truncated_binary_coding,
+       huffman_encoding,
        encode_huffman_tree!,
        decode_huffman_tree!,
        get_huffman_codes!,
@@ -36,6 +38,64 @@ export huffman_encoding,
        read_golomb,
        write_fibonacci_code,
        read_fibonacci_code
+
+################################################################################
+# Basic encoding / decoding
+################################################################################
+
+"""
+    write_unary_coding(w::BitWriter, v::T) where {T<:Unsigned}
+
+Write a unary coding to the bitwriter.
+
+@param w::BitWriter: the bitwriter
+@param v::T: the value to write
+"""
+function write_unary_coding(w::BitWriter, v::T) where {T<:Unsigned}
+    for i in 1:v
+        write_bit(w, true)
+    end
+    write_bit(w, false)
+end
+
+"""
+    write_truncated_binary_coding(w::BitWriter, v::T, n::Int) where {T<:Unsigned}
+
+Write a truncated binary code to the bitwriter.
+
+Truncated binary coding for integers in range [0, n-1]:
+- If n is a power of 2, use standard binary with log2(n) bits
+- Otherwise, use k = floor(log2(n)) bits for values < 2^(k+1) - n
+  and k+1 bits for remaining values
+
+@param w::BitWriter: the bitwriter
+@param v::T: the value to write (must be in range [0, n-1])
+@param n::T: the range size (number of possible values)
+"""
+function write_truncated_binary_coding(w::BitWriter, v::T, n::Int) where {T<:Unsigned}
+    n == 0 && throw(ArgumentError("Range size n must be > 0"))
+    v >= n && throw(ArgumentError("Value v=$v must be < n=$n"))
+    
+    # special case: if n is 1, no bits needed
+    if n == 1
+        return
+    end
+    
+    # calculate k = floor(log2(n))
+    k = floor(Int, log2(n))
+    
+    # calculate threshold u = 2^(k+1) - n
+    u = convert(T, (T(1) << (k + 1)) - n)
+    
+    if v < u
+        # use k bits for values in [0, u-1]
+        write_value(w, v, k)
+    else
+        # use k+1 bits for values in [u, n-1]
+        # encode as v + u in k+1 bits
+        write_value(w, v + u, k + 1)
+    end
+end
 
 ################################################################################
 # Huffman encoding
