@@ -67,4 +67,8 @@ include("mgs.jl")
 using .MGS
 export MGS
 
+include("distribution.jl")
+using .Distribution
+export Distribution
+
 end # module Adjacently
