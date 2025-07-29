@@ -37,7 +37,8 @@ export write_unary_coding,
        write_golomb,
        read_golomb,
        write_fibonacci_code,
-       read_fibonacci_code
+       read_fibonacci_code,
+       write_zeta_coding
 
 ################################################################################
 # Basic encoding / decoding
@@ -51,11 +52,11 @@ Write a unary coding to the bitwriter.
 @param w::BitWriter: the bitwriter
 @param v::T: the value to write
 """
-function write_unary_coding(w::BitWriter, v::T) where {T<:Unsigned}
+function write_unary_coding(w::BitWriter, v::T, invert::Bool = false) where {T<:Unsigned}
     for i in 1:v
-        write_bit(w, true)
+        write_bit(w, invert)
     end
-    write_bit(w, false)
+    write_bit(w, !invert)
 end
 
 """
@@ -662,5 +663,66 @@ function read_fibonacci_code(r::BitReader, ::Type{T}=UInt8) where {T<:Unsigned}
 
     return value
 end
+
+################################################################################
+# Zeta code
+################################################################################
+
+"""
+    write_zeta_coding(w::BitWriter, v::T, k::Int) where {T<:Unsigned}
+
+Write a zeta code for value `v` with parameter `k`.
+
+Zeta coding of a natural number `v` depends on parameter `k` and is done in two steps:
+1. Encode exponent h = floor(floor(log2(v))/k) using unary coding
+2. Encode difference v - (2^k)^h using truncated binary coding
+   with alphabet size (2^k)^(h+1) - (2^k)^h
+
+@param w::BitWriter: the bitwriter
+@param v::T: the value to encode (must be > 0)
+@param k::Int: the zeta parameter (must be > 0)
+"""
+function write_zeta_coding(w::BitWriter, v::T, k::Int) where {T<:Unsigned}
+    if k <= 0
+        throw(ArgumentError("k must be > 0"))
+    end
+    if v == 0
+        throw(ArgumentError("Zeta coding is undefined for 0"))
+    end
+    
+    # Special case: when k=1, zeta coding should be identical to Elias gamma
+    #if k == 1
+    #    write_elias_gamma(w, v)
+    #    return
+    #end
+    
+    # Find h such that v is in range [(2^k)^h, (2^k)^(h+1))
+    h = 0
+    while T(1) << (k * (h + 1)) <= v
+        h += 1
+    end
+    
+    # step 2: encode h using unary coding
+    write_unary_coding(w, T(h))
+    
+    # step 3: calculate (2^k)^h = 2^(k*h)
+    power_base = T(1) << (k * h)
+
+    # step 4: calculate the remainder v - (2^k)^h
+    remainder = v - power_base
+    
+    # step 5: calculate alphabet size = (2^k)^(h+1) - (2^k)^h
+    next_power_base = power_base << k
+    alphabet_size = Int(next_power_base - power_base)
+    
+    # step 6: encode remainder using truncated binary coding
+    if alphabet_size > 1
+        write_truncated_binary_coding(w, remainder, alphabet_size)
+    end
+end
+
+
+
+
 
 end # module Compression

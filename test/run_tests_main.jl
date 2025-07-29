@@ -27,7 +27,7 @@ using Adjacently.MGS: write_mgs3_graph, write_compressed_mgs3_graph, load_mgs3_g
 using Adjacently.Util: bottom_up_sort, quicksort_iterative_permutation!, get_sorted_array, binary_search
 using Adjacently.Compression: write_unary_coding, write_truncated_binary_coding, huffman_encoding, encode_huffman_tree!, decode_huffman_tree!, get_huffman_codes!, 
 write_elias_gamma, write_elias_delta, write_golomb, read_elias_gamma, read_elias_delta, read_golomb, 
-write_fibonacci_code, read_fibonacci_code
+write_fibonacci_code, read_fibonacci_code, write_zeta_coding
 using Adjacently.Distribution: get_degree_entropy
 
 # Get the absolute path to the project root directory
