@@ -95,7 +95,7 @@ end
 
     criterion = [:in_degree, :out_degree, :degree, :pagerank, :lexicographic]
     encoding = [:children, :index]
-    compression = [:elias_delta, :fibonacci]
+    compression = [:elias_delta, :fibonacci, :zeta]
 
     for compression in compression
         for encoding in encoding
