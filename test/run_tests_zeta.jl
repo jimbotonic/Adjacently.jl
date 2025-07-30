@@ -53,6 +53,27 @@ function zeta_bits(v::T, k::Int) where {T<:Unsigned}
     return read_bits(reader, nbits)
 end
 
+"""
+    bitvector_to_bitreader(bits::BitVector)
+
+Create a BitReader from a BitVector for testing purposes.
+"""
+function bitvector_to_bitreader(bits::BitVector)
+    io = IOBuffer()
+    writer = BitWriter(io)
+    
+    # Write each bit from the BitVector
+    for bit in bits
+        write_bit(writer, bit)
+    end
+    
+    # Flush and prepare for reading
+    flush_bitwriter(writer; flush_last_bits=true)
+    seekstart(io)
+    
+    return BitReader(io)
+end
+
 @testset "Unary Coding" begin
     @test unary_bits(UInt8(0), true) == BitVector([0])
     @test unary_bits(UInt8(1), true) == BitVector([1, 0])
@@ -126,4 +147,15 @@ end
     @test zeta_bits(UInt8(6), 4) == BitVector([1, 0, 1, 1, 0])
     @test zeta_bits(UInt8(7), 4) == BitVector([1, 0, 1, 1, 1])
     @test zeta_bits(UInt8(8), 4) == BitVector([1, 1, 0, 0, 0])
+end
+
+@testset "Zeta Decoding" begin
+    @test read_zeta_coding(bitvector_to_bitreader(BitVector([1])), 1, UInt8) == UInt8(1)
+    @test read_zeta_coding(bitvector_to_bitreader(BitVector([0, 1, 0])), 1, UInt8) == UInt8(2)
+    @test read_zeta_coding(bitvector_to_bitreader(BitVector([0, 1, 1])), 1, UInt8) == UInt8(3)
+    @test read_zeta_coding(bitvector_to_bitreader(BitVector([0, 0, 1, 0, 0])), 1, UInt8) == UInt8(4)
+    @test read_zeta_coding(bitvector_to_bitreader(BitVector([0, 0, 1, 0, 1])), 1, UInt8) == UInt8(5)
+    @test read_zeta_coding(bitvector_to_bitreader(BitVector([0, 0, 1, 1, 0])), 1, UInt8) == UInt8(6)
+    @test read_zeta_coding(bitvector_to_bitreader(BitVector([0, 0, 1, 1, 1])), 1, UInt8) == UInt8(7)
+    @test read_zeta_coding(bitvector_to_bitreader(BitVector([0, 0, 0, 1, 0, 0, 0])), 1, UInt8) == UInt8(8)
 end

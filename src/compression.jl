@@ -60,6 +60,24 @@ function write_unary_coding(w::BitWriter, v::T, invert::Bool = false) where {T<:
 end
 
 """
+    read_unary_coding(w::BitReader, invert::Bool = false, ::Type{T}=UInt8) where {T<:Unsigned}
+
+Read a unary coding from the bitreader.
+
+@param w::BitReader: the bitreader
+@param invert::Bool: whether to invert the bits
+@param T::Type: the type to return (default: UInt8)
+@return::T: the decoded value
+"""
+function read_unary_coding(w::BitReader, invert::Bool = false, ::Type{T}=UInt8) where {T<:Unsigned}
+    v = 0
+    while read_bit(w) == invert
+        v += 1
+    end
+    return convert(T, v)
+end
+
+"""
     write_truncated_binary_coding(w::BitWriter, v::T, n::Int) where {T<:Unsigned}
 
 Write a truncated binary code to the bitwriter.
@@ -95,6 +113,43 @@ function write_truncated_binary_coding(w::BitWriter, v::T, n::Int) where {T<:Uns
         # use k+1 bits for values in [u, n-1]
         # encode as v + u in k+1 bits
         write_value(w, v + u, k + 1)
+    end
+end
+
+"""
+    read_truncated_binary_coding(w::BitReader, n::Int, ::Type{T}=UInt8) where {T<:Unsigned}
+
+Read a truncated binary code from the bitreader.
+
+@param w::BitReader: the bitreader
+@param n::Int: the range size (number of possible values)
+@param T::Type: the type to return (default: UInt8)
+@return::T: the decoded value
+"""
+function read_truncated_binary_coding(w::BitReader, n::Int, ::Type{T}=UInt8) where {T<:Unsigned}
+    n == 0 && throw(ArgumentError("Range size n must be > 0"))
+    
+    # Special case: if n is 1, no bits needed
+    if n == 1
+        return T(0)
+    end
+    
+    # Calculate k = floor(log2(n))
+    k = floor(Int, log2(n))
+    
+    # Calculate threshold u = 2^(k+1) - n
+    u = (1 << (k + 1)) - n
+    
+    # Read k bits first
+    v = read_value(w, k, T)
+    
+    if v < u
+        # Use k bits for values in [0, u-1]
+        return v
+    else
+        # Read one more bit and reconstruct the value
+        extra_bit = read_bit(w) ? 1 : 0
+        return T(u + (v - u) * 2 + extra_bit)
     end
 end
 
@@ -721,8 +776,21 @@ function write_zeta_coding(w::BitWriter, v::T, k::Int) where {T<:Unsigned}
     end
 end
 
+"""
+    read_zeta_coding(r::BitReader, k::Int, ::Type{T}=UInt8) where {T<:Unsigned}
 
+Read a zeta code from the bit reader.
 
-
+@param r::BitReader: the bitreader
+@param k::Int: the zeta parameter (must be > 0)
+@param T::Type: the type to return (default: UInt8)
+@return::T: the decoded value
+"""
+function read_zeta_coding(r::BitReader, k::Int, ::Type{T}=UInt8) where {T<:Unsigned}
+    h = read_unary_coding(r, false, T)
+    power_base = T(1) << (k * h)
+    remainder = read_truncated_binary_coding(r, Int(power_base << k) - Int(power_base), T)
+    return power_base + remainder
+end
 
 end # module Compression
