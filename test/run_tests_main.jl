@@ -21,13 +21,13 @@ Pkg.activate(normpath(joinpath(@__DIR__, "..")))
 using LightGraphs: nv, ne, outneighbors, vertices, outdegree, density, add_vertices!, add_edge!
 
 using Adjacently
-using Adjacently.IO: load_adjacency_list_from_csv, load_graph_from_pajek, BitWriter, BitReader, read_bits, flush_bitwriter
+using Adjacently.IO: load_adjacency_list_from_csv, load_graph_from_pajek, BitWriter, BitReader, read_bits, flush_bitwriter, write_bit, read_bit
 using Adjacently.Graph: get_core, get_reverse_graph, get_basic_stats, relabel_graph, relabel_vertices
 using Adjacently.MGS: write_mgs3_graph, write_compressed_mgs3_graph, load_mgs3_graph, load_compressed_mgs3_graph
 using Adjacently.Util: bottom_up_sort, quicksort_iterative_permutation!, get_sorted_array, binary_search
 using Adjacently.Compression: write_unary_coding, write_truncated_binary_coding, huffman_encoding, encode_huffman_tree!, decode_huffman_tree!, get_huffman_codes!, 
 write_elias_gamma, write_elias_delta, write_golomb, read_elias_gamma, read_elias_delta, read_golomb, 
-write_fibonacci_code, read_fibonacci_code, write_zeta_coding
+write_fibonacci_code, read_fibonacci_code, write_zeta_coding, read_zeta_coding
 using Adjacently.Distribution: get_degree_entropy
 
 # Get the absolute path to the project root directory
