@@ -65,11 +65,7 @@ Compute the entropy of the samples.
 @return::Float64: the entropy of the samples
 """
 function get_entropy(samples::Vector{T}) where {T<:Unsigned}
-    entropy = 0.0
-    for sample in samples
-        entropy += log2(sample)
-    end
-    return entropy# compute the entropy of the distribution
+    # compute the entropy of the distribution using Shannon entropy formula
     entropy = 0.0
     # sample distribution (value => count)
     sample_dist = Dict{T, Float64}()
