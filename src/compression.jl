@@ -36,9 +36,10 @@ export write_unary_coding,
        read_elias_coding,
        write_golomb,
        read_golomb,
-       write_fibonacci_code,
-       read_fibonacci_code,
-       write_zeta_coding
+       write_fibonacci,
+       read_fibonacci,
+       write_zeta,
+       read_zeta
 
 ################################################################################
 # Basic encoding / decoding
@@ -552,15 +553,15 @@ Delta code format:
 """
 function read_elias_delta(r::BitReader, ::Type{T}=UInt8) where {T<:Unsigned}
     # Step 1: Read the length of the value
-    len = read_elias_gamma(r, T)
+    len = Int(read_elias_gamma(r, T))
 
     len < 1 && throw(ArgumentError("Invalid Elias delta encoding: length must be >= 1"))
 
     # Step 2: Read the (len - 1) lower bits
-    tail = read_value(r, len - 1, T)
+    tail = read_value(r, len-1, T)
 
     # Step 3: Combine with leading 1
-    return (T(1) << (len - 1)) | tail
+    return (T(1) << (len-1)) | tail
 end
 
 """
@@ -645,11 +646,11 @@ end
 ################################################################################
 
 """
-    write_fibonacci_code(w::BitWriter, n::T) where {T<:Unsigned}
+    write_fibonacci(w::BitWriter, n::T) where {T<:Unsigned}
 
 Write `n` using Fibonacci coding (with '1' stop bit), using precomputed FIB_NUMBERS.
 """
-function write_fibonacci_code(w::BitWriter, n::T) where {T<:Unsigned}
+function write_fibonacci(w::BitWriter, n::T) where {T<:Unsigned}
     n == 0 && throw(ArgumentError("Fibonacci code undefined for 0"))
 
     # find which Fibonacci numbers we need
@@ -687,11 +688,11 @@ function write_fibonacci_code(w::BitWriter, n::T) where {T<:Unsigned}
 end
 
 """
-    read_fibonacci_code(r::BitReader, ::Type{T}=UInt8) where {T<:Unsigned}
+    read_fibonacci(r::BitReader, ::Type{T}=UInt8) where {T<:Unsigned}
 
 Decode a Fibonacci code using precomputed FIB_NUMBERS.
 """
-function read_fibonacci_code(r::BitReader, ::Type{T}=UInt8) where {T<:Unsigned}
+function read_fibonacci(r::BitReader, ::Type{T}=UInt8) where {T<:Unsigned}
     value = zero(T)
     prev = false
     i = 1
@@ -724,7 +725,7 @@ end
 ################################################################################
 
 """
-    write_zeta_coding(w::BitWriter, v::T, k::Int) where {T<:Unsigned}
+    write_zeta(w::BitWriter, v::T, k::Int) where {T<:Unsigned}
 
 Write a zeta code for value `v` with parameter `k`.
 
@@ -737,7 +738,7 @@ Zeta coding of a natural number `v` depends on parameter `k` and is done in two 
 @param v::T: the value to encode (must be > 0)
 @param k::Int: the zeta parameter (must be > 0)
 """
-function write_zeta_coding(w::BitWriter, v::T, k::Int) where {T<:Unsigned}
+function write_zeta(w::BitWriter, v::T, k::Int) where {T<:Unsigned}
     if k <= 0
         throw(ArgumentError("k must be > 0"))
     end
@@ -777,7 +778,7 @@ function write_zeta_coding(w::BitWriter, v::T, k::Int) where {T<:Unsigned}
 end
 
 """
-    read_zeta_coding(r::BitReader, k::Int, ::Type{T}=UInt8) where {T<:Unsigned}
+    read_zeta(r::BitReader, k::Int, ::Type{T}=UInt8) where {T<:Unsigned}
 
 Read a zeta code from the bit reader.
 
@@ -786,7 +787,7 @@ Read a zeta code from the bit reader.
 @param T::Type: the type to return (default: UInt8)
 @return::T: the decoded value
 """
-function read_zeta_coding(r::BitReader, k::Int, ::Type{T}=UInt8) where {T<:Unsigned}
+function read_zeta(r::BitReader, k::Int, ::Type{T}=UInt8) where {T<:Unsigned}
     h = read_unary_coding(r, false, T)
     power_base = T(1) << (k * h)
     remainder = read_truncated_binary_coding(r, Int(power_base << k) - Int(power_base), T)

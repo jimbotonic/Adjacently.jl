@@ -48,3 +48,38 @@ include("run_tests_main.jl")
     out_degree_entropy = get_degree_entropy(amz_rcore, :out_degree)
     @test isapprox(out_degree_entropy, 0.8850680456612653, atol=1e-10)
 end
+
+@testset "Powerlaw Sampling" begin
+    @info("Sampling from powerlaw distribution")
+    k = 1.2
+    min_value = 1
+    max_value = 1000
+    n_samples = 1000000
+    values = powerlaw_sample(k, n_samples, min_value, max_value, UInt64)
+    @test length(values) == n_samples
+    @test all(values .>= 1)
+    @test all(values .<= 1000)
+
+    # Plot histogram (normalized)
+    hist = histogram(values;
+        bins=1000,
+        normalize=true,
+        title="Power-law Histogram (k=$k)",
+        xlabel="Value",
+        ylabel="Probability",
+        legend=false)
+
+    # create test directory if it doesn't exist
+    mkpath(TEST_DIR)
+    
+    # Use test directory for output files
+    powerlaw_output_file = joinpath(TEST_DIR, "powerlaw_histogram_k$k.png")
+
+    # Save the plot as PNG
+    savefig(powerlaw_output_file)
+
+    # Clean up test file
+    #rm(powerlaw_output_file, force=true)
+    # clean up the test directory
+    #rm(TEST_DIR, force=true, recursive=true)  
+end

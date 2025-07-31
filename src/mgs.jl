@@ -21,10 +21,12 @@ using ..NodeTypes: Node, EmptyNode
 using ..CustomLightGraphs: SimpleDiGraph, SimpleGraph, SimpleEdge
 using ..Util: infer_uint_custom_type, to_bytes
 using ..IO: BitWriter, write_bytes, flush_bitwriter, BitReader
+
 using ..Compression: huffman_encoding, get_huffman_codes!, decode_huffman_values, 
 	delta_encode_vector, write_elias_coding, read_elias_coding, 
-	write_golomb, read_golomb, write_fibonacci_code, read_fibonacci_code,
-	write_zeta_coding, read_zeta_coding
+	write_golomb, read_golomb, write_fibonacci, read_fibonacci,
+	write_zeta, read_zeta
+
 using ..Graph: get_basic_stats, get_in_out_degrees, get_out_degrees, relabel_vertices, relabel_graph
 using ..Constants: GOLOMB_BASE, ZETA_BASE
 
@@ -931,13 +933,13 @@ function write_fibonacci_compressed_mgs3_graph(g::AbstractGraph{T}, filename::Ab
 					if d == 0
 						error("Delta is equal to 0. This should not happen as all neighbors are unique.")
 					end
-					write_fibonacci_code(bw, d)
+					write_fibonacci(bw, d)
 				end
 			end
 			# if we did not reach the last parent vertex, write the stop sequence
 			if v < gs
 				# write the stop sequence
-				write_fibonacci_code(bw, stop_seq)
+				write_fibonacci(bw, stop_seq)
 			end
 		end
 	elseif encoding == :index
@@ -948,7 +950,7 @@ function write_fibonacci_compressed_mgs3_graph(g::AbstractGraph{T}, filename::Ab
 		@info("writing index section")
 		### write index section
 		for v in vs
-			write_fibonacci_code(bw, out_degrees[v])
+			write_fibonacci(bw, out_degrees[v])
 		end
 		@info("writing data section")
 		### write data section
@@ -967,7 +969,7 @@ function write_fibonacci_compressed_mgs3_graph(g::AbstractGraph{T}, filename::Ab
 					if d == 0
 						error("Delta is equal to 0. This should not happen as all neighbors are unique.")
 					end
-					write_fibonacci_code(bw, d)
+					write_fibonacci(bw, d)
 				end
 			end
 		end
@@ -1062,13 +1064,13 @@ function write_zeta_compressed_mgs3_graph(g::AbstractGraph{T}, filename::Abstrac
 					if d == 0
 						error("Delta is equal to 0. This should not happen as all neighbors are unique.")
 					end
-					write_zeta_coding(bw, d, k)
+					write_zeta(bw, d, k)
 				end
 			end
 			# if we did not reach the last parent vertex, write the stop sequence
 			if v < gs
 				# write the stop sequence
-				write_zeta_coding(bw, stop_seq, k)
+				write_zeta(bw, stop_seq, k)
 			end
 		end
 	elseif encoding == :index
@@ -1079,7 +1081,7 @@ function write_zeta_compressed_mgs3_graph(g::AbstractGraph{T}, filename::Abstrac
 		@info("writing index section")
 		### write index section
 		for v in vs
-			write_zeta_coding(bw, out_degrees[v], k)
+			write_zeta(bw, out_degrees[v], k)
 		end
 		@info("writing data section")
 		### write data section
@@ -1098,7 +1100,7 @@ function write_zeta_compressed_mgs3_graph(g::AbstractGraph{T}, filename::Abstrac
 					if d == 0
 						error("Delta is equal to 0. This should not happen as all neighbors are unique.")
 					end
-					write_zeta_coding(bw, d, k)
+					write_zeta(bw, d, k)
 				end
 			end
 		end
@@ -1592,7 +1594,7 @@ function load_fibonacci_compressed_mgs3_graph(io::IO, graph_type::Symbol, encodi
 			source = convert(V, v)
 			try
 				# read the first neighbor value
-				first_value = read_fibonacci_code(reader, V)
+				first_value = read_fibonacci(reader, V)
 				if first_value == stop_seq
 					# go to next vertex
 					continue
@@ -1604,7 +1606,7 @@ function load_fibonacci_compressed_mgs3_graph(io::IO, graph_type::Symbol, encodi
 
 				# read subsequent neighbors as differences
 				while true
-					delta = read_fibonacci_code(reader, V)
+					delta = read_fibonacci(reader, V)
 					if delta == stop_seq
 						# go to next vertex
 						break
@@ -1624,7 +1626,7 @@ function load_fibonacci_compressed_mgs3_graph(io::IO, graph_type::Symbol, encodi
 		out_degrees = Dict{V,V}()
 		# read the out-degrees
 		for v in vs
-			out_degrees[v] = read_fibonacci_code(reader, V)
+			out_degrees[v] = read_fibonacci(reader, V)
 		end
 		@info("reading data section")
 		for v in vs
@@ -1638,13 +1640,13 @@ function load_fibonacci_compressed_mgs3_graph(io::IO, graph_type::Symbol, encodi
 			neighbors = V[]
 			try
 				# read first value
-				first_value = read_fibonacci_code(reader, V)
+				first_value = read_fibonacci(reader, V)
 				push!(neighbors, first_value - 1)
 				prev_value = first_value - 1
 				
 				# read remaining deltas
 				for _ in 2:degree
-					delta = read_fibonacci_code(reader, V)
+					delta = read_fibonacci(reader, V)
 					prev_value += (delta - 1)
 					push!(neighbors, prev_value)
 				end
@@ -1710,7 +1712,7 @@ function load_zeta_compressed_mgs3_graph(io::IO, graph_type::Symbol, encoding::S
 			source = convert(V, v)
 			try
 				# read the first neighbor value
-				first_value = read_zeta_coding(reader, k, V)
+				first_value = read_zeta(reader, k, V)
 				if first_value == stop_seq
 					# go to next vertex
 					continue
@@ -1722,7 +1724,7 @@ function load_zeta_compressed_mgs3_graph(io::IO, graph_type::Symbol, encoding::S
 
 				# read subsequent neighbors as differences
 				while true
-					delta = read_zeta_coding(reader, k, V)
+					delta = read_zeta(reader, k, V)
 					if delta == stop_seq
 						# go to next vertex
 						break
@@ -1742,7 +1744,7 @@ function load_zeta_compressed_mgs3_graph(io::IO, graph_type::Symbol, encoding::S
 		out_degrees = Dict{V,V}()
 		# read the out-degrees
 		for v in vs
-			out_degrees[v] = read_zeta_coding(reader, k, V)
+			out_degrees[v] = read_zeta(reader, k, V)
 		end
 		@info("reading data section")
 		for v in vs
@@ -1756,13 +1758,13 @@ function load_zeta_compressed_mgs3_graph(io::IO, graph_type::Symbol, encoding::S
 			neighbors = V[]
 			try
 				# read first value
-				first_value = read_zeta_coding(reader, k, V)
+				first_value = read_zeta(reader, k, V)
 				push!(neighbors, first_value - 1)
 				prev_value = first_value - 1
 				
 				# read remaining deltas
 				for _ in 2:degree
-					delta = read_zeta_coding(reader, k, V)
+					delta = read_zeta(reader, k, V)
 					prev_value += (delta - 1)
 					push!(neighbors, prev_value)
 				end
