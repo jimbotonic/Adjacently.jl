@@ -28,16 +28,21 @@ using Adjacently
 using Adjacently.IO: load_adjacency_list_from_csv, load_graph_from_pajek, BitWriter, BitReader, 
 read_bits, flush_bitwriter, write_bit, read_bit
 
-using Adjacently.Graph: get_core, get_reverse_graph, get_basic_stats, relabel_graph, relabel_vertices
+using Adjacently.Graph: get_core, get_reverse_graph, get_basic_stats, relabel_graph, relabel_vertices,
+get_out_degrees, get_in_degrees, get_in_out_degrees
+
 using Adjacently.MGS: write_mgs3_graph, write_compressed_mgs3_graph, load_mgs3_graph, load_compressed_mgs3_graph
-using Adjacently.Util: bottom_up_sort, quicksort_iterative_permutation!, get_sorted_array, binary_search
+
+using Adjacently.Util: bottom_up_sort, quicksort_iterative_permutation!, get_sorted_array, binary_search,
+infer_uint_custom_type
 
 using Adjacently.Compression: write_unary_coding, write_truncated_binary_coding, huffman_encoding, 
 encode_huffman_tree!, decode_huffman_tree!, get_huffman_codes!, 
 write_elias_gamma, write_elias_delta, write_golomb, read_elias_gamma, read_elias_delta, read_golomb, 
-write_fibonacci, read_fibonacci, write_zeta, read_zeta
+write_fibonacci, read_fibonacci, write_zeta, read_zeta, delta_encode_vector,
+write_encoded_value, read_encoded_value, write_run_length_delta, read_run_length_delta
 
-using Adjacently.Distribution: get_degree_entropy, get_entropy, powerlaw_sample
+using Adjacently.Distribution: get_graph_entropy, get_degree_entropy, get_entropy, powerlaw_sample
 
 using Adjacently.Constants: GOLOMB_BASE, ZETA_BASE
 
@@ -96,4 +101,51 @@ function bitvector_to_bitreader(bits::BitVector)
     seekstart(io)
     
     return BitReader(io)
+end
+
+"""
+    samples_bits(samples::Vector{T}, encoding::Symbol) where {T<:Unsigned}
+
+    Parameters:
+    - samples: Vector of samples to encode
+    - encoding: Encoding scheme (:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta)
+
+Return encoded samples as a BitVector for a given samples.
+"""
+function samples_bits(samples::Vector{T}, encoding::Symbol) where {T<:Unsigned}
+    # Use a simple approach: encode each sample individually and collect the bits
+    all_bits = Bool[]
+    
+    for sample in samples
+        io = IOBuffer()
+        writer = BitWriter(io)
+        
+        if encoding == :elias_gamma
+            write_elias_gamma(writer, sample)
+        elseif encoding == :elias_delta
+            write_elias_delta(writer, sample)
+        elseif encoding == :golomb
+            write_golomb(writer, sample, GOLOMB_BASE)
+        elseif encoding == :fibonacci
+            write_fibonacci(writer, sample)
+        elseif encoding == :zeta
+            write_zeta(writer, sample, ZETA_BASE)
+        else
+            error("Invalid encoding scheme: $encoding")
+        end
+        
+        # capture number of bits for this sample
+        sample_nbits = writer.index - 1
+        flush_bitwriter(writer; flush_last_bits=true)
+        
+        # read the bits for this sample
+        seekstart(io)
+        reader = BitReader(io)
+        sample_bits = read_bits(reader, sample_nbits)
+        
+        # append to all_bits
+        append!(all_bits, sample_bits)
+    end
+    
+    return all_bits
 end

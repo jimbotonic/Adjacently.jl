@@ -16,83 +16,36 @@
 include("run_tests_main.jl")
 
 """
-    samples_bits(samples::Vector{T}, encoding::Symbol) where {T<:Unsigned}
-
-    Parameters:
-    - samples: Vector of samples to encode
-    - encoding: Encoding scheme (:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta)
-
-Return Elias code as a BitVector for a given samples.
-"""
-function samples_bits(samples::Vector{T}, encoding::Symbol) where {T<:Unsigned}
-    # Use a simple approach: encode each sample individually and collect the bits
-    all_bits = Bool[]
-    
-    for sample in samples
-        io = IOBuffer()
-        writer = BitWriter(io)
-        
-        if encoding == :elias_gamma
-            write_elias_gamma(writer, sample)
-        elseif encoding == :elias_delta
-            write_elias_delta(writer, sample)
-        elseif encoding == :golomb
-            write_golomb(writer, sample, GOLOMB_BASE)
-        elseif encoding == :fibonacci
-            write_fibonacci(writer, sample)
-        elseif encoding == :zeta
-            write_zeta(writer, sample, ZETA_BASE)
-        else
-            error("Invalid encoding scheme: $encoding")
-        end
-        
-        # capture number of bits for this sample
-        sample_nbits = writer.index - 1
-        flush_bitwriter(writer; flush_last_bits=true)
-        
-        # read the bits for this sample
-        seekstart(io)
-        reader = BitReader(io)
-        sample_bits = read_bits(reader, sample_nbits)
-        
-        # append to all_bits
-        append!(all_bits, sample_bits)
-    end
-    
-    return all_bits
-end
-
-"""
     decode_samples(bits::BitVector, n_samples::Int, algorithm::Symbol)
 
 Parameters:
 - bits: BitVector to decode
 - n_samples: Number of samples to decode
-- algorithm: Algorithm to use for decoding
+- encoding: Encoding to use for decoding
 
 Return decoded samples as a Vector{UInt64}.
 """
-function decode_samples(bits::BitVector, n_samples::Int, algorithm::Symbol)
-    @info "Decoding $n_samples samples with $algorithm from $(length(bits)) bits"
+function decode_samples(bits::BitVector, n_samples::Int, encoding::Symbol)
+    @info "Decoding $n_samples samples with $encoding from $(length(bits)) bits"
     reader = bitvector_to_bitreader(bits)
     decoded = Vector{UInt64}(undef, n_samples)
     for i in 1:n_samples
         try
-            if algorithm == :elias_gamma
+            if encoding == :elias_gamma
                 decoded[i] = read_elias_gamma(reader, UInt64)
-            elseif algorithm == :elias_delta
+            elseif encoding == :elias_delta
                 decoded[i] = read_elias_delta(reader, UInt64)
-            elseif algorithm == :golomb
+            elseif encoding == :golomb
                 decoded[i] = read_golomb(reader, GOLOMB_BASE, UInt64)
-            elseif algorithm == :fibonacci
+            elseif encoding == :fibonacci
                 decoded[i] = read_fibonacci(reader, UInt64)
-            elseif algorithm == :zeta
+            elseif encoding == :zeta
                 decoded[i] = read_zeta(reader, ZETA_BASE, UInt64)
             else
-                error("Invalid algorithm: $algorithm")
+                error("Invalid encoding: $encoding")
             end
         catch e
-            @error "Error decoding sample $i with $algorithm: $e"
+            @error "Error decoding sample $i with $encoding: $e"
             rethrow(e)
         end
     end
@@ -111,12 +64,12 @@ end
     @test all(values .>= 1)
     @test all(values .<= 1000)
 
-    algorithms = [:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta]
+    encodings = [:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta]
 
     # encode the samples
-    for algorithm in algorithms
-        bits = samples_bits(values, algorithm)
-        @info "$algorithm: $(length(bits)) bits ($(length(bits) / n_samples) bits/sample)"
+    for encoding in encodings
+        bits = samples_bits(values, encoding)
+        @info "$encoding: $(length(bits)) bits ($(length(bits) / n_samples) bits/sample)"
     end
 
     # compute entropy of the samples
@@ -124,9 +77,9 @@ end
     @info "Samples entropy: $samples_entropy"
 
     # decode the samples
-    for algorithm in algorithms
-        bits = samples_bits(values, algorithm)
-        decoded = decode_samples(BitVector(bits), n_samples, algorithm)
+    for encoding in encodings
+        bits = samples_bits(values, encoding)
+        decoded = decode_samples(BitVector(bits), n_samples, encoding)
         @test decoded == values
     end
 end
@@ -139,12 +92,12 @@ end
     n_samples = 100000
     # average over 3 runs
     n_repetitions = 3
-    algorithms = [:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta]
+    encodings = [:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta]
     
     # Initialize results storage
     compression_rates = Dict{Symbol, Vector{Float64}}()
-    for algorithm in algorithms
-        compression_rates[algorithm] = Float64[]
+    for encoding in encodings
+        compression_rates[encoding] = Float64[]
     end
     
     # Storage for entropy values
@@ -158,8 +111,8 @@ end
         
         # storage for this k value
         k_rates = Dict{Symbol, Vector{Float64}}()
-        for algorithm in algorithms
-            k_rates[algorithm] = Float64[]
+        for encoding in encodings
+            k_rates[encoding] = Float64[]
         end
         
         # storage for entropy values for this k
@@ -175,17 +128,17 @@ end
             push!(k_entropies, sample_entropy)
             
             # test each algorithm
-            for algorithm in algorithms
-                bits = samples_bits(values, algorithm)
+            for encoding in encodings
+                bits = samples_bits(values, encoding)
                 rate = length(bits) / n_samples
-                push!(k_rates[algorithm], rate)
+                push!(k_rates[encoding], rate)
             end
         end
         
         # compute averages for this k value
-        for algorithm in algorithms
-            avg_rate = sum(k_rates[algorithm]) / n_repetitions
-            push!(compression_rates[algorithm], avg_rate)
+        for encoding in encodings
+            avg_rate = sum(k_rates[encoding]) / n_repetitions
+            push!(compression_rates[encoding], avg_rate)
         end
         
         # compute average entropy for this k value
@@ -213,9 +166,9 @@ end
     colors = [:blue, :red, :green, :purple, :orange, :black]
     
     # Add line for each algorithm
-    for (i, algorithm) in enumerate(algorithms)
-        plot!(plot_obj, k_vec, compression_rates[algorithm],
-              label=string(algorithm),
+    for (i, encoding) in enumerate(encodings)
+        plot!(plot_obj, k_vec, compression_rates[encoding],
+              label=string(encoding),
               color=colors[i],
               linewidth=2,
               marker=:circle,
@@ -238,12 +191,12 @@ end
     
     # print summary statistics
     @info "Compression Rate Summary:"
-    for algorithm in algorithms
-        rates = compression_rates[algorithm]
+    for encoding in encodings
+        rates = compression_rates[encoding]
         min_rate = minimum(rates)
         max_rate = maximum(rates)
         avg_rate = sum(rates) / length(rates)
-        @info "$algorithm: min=$min_rate, max=$max_rate, avg=$avg_rate bits/sample"
+        @info "$encoding: min=$min_rate, max=$max_rate, avg=$avg_rate bits/sample"
     end
     
     # Print entropy summary
@@ -256,11 +209,150 @@ end
     @test length(k_vec) == length(k_values)
     @test length(entropy_values) == length(k_values)
     @test all(entropy -> entropy > 0, entropy_values)
-    for algorithm in algorithms
-        @test length(compression_rates[algorithm]) == length(k_values)
-        @test all(rate -> rate > 0, compression_rates[algorithm])
+    for encoding in encodings
+        @test length(compression_rates[encoding]) == length(k_values)
+        @test all(rate -> rate > 0, compression_rates[encoding])
     end
     
     @info "Compression rate analysis completed successfully"
+end
+
+@testset "Plot Compression Rate (delta)" begin
+    # Parameters for the delta compression rate analysis
+    k_values = 1.1:0.1:3.0
+    min_value = 1
+    max_value = 1000
+    n_samples = 100000
+    # average over 3 runs
+    n_repetitions = 3
+    encodings = [:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta]
+    
+    # Initialize results storage for delta distribution
+    delta_compression_rates = Dict{Symbol, Vector{Float64}}()
+    for encoding in encodings
+        delta_compression_rates[encoding] = Float64[]
+    end
+    
+    # Storage for delta entropy values
+    delta_entropy_values = Float64[]
+    
+    @info "Computing compression rates for delta distribution of power law samples..."
+    
+    # test each k value
+    for k in k_values
+        @info "Testing k = $k"
+        
+        # storage for this k value
+        k_rates = Dict{Symbol, Vector{Float64}}()
+        for encoding in encodings
+            k_rates[encoding] = Float64[]
+        end
+        
+        # storage for entropy values for this k
+        k_entropies = Float64[]
+        
+        # run multiple repetitions for averaging
+        for rep in 1:n_repetitions
+            # generate power law samples
+            raw_values = powerlaw_sample(k, n_samples, min_value, max_value, UInt64)
+            
+            # sort the samples and compute delta encoding
+            sorted_values = sort(raw_values)
+            delta_values = delta_encode_vector(sorted_values)
+            # shift the delta values by 1 to avoid 0
+            delta_values = delta_values .+ 1
+            
+            # compute entropy for the delta distribution
+            delta_entropy = get_entropy(delta_values)
+            push!(k_entropies, delta_entropy)
+            
+            # test each algorithm on delta values
+            for encoding in encodings
+                bits = samples_bits(delta_values, encoding)
+                rate = length(bits) / n_samples
+                push!(k_rates[encoding], rate)
+            end
+        end
+        
+        # compute averages for this k value
+        for encoding in encodings
+            avg_rate = sum(k_rates[encoding]) / n_repetitions
+            push!(delta_compression_rates[encoding], avg_rate)
+        end
+        
+        # compute average entropy for this k value
+        avg_entropy = sum(k_entropies) / n_repetitions
+        push!(delta_entropy_values, avg_entropy)
+    end
+    
+    # Create the delta plot
+    @info "Creating delta compression rate plot..."
+    
+    # Convert k_values to vector for plotting
+    k_vec = collect(k_values)
+    
+    # Create plot with different colors for each algorithm
+    delta_plot_obj = plot(
+        title="Delta Compression Rate vs Power Law Exponent",
+        xlabel="Power Law Exponent (k)",
+        ylabel="Compression Rate (bits/sample)",
+        legend=:topright,
+        size=(800, 600),
+        dpi=300
+    )
+    
+    # Color palette for algorithms and entropy
+    colors = [:blue, :red, :green, :purple, :orange, :black]
+    
+    # Add line for each algorithm
+    for (i, encoding) in enumerate(encodings)
+        plot!(delta_plot_obj, k_vec, delta_compression_rates[encoding],
+              label=string(encoding),
+              color=colors[i],
+              linewidth=2,
+              marker=:circle,
+              markersize=4)
+    end
+    
+    # Add delta entropy line
+    plot!(delta_plot_obj, k_vec, delta_entropy_values,
+          label="entropy",
+          color=colors[6],
+          linewidth=2,
+          marker=:diamond,
+          markersize=4,
+          linestyle=:dash)
+    
+    # save the delta plot
+    mkpath("test_data")
+    savefig(delta_plot_obj, "test_data/delta_compression_rates.png")
+    @info "Delta plot saved to test_data/delta_compression_rates.png"
+    
+    # print delta summary statistics
+    @info "Delta Compression Rate Summary:"
+    for encoding in encodings
+        rates = delta_compression_rates[encoding]
+        min_rate = minimum(rates)
+        max_rate = maximum(rates)
+        avg_rate = sum(rates) / length(rates)
+        @info "$encoding: min=$min_rate, max=$max_rate, avg=$avg_rate bits/sample"
+    end
+    
+    # Print delta entropy summary
+    min_entropy = minimum(delta_entropy_values)
+    max_entropy = maximum(delta_entropy_values)
+    avg_entropy = sum(delta_entropy_values) / length(delta_entropy_values)
+    @info "delta entropy: min=$min_entropy, max=$max_entropy, avg=$avg_entropy bits/sample"
+    
+    # basic validation tests for delta
+    @test length(k_vec) == length(k_values)
+    @test length(delta_entropy_values) == length(k_values)
+    @test all(entropy -> entropy > 0, delta_entropy_values)
+    for encoding in encodings
+        @test length(delta_compression_rates[encoding]) == length(k_values)
+        @test all(rate -> rate > 0, delta_compression_rates[encoding])
+    end
+    
+    @info "Delta compression rate analysis completed successfully"
 end
 
