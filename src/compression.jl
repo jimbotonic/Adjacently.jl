@@ -24,6 +24,8 @@ using ..Constants: FIB_NUMBERS, BUFFER_SIZE
 # Export the functions we want to make available
 export write_unary_coding,
        write_truncated_binary_coding,
+       write_encoded_value,
+       read_encoded_value,
        huffman_encoding,
        encode_huffman_tree!,
        decode_huffman_tree!,
@@ -39,7 +41,9 @@ export write_unary_coding,
        write_fibonacci,
        read_fibonacci,
        write_zeta,
-       read_zeta
+       read_zeta,
+       write_run_length_delta,
+       read_run_length_delta
 
 ################################################################################
 # Basic encoding / decoding
@@ -151,6 +155,61 @@ function read_truncated_binary_coding(w::BitReader, n::Int, ::Type{T}=UInt8) whe
         # Read one more bit and reconstruct the value
         extra_bit = read_bit(w) ? 1 : 0
         return T(u + (v - u) * 2 + extra_bit)
+    end
+end
+
+################################################################################
+# Dispatching functions
+################################################################################
+
+"""
+    write_encoded_value(w::BitWriter, value::T, compression::Symbol) where {T<:Unsigned}
+
+Write a value to the bitwriter using the specified compression code.
+
+@param w::BitWriter: the bitwriter
+@param value::T: the value to write
+@param compression::Symbol: the compression coding to use (:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta)
+"""
+function write_encoded_value(w::BitWriter, value::T, compression::Symbol) where {T<:Unsigned}
+    if compression == :elias_gamma
+        write_elias_gamma(w, value)
+    elseif compression == :elias_delta
+        write_elias_delta(w, value)
+    elseif compression == :golomb
+        write_golomb(w, value, GOLOMB_BASE)
+    elseif compression == :fibonacci
+        write_fibonacci(w, value)
+    elseif compression == :zeta
+        write_zeta(w, value, ZETA_BASE)
+    else
+        throw(ArgumentError("Invalid compression code: $compression"))
+    end
+end
+
+"""
+    read_encoded_value(r::BitReader, compression::Symbol, ::Type{T}=UInt8) where {T<:Unsigned}
+
+Read a value from the bitreader using the specified compression code.
+
+@param r::BitReader: the bitreader
+@param compression::Symbol: the compression coding to use (:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta)
+@param T::Type: the type to return (default: UInt8)
+@return::T: the decoded value
+"""
+function read_encoded_value(r::BitReader, compression::Symbol, ::Type{T}=UInt8) where {T<:Unsigned}
+    if compression == :elias_gamma
+        return read_elias_gamma(r, T)
+    elseif compression == :elias_delta
+        return read_elias_delta(r, T)
+    elseif compression == :golomb
+        return read_golomb(r, GOLOMB_BASE, T)
+    elseif compression == :fibonacci
+        return read_fibonacci(r, T)
+    elseif compression == :zeta
+        return read_zeta(r, ZETA_BASE, T)
+    else
+        throw(ArgumentError("Invalid compression code: $compression"))
     end
 end
 
@@ -428,22 +487,17 @@ end
 Delta encode a list of integers
 
 @param lst::Vector{T}: The list of integers to delta encode
+@param shifted::Bool: Whether to shift the list by 1 to avoid 0
 @return::Vector{T}: The delta encoded list
 """
-function delta_encode_vector(lst::Vector{T}, shifted::Bool = false)::Vector{T} where {T<:Unsigned}
-    if shifted
-        # shift the list by 1 to avoid 0
-        lst_shifted = lst .+ 1
-    else
-        lst_shifted = lst
-    end
+function delta_encode_vector(lst::Vector{T})::Vector{T} where {T<:Unsigned}
     # if the list is empty, return an empty list
-    isempty(lst_shifted) && return T[]
+    isempty(lst) && return T[]
     # initialize the differences with the first element
-    diffs = [T(lst_shifted[firstindex(lst_shifted)])]
+    diffs = [T(lst[firstindex(lst)])]
     # for each element in the list, compute the difference with the previous element
-    for i in eachindex(lst_shifted)[2:end]
-        push!(diffs, T(lst_shifted[i] - lst_shifted[i-1]))
+    for i in eachindex(lst)[2:end]
+        push!(diffs, T(lst[i] - lst[i-1]))
     end
     return diffs
 end
@@ -746,32 +800,35 @@ function write_zeta(w::BitWriter, v::T, k::Int) where {T<:Unsigned}
         throw(ArgumentError("Zeta coding is undefined for 0"))
     end
     
-    # Special case: when k=1, zeta coding should be identical to Elias gamma
-    #if k == 1
-    #    write_elias_gamma(w, v)
-    #    return
-    #end
-    
-    # Find h such that v is in range [(2^k)^h, (2^k)^(h+1))
-    h = 0
-    while T(1) << (k * (h + 1)) <= v
-        h += 1
+    # Special case: when k=1, zeta coding is identical to Elias gamma
+    if k == 1
+        write_elias_gamma(w, v)
+        return
     end
     
-    # step 2: encode h using unary coding
+    # optimized h calculation using bit operations
+    # find h such that v is in range [2^(k*h), 2^(k*(h+1)))
+    log2_v = sizeof(T) * 8 - leading_zeros(v) - 1  # floor(log2(v))
+    h = div(log2_v, k)  # floor(log2_v / k)
+    
+    # verify and adjust if needed (for edge cases)
+    k_times_h = k * h
+    power_base = T(1) << k_times_h
+    if power_base > v
+        h -= 1
+        power_base >>= k 
+    end
+    
+    # encode h using unary coding
     write_unary_coding(w, T(h))
     
-    # step 3: calculate (2^k)^h = 2^(k*h)
-    power_base = T(1) << (k * h)
-
-    # step 4: calculate the remainder v - (2^k)^h
+    # calculate remainder v - 2^(k*h)
     remainder = v - power_base
     
-    # step 5: calculate alphabet size = (2^k)^(h+1) - (2^k)^h
-    next_power_base = power_base << k
-    alphabet_size = Int(next_power_base - power_base)
+    # calculate alphabet size = 2^(k*(h+1)) - 2^(k*h) = 2^(k*h) * (2^k - 1)
+    alphabet_size = Int(power_base * ((1 << k) - 1))
     
-    # step 6: encode remainder using truncated binary coding
+    # encode remainder using truncated binary coding
     if alphabet_size > 1
         write_truncated_binary_coding(w, remainder, alphabet_size)
     end
@@ -792,6 +849,118 @@ function read_zeta(r::BitReader, k::Int, ::Type{T}=UInt8) where {T<:Unsigned}
     power_base = T(1) << (k * h)
     remainder = read_truncated_binary_coding(r, Int(power_base << k) - Int(power_base), T)
     return power_base + remainder
+end
+
+################################################################################
+# Run-length + delta code
+################################################################################
+
+"""
+    write_run_length_delta(w::BitWriter, compression::Symbol, lst::Vector{T}) where {T<:Unsigned}
+
+Write a run-length + delta code to the bitwriter.
+
+@param w::BitWriter: the bitwriter
+@param encoding::Symbol: the compression coding to use (:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta)
+@param lst::Vector{T}: the list of integers to write
+"""
+function write_run_length_delta(w::BitWriter, encoding::Symbol, lst::Vector{T}) where {T<:Unsigned}
+    # if the list is empty, return
+    isempty(lst) && return
+
+    # delta encoding
+    delta_lst = delta_encode_vector(lst)
+
+    # [flag 0: 1 bit][delta: varint]  // delta
+    # [flag 1: 1 bit][value: varint][length: varint]   // run
+
+    # write the first value (not delta encoded)
+    write_encoded_value(w, delta_lst[1], encoding)
+    
+    i = 2
+    while i <= length(delta_lst)
+        current_value = delta_lst[i]
+        
+        # check for consecutive equal values (run)
+        run_length = 1
+        while i + run_length <= length(delta_lst) && delta_lst[i + run_length - 1] == current_value
+            run_length += 1
+        end
+        
+        if run_length >= 3  # only use run-length for 3+ consecutive values
+            # flag 1: run-length encoding
+            write_bit(w, true)
+            # encode the value
+            write_encoded_value(w, current_value, encoding)
+            # encode the run length
+            write_encoded_value(w, T(run_length), encoding)
+            i += run_length
+        else
+            # flag 0: delta encoding
+            write_bit(w, false)
+            # encode the delta value
+            write_encoded_value(w, current_value, encoding)
+            i += 1
+        end
+    end
+end
+
+"""
+    read_run_length_delta(r::BitReader, encoding::Symbol, ::Type{T}=UInt8) where {T<:Unsigned}
+
+Read a run-length + delta code from the bit reader.
+
+@param r::BitReader: the bit reader
+@param encoding::Symbol: the compression coding to use (:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta)
+@param T::Type: the type to return (default: UInt8)
+@return::Vector{T}: the decoded list
+"""
+function read_run_length_delta(r::BitReader, encoding::Symbol, ::Type{T}=UInt8) where {T<:Unsigned}
+    delta_lst = T[]
+    
+    try
+        # read the first value (not delta encoded)
+        first_value = read_encoded_value(r, encoding, T)
+        push!(delta_lst, first_value)
+        
+        # read the rest of the values
+        while true
+            # read the flag bit
+            flag = read_bit(r)
+            
+            # run-length encoding
+            if flag
+                # read the value
+                value = read_encoded_value(r, encoding, T)
+                # read the run length
+                run_length = Int(read_encoded_value(r, encoding, T))
+                # add the run to the delta list
+                for _ in 1:run_length
+                    push!(delta_lst, value)
+                end
+            # delta encoding
+            else
+                # read the delta value
+                delta_value = read_encoded_value(r, encoding, T)
+                push!(delta_lst, delta_value)
+            end
+        end
+    catch e
+        # end of stream reached, this is expected
+        if !isa(e, EOFError)
+            rethrow(e)
+        end
+    end
+    
+    # reconstruct original values from delta encoding
+    isempty(delta_lst) && return T[]
+    
+    original_lst = T[delta_lst[1]]
+    for i in 2:length(delta_lst)
+        push!(original_lst, original_lst[end] + delta_lst[i])
+    end
+    
+    return original_lst
 end
 
 end # module Compression
