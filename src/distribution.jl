@@ -19,7 +19,71 @@ using Random
 using LightGraphs
 using ..Graph: get_in_degrees, get_out_degrees, get_in_out_degrees
 
-export get_degree_entropy, get_entropy, powerlaw_sample
+export get_graph_entropy, get_degree_entropy, get_entropy, powerlaw_sample
+
+"""
+    get_graph_entropy(g::AbstractGraph{T}, unit::Symbol=:bits_per_edge) where {T<:Unsigned}
+
+Compute the entropy of the graph structure.
+
+@param g::AbstractGraph{T}: the graph
+@param unit::Symbol: the unit to return (:bits_per_edge or :bits_per_vertex)
+@return::Float64: the entropy of the graph in the specified unit
+
+For :bits_per_edge - calculates the entropy of neighbor IDs (adjacency list entropy)
+For :bits_per_vertex - calculates the entropy of degree sequences
+"""
+function get_graph_entropy(g::AbstractGraph{T}, unit::Symbol=:bits_per_edge) where {T<:Unsigned}
+    if unit == :bits_per_vertex
+        # Calculate entropy of degree distributions (bits per vertex)
+        in_degrees, out_degrees = get_in_out_degrees(g)
+        num_vertices = nv(g)
+        
+        # in-degree entropy
+        in_degree_counts = Dict{T, Int}()
+        for in_deg in values(in_degrees)
+            in_degree_counts[in_deg] = get(in_degree_counts, in_deg, 0) + 1
+        end
+        
+        in_entropy = 0.0
+        for count in values(in_degree_counts)
+            prob = count / num_vertices
+            in_entropy += prob * log2(prob)
+        end
+        
+        # out-degree entropy  
+        out_degree_counts = Dict{T, Int}()
+        for out_deg in values(out_degrees)
+            out_degree_counts[out_deg] = get(out_degree_counts, out_deg, 0) + 1
+        end
+        
+        out_entropy = 0.0
+        for count in values(out_degree_counts)
+            prob = count / num_vertices
+            out_entropy += prob * log2(prob)
+        end
+        
+        return -(in_entropy + out_entropy)
+        
+    elseif unit == :bits_per_edge
+        # calculate entropy of neighbor IDs (adjacency list entropy)
+        neighbor_ids = T[]
+        
+        for v in vertices(g)
+            for neighbor in outneighbors(g, v)
+                push!(neighbor_ids, T(neighbor))
+            end
+        end
+        
+        if isempty(neighbor_ids)
+            return 0.0
+        end
+        
+        return get_entropy(neighbor_ids)        
+    else
+        throw(ArgumentError("Invalid unit: $unit. Must be :bits_per_edge or :bits_per_vertex"))
+    end
+end
 
 """
     get_degree_entropy(g::AbstractGraph{T}, type::Symbol=:in_degree) where {T<:Unsigned}
