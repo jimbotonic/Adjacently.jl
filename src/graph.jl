@@ -46,7 +46,8 @@ export get_basic_stats,
        get_sparse_P_matrix,
        relabel_vertices,
        relabel_graph,
-       get_sparse_symmetric_P_matrix
+       get_sparse_symmetric_P_matrix,
+	   get_neighbor_lists
 
 ########################################################
 # Basic stats for directed graphs
@@ -447,6 +448,23 @@ function get_avg_out_degree(g::AbstractGraph{T}, visited::Array{T,1}, p_avg::Flo
 	else
 		return sum/length(visited)
 	end
+end
+
+"""
+    get_neighbor_lists(g::AbstractGraph{T}) where {T<:Unsigned}
+
+get the neighbor lists of the graph
+
+@param g: the graph
+
+@returns the neighbor lists as a dictionary (vertex_id -> list of neighbors)
+"""
+function get_neighbor_lists(g::AbstractGraph{T}) where {T<:Unsigned}
+	neighbor_lists = Dict{T,Vector{T}}()
+	for v in vertices(g)
+		neighbor_lists[v] = outneighbors(g,v)
+	end
+	return neighbor_lists
 end
 
 """ 
