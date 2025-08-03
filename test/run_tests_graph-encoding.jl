@@ -30,8 +30,8 @@ include("run_tests_main.jl")
 	@info("Getting reverse graph")
 	amz_rcore = get_reverse_graph(amz_core) 
 	@test 395234 == convert(Int,nv(amz_rcore))
-	@test 3301092 == ne(amz_rcore)
-    
+	@test 3301092 == ne(amz_rcore)	
+
     # Create test directory if it doesn't exist
     mkpath(TEST_DIR)
 
