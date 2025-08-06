@@ -32,6 +32,8 @@ export write_unary_coding,
        get_huffman_codes!,
        decode_huffman_values,
        delta_encode_vector,
+       write_delta,
+       read_delta,
        write_elias_gamma,
        read_elias_gamma,
        write_elias_coding,
@@ -895,6 +897,91 @@ end
 ################################################################################
 
 """
+    write_delta(w::BitWriter, lst::Vector{T}, encoding::Symbol) where {T<:Unsigned}
+
+Write a list of values to the bitwriter, using delta encoding.
+
+@param w::BitWriter: the bitwriter
+@param lst::Vector{T}: the list of values to write
+@param encoding::Symbol: the compression coding to use (:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta)
+"""
+function write_delta(w::BitWriter, lst::Vector{T}, encoding::Symbol) where {T<:Unsigned}
+    # if the list is empty, return
+    isempty(lst) && return
+    
+    # delta encoding
+    delta_lst = delta_encode_vector(lst)
+
+    # write the first value (not delta encoded)
+    # NB: we assume that the first value is not 0
+    write_encoded_value(w, delta_lst[1], encoding)
+
+    # write the rest of the values
+    for i in 2:length(delta_lst)
+        # NB: we shift by 1 to avoid zeros
+        write_encoded_value(w, delta_lst[i] + T(1), encoding)
+    end
+end
+
+"""
+    read_delta(r::BitReader, encoding::Symbol, ::Type{T}=UInt8) where {T<:Unsigned}
+
+Read a list of values from the bit reader, using delta encoding.
+
+@param r::BitReader: the bit reader
+@param encoding::Symbol: the compression coding to use (:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta)
+@param T::Type: the type to return (default: UInt8)
+@return::Vector{T}: the decoded list
+"""
+function read_delta(r::BitReader, encoding::Symbol, ::Type{T}=UInt8; max_elements::Union{Nothing,Int}=nothing, stop_value::Union{Nothing,T}=nothing) where {T<:Unsigned}
+    lst = T[]
+
+    # read the first value (not delta encoded)
+    # NB: we assume that the first value is not 0
+    try
+        first_value = read_encoded_value(r, encoding, T)
+        push!(lst, first_value)
+    catch e
+        # Empty list case: if we can't even read the first value
+        if isa(e, EOFError) || isa(e, ErrorException)
+            return T[]  # Return empty list
+        else
+            rethrow(e)
+        end
+    end
+
+    # read the rest of the values
+    while true
+        # Check termination conditions
+        if max_elements !== nothing && length(lst) >= max_elements
+            break
+        end
+
+        # read the next value
+        local value
+        try
+            value = read_encoded_value(r, encoding, T)
+        catch e
+            # End of stream - this is expected
+            if isa(e, EOFError) || isa(e, ErrorException)
+                break
+            else
+                rethrow(e)
+            end
+        end
+
+        # Check for stop value before adding
+        if stop_value !== nothing && value == stop_value
+            break
+        end
+
+        # NB: shift back by 1
+        push!(lst, lst[end] + value - T(1))
+    end
+    return lst
+end
+
+"""
     write_run_length_delta(w::BitWriter, compression::Symbol, lst::Vector{T}) where {T<:Unsigned}
 
 Write a run-length + delta code to the bitwriter.
@@ -916,25 +1003,25 @@ function write_run_length_delta(w::BitWriter, encoding::Symbol, lst::Vector{T}) 
     # write the first value (not delta encoded)
     # NB: we assume that the first value is not 0
     write_encoded_value(w, delta_lst[1], encoding)
-    
+
+    # write the rest of the values
     i = 2
     while i <= length(delta_lst)
         current_value = delta_lst[i]
-        
+
         # check for consecutive equal values (run)
         run_length = 1
         while i + run_length <= length(delta_lst) && delta_lst[i + run_length] == current_value
             run_length += 1
         end
-        
+
         if run_length >= 3  # only use run-length for 3+ consecutive values
             # flag 1: run-length encoding
             write_bit(w, true)
+            # encode the run length
+            write_encoded_value(w, T(run_length), encoding)
             # encode the value shifted by 1 to avoid zeros
             write_encoded_value(w, current_value + T(1), encoding)
-            # encode the run length
-            # NB: the run length is >= 3
-            write_encoded_value(w, T(run_length), encoding)
             i += run_length
         else
             # flag 0: delta encoding
@@ -947,7 +1034,7 @@ function write_run_length_delta(w::BitWriter, encoding::Symbol, lst::Vector{T}) 
 end
 
 """
-    read_run_length_delta(r::BitReader, encoding::Symbol, ::Type{T}=UInt8) where {T<:Unsigned}
+    read_run_length_delta(r::BitReader, encoding::Symbol, ::Type{T}=UInt8; max_elements::Union{Nothing,Int}=nothing, stop_value::Union{Nothing,T}=nothing) where {T<:Unsigned}
 
 Read a run-length + delta code from the bit reader.
 
@@ -957,41 +1044,59 @@ Read a run-length + delta code from the bit reader.
 @param r::BitReader: the bit reader
 @param encoding::Symbol: the compression coding to use (:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta)
 @param T::Type: the type to return (default: UInt8)
+@param max_elements::Union{Nothing,Int}: maximum number of elements to read (for index mode)
+@param stop_value::Union{Nothing,T}: value that signals end of list (for children mode)
 @return::Vector{T}: the decoded list
 """
-function read_run_length_delta(r::BitReader, encoding::Symbol, ::Type{T}=UInt8) where {T<:Unsigned}
+function read_run_length_delta(r::BitReader, encoding::Symbol, ::Type{T}=UInt8; max_elements::Union{Nothing,Int}=nothing, stop_value::Union{Nothing,T}=nothing) where {T<:Unsigned}
+    # if the list is empty (immediate end of stream), return empty
     delta_lst = T[]
     
     try
         # read the first value (not delta encoded)
-        # NB: we assume that the first value was not shifted by 1
+        # NB: we assume that the first value is not 0
         first_value = read_encoded_value(r, encoding, T)
+
+        # if the first value is the stop value, return empty list
+        if stop_value !== nothing && first_value == stop_value
+            return T[]
+        end
+
         push!(delta_lst, first_value)
-        
+
         # read the rest of the values
         while true
-            # read the flag bit
+            # Check termination conditions
+            if max_elements !== nothing && length(delta_lst) >= max_elements
+                break
+            end
+            
+            # read the flag bit (0: delta, 1: run-length)
             flag = read_bit(r)
             
-            # run-length encoding
             if flag
-                # read the value
-                value = read_encoded_value(r, encoding, T)
-                # NB: the value is shifted by 1 to avoid zeros
-                value = value - T(1)
-                # read the run length
+                # flag 1: run-length encoding
+                # Format: [run_length: varint][value: varint]
                 run_length = Int(read_encoded_value(r, encoding, T))
-                # add the run to the delta list
+                value = read_encoded_value(r, encoding, T)
+                
+                # add the run to the delta list (unshift the data value)
                 for _ in 1:run_length
-                    push!(delta_lst, value)
+                    # NB: no need to check for max_elements here => we copy the whole run-length
+                    push!(delta_lst, value - T(1))
                 end
-            # delta encoding
             else
-                # read the delta value
-                delta_value = read_encoded_value(r, encoding, T)
-                # NB: the delta value is shifted by 1 to avoid zeros
-                delta_value = delta_value - T(1)
-                push!(delta_lst, delta_value)
+                # flag 0: delta encoding
+                # Format: [delta_value: varint] (shifted by 1 to avoid zeros)
+                # NB: first value is assumed to be not 0
+                value = read_encoded_value(r, encoding, T)
+                
+                # Check for stop value (stop values are written as-is, not shifted)
+                if stop_value !== nothing && value == stop_value
+                    break
+                end
+
+                push!(delta_lst, value - T(1))
             end
         end
     catch e
@@ -1002,7 +1107,6 @@ function read_run_length_delta(r::BitReader, encoding::Symbol, ::Type{T}=UInt8) 
     end
     
     # reconstruct original values from delta encoding
-    # NB: we assume that the first value was not shifted by 1
     isempty(delta_lst) && return T[]
     
     original_lst = T[delta_lst[1]]
@@ -1095,7 +1199,7 @@ function write_reference_encoding(w::BitWriter, neighbor_lists::Dict{T,Vector{T}
     if enable_reference
         write_bit(w, true)  # main flag = 1: reference encoding
     else
-        write_bit(w, false)  # main flag = 0: direct encoding (empty list)
+        write_bit(w, false)  # main flag = 0: direct encoding
     end
 
     # if mode is :index, we need to write the out-degrees of the vertices first
@@ -1118,9 +1222,11 @@ function write_reference_encoding(w::BitWriter, neighbor_lists::Dict{T,Vector{T}
         if isempty(current_neighbors)
             # for empty lists in children mode, write stop value if not the last vertex
             if mode == :children && v < vs
+                # write direct encoding flag
                 if enable_reference
-                    write_bit(w, false)  # main flag = 0: direct encoding (empty list)
+                    write_bit(w, false)  # flag = 0: direct encoding
                 end
+                # write stop value
                 write_encoded_value(w, T(1), encoding)  # stop value
             end
             continue
@@ -1128,8 +1234,10 @@ function write_reference_encoding(w::BitWriter, neighbor_lists::Dict{T,Vector{T}
         
         # sort neighbors 
         sorted_neighbors = sort(copy(current_neighbors))
-        
-        # index mode: write delta encoded values without shifting, no stop values
+       
+        ########################################################################
+        # Index mode: write delta encoded values without shifting, no stop values
+        ########################################################################
         if mode == :index
             # track if the vertex has been written
             vertex_written = false
@@ -1140,27 +1248,27 @@ function write_reference_encoding(w::BitWriter, neighbor_lists::Dict{T,Vector{T}
                 best_ref = find_best_reference(sorted_neighbors, neighbor_lists, potential_references)
                 
                 if best_ref !== nothing
-                    # use reference encoding flag
-                    write_bit(w, true)   # main flag = 1: reference encoding
+                    # write reference encoding flag
+                    write_bit(w, true)   # flag = 1: reference encoding
                             
-                    # encode reference vertex ID
+                    # write reference vertex ID
                     write_encoded_value(w, T(best_ref), encoding)
                             
                     # create copy bitmap and residuals
                     ref_neighbors = neighbor_lists[best_ref]
                     copy_bitmap, residuals = create_reference_data(sorted_neighbors, ref_neighbors)
                             
-                    # encode copy bitmap length and the bitmap itself
+                    # write copy bitmap length and the bitmap itself
                     write_encoded_value(w, T(length(copy_bitmap)), encoding)
                     for bit in copy_bitmap
                         write_bit(w, bit)
                     end
                             
-                    # encode residuals flag and residuals if any exist
+                    # write residuals flag and residuals if any exist
                     if !isempty(residuals)
                         write_bit(w, true)   # residuals flag = 1: has residuals
-                            
-                        # encode residuals
+
+                        # write residuals
                         write_run_length_delta(w, encoding, residuals) 
                     else
                         # no residuals: write flag 0
@@ -1168,7 +1276,7 @@ function write_reference_encoding(w::BitWriter, neighbor_lists::Dict{T,Vector{T}
                     end
 
                     # add current vertex to the potential references
-                    push!(potential_references, best_ref)
+                    push!(potential_references, T(v))
 
                     # set the vertex as written
                     vertex_written = true
@@ -1176,23 +1284,19 @@ function write_reference_encoding(w::BitWriter, neighbor_lists::Dict{T,Vector{T}
             # direct encoding
             elseif !vertex_written
                 if enable_reference
-                    # use direct encoding flag
-                    write_bit(w, false)   # main flag = 0: direct encoding
+                    # write direct encoding flag
+                    write_bit(w, false)   # flag = 0: direct encoding
                 end
 
-                if length(sorted_neighbors) > 1
-                    # delta encode the sorted neighbors
-                    write_encoded_value(w, sorted_neighbors[1], encoding)  # first value
-                    for i in 2:length(sorted_neighbors)
-                        delta_val = sorted_neighbors[i] - sorted_neighbors[i-1]
-                        write_encoded_value(w, delta_val, encoding)  # no shift in index mode
-                    end
-                else
-                    # single neighbor: write it directly
-                    write_encoded_value(w, sorted_neighbors[1], encoding)
-                end
+                # write run-length + delta encoding for direct encoding
+                write_run_length_delta(w, encoding, sorted_neighbors)
+
+                # add current vertex to potential references
+                push!(potential_references, T(v))
             end # end direct encoding
-        # mode_ children: write delta encoded values shifted by 1, with stop values
+        ########################################################################
+        # Children mode: write delta encoded values shifted by 1, with stop values
+        ########################################################################
         else
             # track if the vertex has been written
             vertex_written = false
@@ -1203,27 +1307,27 @@ function write_reference_encoding(w::BitWriter, neighbor_lists::Dict{T,Vector{T}
                 best_ref = find_best_reference(sorted_neighbors, neighbor_lists, potential_references)
                 
                 if best_ref !== nothing
-                    # use reference encoding flag
-                    write_bit(w, true)   # main flag = 1: reference encoding
+                    # write reference encoding flag
+                    write_bit(w, true)   # flag = 1: reference encoding
                             
-                    # encode reference vertex ID
+                    # write reference vertex ID
                     write_encoded_value(w, T(best_ref), encoding)
                             
                     # create copy bitmap and residuals
                     ref_neighbors = neighbor_lists[best_ref]
                     copy_bitmap, residuals = create_reference_data(sorted_neighbors, ref_neighbors)
                             
-                    # encode copy bitmap length and the bitmap itself
+                    # write copy bitmap length and the bitmap itself
                     write_encoded_value(w, T(length(copy_bitmap)), encoding)
                     for bit in copy_bitmap
                         write_bit(w, bit)
                     end
                             
-                    # encode residuals flag and residuals if any exist
+                    # write residuals flag and residuals if any exist
                     if !isempty(residuals)
                         write_bit(w, true)   # residuals flag = 1: has residuals
                             
-                        # encode residuals
+                        # write residuals
                         write_run_length_delta(w, encoding, residuals) 
                     else
                         # no residuals: write flag 0
@@ -1231,39 +1335,39 @@ function write_reference_encoding(w::BitWriter, neighbor_lists::Dict{T,Vector{T}
                     end
 
                     # add current vertex to the potential references
-                    push!(potential_references, best_ref)
+                    push!(potential_references, T(v))
 
                     # set the vertex as written
                     vertex_written = true
 
                     # add stop value T(1) at the end of each list except the last one
                     if v < vs
+                        # write direct encoding flag
+                        # NB: reference encoding is enabled
+                        write_bit(w, false)  # flag = 0: direct encoding
                         write_encoded_value(w, T(1), encoding)  # stop value
                     end
                 end
             # direct encoding
             elseif !vertex_written
                 if enable_reference
-                    # use direct encoding flag
-                    write_bit(w, false)   # main flag = 0: direct encoding
+                    # write direct encoding flag
+                    write_bit(w, false)   # flag = 0: direct encoding
                 end
                 
-                if length(sorted_neighbors) > 1
-                    # delta encode the sorted neighbors
-                    write_encoded_value(w, sorted_neighbors[1], encoding)  # first value
-                    for i in 2:length(sorted_neighbors)
-                        delta_val = sorted_neighbors[i] - sorted_neighbors[i-1]
-                        write_encoded_value(w, delta_val + T(1), encoding)  # shift in children mode
-                    end
-                else
-                    # single neighbor: write it directly
-                    write_encoded_value(w, sorted_neighbors[1], encoding)
-                end
+                # Use run-length + delta encoding for direct encoding
+                write_run_length_delta(w, encoding, sorted_neighbors)
 
                 # add stop value T(1) at the end of each list except the last one
                 if v < vs
+                    if enable_reference
+                        write_bit(w, false)  # flag = 0: direct encoding
+                    end
                     write_encoded_value(w, T(1), encoding)  # stop value
                 end
+
+                # add current vertex to potential references
+                push!(potential_references, T(v))
             end # end direct encoding
         end
     end
@@ -1333,10 +1437,11 @@ All vertices use direct delta encoding without any per-vertex flags:
 @param vs::T: the number of vertices in the graph
 @param encoding::Symbol: the compression coding used for values (:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta)
 @param mode::Symbol: the mode to use (:children, :index)
+@param enable_reference::Bool: whether to enable reference encoding (default: true)
 @param T::Type: the type to return (default: UInt8)
 @return::Dict{T,Vector{T}}: the decoded neighbor lists
 """
-function read_reference_encoding(r::BitReader, vs::T, encoding::Symbol, mode::Symbol=:children, ::Type{T}=UInt8) where {T<:Unsigned}
+function read_reference_encoding(r::BitReader, vs::T, encoding::Symbol, mode::Symbol=:children, enable_reference::Bool=true, ::Type{T}=UInt8) where {T<:Unsigned}
     # initialize the neighbor lists
     neighbor_lists = Dict{T,Vector{T}}() 
 
@@ -1362,7 +1467,7 @@ function read_reference_encoding(r::BitReader, vs::T, encoding::Symbol, mode::Sy
         while vertex_id <= vs
             current_neighbors = T[]
             
-            if global_main_flag
+            if global_main_flag && enable_reference
                 # Reference encoding is enabled: read vertex flag for each vertex
                 vertex_flag = read_bit(r)
                 
@@ -1383,7 +1488,7 @@ function read_reference_encoding(r::BitReader, vs::T, encoding::Symbol, mode::Sy
                     residuals_flag = read_bit(r)
                     residuals = if residuals_flag
                         # residuals flag = 1: has residuals
-                        read_delta_encoded_list(r, encoding, mode, T)
+                        read_run_length_delta(r, encoding, T)
                     else
                         # residuals flag = 0: no residuals
                         T[]
@@ -1398,11 +1503,13 @@ function read_reference_encoding(r::BitReader, vs::T, encoding::Symbol, mode::Sy
                     end
                 else
                     # vertex flag = 0: direct encoding for this vertex
-                    current_neighbors = read_direct_encoded_list(r, encoding, mode, vertex_id, vs, T)
+                    degrees_param = mode == :index ? out_degrees : T[]
+                    current_neighbors = read_direct_encoded_list(r, encoding, mode, vertex_id, degrees_param, T)
                 end
             else
                 # Reference encoding is disabled: direct encoding only (no vertex flags)
-                current_neighbors = read_direct_encoded_list(r, encoding, mode, vertex_id, vs, T)
+                degrees_param = mode == :index ? out_degrees : T[]
+                current_neighbors = read_direct_encoded_list(r, encoding, mode, vertex_id, degrees_param, T)
             end
             
             # stop values are handled within read_delta_encoded_list for children mode
@@ -1435,7 +1542,7 @@ function read_reference_encoding(r::BitReader, vs::T, encoding::Symbol, mode::Sy
 end
 
 """
-    read_direct_encoded_list(r::BitReader, encoding::Symbol, mode::Symbol, vertex_id::T, vs::T, ::Type{T}=UInt8) where {T<:Unsigned}
+    read_direct_encoded_list(r::BitReader, encoding::Symbol, mode::Symbol, vertex_id::T, out_degrees::Vector{T}, ::Type{T}=UInt8) where {T<:Unsigned}
 
 Read a directly-encoded neighbor list according to mode-specific format.
 
@@ -1443,47 +1550,29 @@ Read a directly-encoded neighbor list according to mode-specific format.
 @param encoding::Symbol: the compression coding used
 @param mode::Symbol: the mode (:index or :children)
 @param vertex_id::T: current vertex ID being processed
-@param vs::T: total number of vertices
+@param out_degrees::Vector{T}: the out-degrees for each vertex (for index mode), empty for children mode
 @param T::Type: the type to return
 @return::Vector{T}: the decoded neighbor list
 """
-function read_direct_encoded_list(r::BitReader, encoding::Symbol, mode::Symbol, vertex_id::T, vs::T, ::Type{T}=UInt8) where {T<:Unsigned}
-    neighbors = T[]
-    
+function read_direct_encoded_list(r::BitReader, encoding::Symbol, mode::Symbol, vertex_id::T, out_degrees::Vector{T}, ::Type{T}=UInt8) where {T<:Unsigned}
     try
         if mode == :children
-            # In children mode, all neighbor values are >= 2, so T(1) is always a stop value
-            # Read the first value
-            first_val = read_encoded_value(r, encoding, T)
-            
-            if first_val == T(1) && vertex_id < vs
-                # This is a stop value for an empty list
-                return T[]
-            else
-                # This is actual data - start building the list
-                push!(neighbors, first_val)
-                
-                # Read subsequent delta values until stop value or end
-                while true
-                    try
-                        val = read_encoded_value(r, encoding, T)
-                        if val == T(1) && vertex_id < vs
-                            # Stop value found (only for non-last vertices)
-                            break
-                        end
-                        # Unshift the value (it was shifted by 1 during encoding)
-                        delta_val = val - T(1)
-                        next_val = neighbors[end] + delta_val
-                        push!(neighbors, next_val)
-                    catch e
-                        # End of stream or list (for last vertex)
-                        break
-                    end
-                end
-            end
+            # For children mode, read run-length+delta stream with stop value detection
+            # The stop value T(1) is written separately after the run-length+delta data
+            # We can use the stop_value parameter in read_run_length_delta
+            neighbors = read_run_length_delta(r, encoding, T; stop_value=T(1))
+            return neighbors
         else
-            # Index mode: no shifting, no stop values
-            return read_delta_encoded_list(r, encoding, mode, T)
+            # Index mode: read exactly out_degrees[vertex_id] neighbors
+            expected_neighbors = out_degrees[vertex_id]
+            
+            if expected_neighbors == 0
+                return T[]  # Empty list
+            end
+            
+            # Use max_elements to limit reading to expected number of neighbors
+            neighbors = read_run_length_delta(r, encoding, T; max_elements=Int(expected_neighbors))
+            return neighbors
         end
     catch e
         # Empty list case: if we can't even read the first value
@@ -1493,8 +1582,6 @@ function read_direct_encoded_list(r::BitReader, encoding::Symbol, mode::Symbol, 
             rethrow(e)
         end
     end
-    
-    return neighbors
 end
 
 """

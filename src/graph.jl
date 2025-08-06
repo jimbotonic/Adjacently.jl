@@ -725,7 +725,7 @@ Possible lexicographic criterion:
 
 @returns the mapping of the vertices (vertex_id[old_id] -> new_id)
 """
-function relabel_vertices(g::AbstractGraph{T}, criterion::Symbol=:in_degree) where {T<:Unsigned}
+function relabel_vertices(g::AbstractGraph{T}, criterion::Symbol=:lexicographic) where {T<:Unsigned}
 	if criterion == :lexicographic
 		return relabel_vertices_lexicographic(g)
 	else
