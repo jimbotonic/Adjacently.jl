@@ -285,6 +285,11 @@ function UInt32(x::UInt24)
     return reinterpret(UInt32, x)
 end
 
+# Add UInt64 constructor for UInt24
+function UInt64(x::UInt24)
+    return UInt64(reinterpret(UInt32, x))
+end
+
 # Add UInt64 constructor for UInt40 while we're at it
 function UInt64(x::UInt40)
     return reinterpret(UInt64, x)
