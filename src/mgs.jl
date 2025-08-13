@@ -386,18 +386,16 @@ Supported compression schemes:
 function write_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, encoding::Symbol=:children, compression::Symbol=:huffman) where {T<:Unsigned}
     if compression == :huffman
         write_huffman_compressed_mgs3_graph(g, filename, encoding)
-    elseif compression == :elias_gamma || compression == :elias_delta
-        write_elias_compressed_mgs3_graph(g, filename, encoding, compression)
-    elseif compression == :golomb
-        write_golomb_compressed_mgs3_graph(g, filename, encoding)
-    elseif compression == :fibonacci
-        write_fibonacci_compressed_mgs3_graph(g, filename, encoding)
-	elseif compression == :zeta
-		write_zeta_compressed_mgs3_graph(g, filename, encoding)
+    elseif compression == :elias_gamma || compression == :elias_delta || compression == :golomb || compression == :fibonacci || compression == :zeta
+        write_var_length_compressed_mgs3_graph(g, filename, encoding, compression)
     else
-        error("Unsupported compression scheme: $compression. Supported schemes are :huffman, :elias, :golomb")
+        error("Unsupported compression scheme: $compression. Supported schemes are :huffman, :elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta")
     end
 end
+
+################################################################################
+# Huffman compressed MGS v3 graph
+################################################################################
 
 """
     write_huffman_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, coding_scheme::UInt8=0x00) where {T<:Unsigned}
@@ -411,7 +409,7 @@ Parameters:
 
 @returns nothing
 """
-function write_huffman_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, encoding::Symbol=:children) where {T<:Unsigned}
+function write_huffman_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, coding_scheme::Symbol=:children) where {T<:Unsigned}
 	# Header 12 bytes: 
 	# -> version: 'MGS' 3 bytes string
 	# -> major + minor version: 2 bytes
@@ -447,11 +445,11 @@ function write_huffman_compressed_mgs3_graph(g::AbstractGraph{T}, filename::Abst
 	#  The difference of size should >= 0 
 	diff_size = p_size_t - n_size_t
 
-	if encoding == :children
+	if coding_scheme == :children
 		# 'MGS' + 0x0300 + 0x01 (directed graph + Huffman compression) + 0x00 (data section only + reserved)
 		# encoding: data section only with implicit numbering of vertices
   		version = HEADER_MGS3_DH_CS0
-	elseif encoding == :index
+	elseif coding_scheme == :index
 		# 'MGS' + 0x0300 + 0x01 (directed graph + Huffman compression) + 0x10 (index and data sections + reserved)
 		# encoding: index+data sections with implicit numbering of vertices
   		version = HEADER_MGS3_DH_CS1
@@ -465,9 +463,11 @@ function write_huffman_compressed_mgs3_graph(g::AbstractGraph{T}, filename::Abst
 
 	# frequencies of each vertex (in- and out- degrees)
 	in_degrees, out_degrees = get_in_out_degrees(g)
-	# convert the degrees to the custom type `V`
-	in_degrees = Dict{V,V}(k => convert(V, v) for (k, v) in in_degrees)
+
+	# convert the out-degrees to the custom type `V`
 	out_degrees = Dict{V,V}(k => convert(V, v) for (k, v) in out_degrees)
+	# convert in-degrees to the custom type `V`
+	in_degrees = Dict{V,V}(k => convert(V, v) for (k, v) in in_degrees)
 	
 	# collect all children and in-degrees
 	for v in vs
@@ -477,12 +477,14 @@ function write_huffman_compressed_mgs3_graph(g::AbstractGraph{T}, filename::Abst
 		end
 	end
 
-	# if coding scheme is :children, we need a special stop sequence equal to the number of vertices
-	# NB: frequencies are in the range [0, gs-1] and the stop sequence is the code associated to `gs`
-	if encoding == :children
-		# add the stop sequence typemax(V) to the frequencies
-		# typemax(V) => gs
-		in_degrees[typemax(V)] = convert(V, gs)
+	# if coding scheme is :children, we add a special stop sequence whose frequency is equal to `gs` the number of vertices
+	# NB: vertex frequencies are in the range [0, gs-1]
+	if coding_scheme == :children
+		# add the stop sequence 0 to the frequencies
+		# NB: 
+		# - vertex IDs are in the range [1, gs]
+		# - 0 is the stop sequence and its frequency is set to the total number of vertices
+		in_degrees[zero(V)] = convert(V, gs)
 	end
 
 	@info("generating Huffman tree")
@@ -516,17 +518,17 @@ function write_huffman_compressed_mgs3_graph(g::AbstractGraph{T}, filename::Abst
 		write(f, bytes)
 	end
 
-	if encoding == :children
+	if coding_scheme == :children
 		# write stop sequence in frequency section
-		bytes = to_bytes(in_degrees[typemax(V)])[(diff_size+1):end]
+		bytes = to_bytes(in_degrees[zero(V)])[(diff_size+1):end]
 		write(f, bytes)
 		
 		@info("writing data section with stop sequence")
 		### write data section
 		cdata = BitArray{1}()
-		# stop sequence is the code associated to typemax(V)
+		# stop sequence is the code associated to 0
 		# NB: R has a length of `gs+1` because of the stop sequence
-		stop_seq_code = R[typemax(V)] 
+		stop_seq_code = R[zero(V)] 
 		
 		for v in vs
 			ovs = outneighbors(g, v)
@@ -536,7 +538,7 @@ function write_huffman_compressed_mgs3_graph(g::AbstractGraph{T}, filename::Abst
 			end
 			append!(cdata, stop_seq_code)
 		end
-	elseif encoding == :index
+	elseif coding_scheme == :index
 		@info("writing index section")
 		### write index section
 		for v in vs
@@ -575,6 +577,175 @@ function write_huffman_compressed_mgs3_graph(g::AbstractGraph{T}, filename::Abst
 	b = 0xff
 	write(f, b >> sp)
 
+	close(f)
+end
+
+################################################################################
+# Variable length compressed MGS v3 graph
+################################################################################
+
+function write_var_length_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, coding_scheme::Symbol=:children, compression::Symbol=:elias_delta) where {T<:Unsigned}
+	# Header 12 bytes: 
+	# -> version: 'MGS' 3 bytes string
+	# -> major + minor version: 2 bytes
+	# -> flags: 2 bytes
+	#	 * Byte 1 (2 bits + 6 bits):
+	#    	- graph type (2 bits): 			0x0: directed graph | 0x1: undirected graph
+	#	 	- compression scheme (6 bits): 	0x1: Huffman | 0x2: Elias gamma | 0x3: Elias delta | 0x4: Golomb
+	#	 * Byte 2:
+	#		- coding scheme: 		0x0: data section only | 0x1: index+data section with implicit numbering of vertices
+	#	 	- reserved flags: 		0x0: reserved
+	# -> # vertices: 5 bytes position 
+	#
+	# <'MGS' string 3 bytes> + <16 bits major|minor version> + <flags 2 bytes> + <# vertices 5 bytes>
+	vs = vertices(g)
+	# number of vertices
+	gs = convert(UInt64, length(vs))
+
+	# if the graph has more than 2^40-1 vertices, `T` should be `UInt64`
+	if gs > MGS_MAX_SIZE
+		error("Input graph cannot have more than 2^40-1 vertices")
+	end
+
+	# `n_bits_v` is the number of bits needed to represent the graph vertices
+	n_bits_v = convert(UInt8, ceil(log(2, gs)))
+	# Get appropriate custom UInt type based on number of bits needed
+	V = infer_uint_custom_type(n_bits_v)
+
+	if compression == :elias_gamma
+		if encoding == :children
+			# 'MGS' + 0x0300 + 0x02 (directed graph + compression) + 0x00 (data section only + reserved)
+			# encoding: data section only with implicit numbering of vertices
+			version = HEADER_MGS3_DEG_CS0
+		elseif encoding == :index
+			# 'MGS' + 0x0300 + 0x02 (directed graph + compression) + 0x10 (index and data sections + reserved)
+			# encoding: index+data sections with implicit numbering of vertices
+			version = HEADER_MGS3_DEG_CS1
+		end
+	elseif compression == :elias_delta
+		if encoding == :children
+			# 'MGS' + 0x0300 + 0x03 (directed graph + compression) + 0x00 (data section only + reserved)
+			# encoding: data section only with implicit numbering of vertices
+			version = HEADER_MGS3_DED_CS0
+		elseif encoding == :index
+			# 'MGS' + 0x0300 + 0x03 (directed graph + compression) + 0x10 (index and data sections + reserved)
+			# encoding: index+data sections with implicit numbering of vertices
+			version = HEADER_MGS3_DED_CS1
+		end
+	elseif compression == :golomb
+		if encoding == :children
+			# 'MGS' + 0x0300 + 0x04 (directed graph + compression) + 0x00 (data section only + reserved)
+			# encoding: data section only with implicit numbering of vertices
+			version = HEADER_MGS3_DG_CS0
+		elseif encoding == :index
+			# 'MGS' + 0x0300 + 0x04 (directed graph + compression) + 0x10 (index and data sections + reserved)
+			# encoding: index+data sections with implicit numbering of vertices
+			version = HEADER_MGS3_DG_CS1
+		end
+	elseif compression == :fibonacci
+		if encoding == :children
+			# 'MGS' + 0x0300 + 0x05 (directed graph + compression) + 0x00 (data section only + reserved)
+			# encoding: data section only with implicit numbering of vertices
+			version = HEADER_MGS3_DF_CS0
+		elseif encoding == :index
+			# 'MGS' + 0x0300 + 0x05 (directed graph + compression) + 0x10 (index and data sections + reserved)
+			# encoding: index+data sections with implicit numbering of vertices
+			version = HEADER_MGS3_DF_CS1
+		end
+	elseif compression == :zeta
+		if encoding == :children
+			# 'MGS' + 0x0300 + 0x06 (directed graph + compression) + 0x00 (data section only + reserved)
+			# encoding: data section only with implicit numbering of vertices
+			version = HEADER_MGS3_ZRL_CS0
+		elseif encoding == :index
+			# 'MGS' + 0x0300 + 0x06 (directed graph + compression) + 0x10 (index and data sections + reserved)
+			# encoding: index+data sections with implicit numbering of vertices
+			version = HEADER_MGS3_ZRL_CS1
+		end
+	else
+		error("Compression scheme not supported")
+	end
+
+	# create the output file (with extension .mgz)
+	f = open(filename * ".mgz", "w")
+
+	# create a bitwriter
+	bw = BitWriter(f)
+
+	@info("writing header section")
+	### write header
+	# MGS version + parameters (7 bytes)
+	# NB: reinterpret generates an array of length 8 even if version has a length of 7 bytes
+	bytes = reverse(reinterpret(UInt8, [version]))[2:8]
+	write_bytes(bw, bytes)
+
+	# write the number of vertices (5 bytes)
+	bytes = reverse(reinterpret(UInt8, [gs]))[4:8]
+	write_bytes(bw, bytes)
+
+	if coding_scheme == :children
+		@info("writing data section with stop sequence")
+		# reserve 1 for the stop sequence
+		stop_seq = one(V)
+
+		### write data section
+		for v in vs
+			# get the outneighbors of the vertex
+			# sort the outneighbors in ascending order
+			# NB: as we do not deal with muti-graphs, all neighbors are unique
+			# so we can sort them in ascending order
+			ovs = sort(collect(V, outneighbors(g, v)))
+			# delta encode the neighbors
+			# NB: the starting value is the first element of the `diffs` vector
+			# NB: as we do not deal with muti-graphs, all neighbors are unique
+			# and no delta is equal to 0
+			diffs = delta_encode_vector(ovs)
+			# shift the diffs as 1 is reserved for the stop sequence
+			# NB: all values in the original vector are greater than 0
+			diffs .+= 1
+			# write the diffs using Elias coding
+			# NB: the starting value is the first outneighbor of the vertex
+			for d in diffs
+				write_encoded_value(bw, d, compression)
+			end
+			# if we did not reach the last parent vertex, write the stop sequence
+			if v < gs
+				# write the stop sequence
+				write_encoded_value(bw, stop_seq, compression)
+			end
+		end
+	elseif coding_scheme == :index
+		# frequencies of each vertex (out- degrees)
+		out_degrees = get_out_degrees(g)
+		# convert the out-degrees to the custom type `V` and shift as 0 is a forbidden value
+		out_degrees = Dict{V,V}(k => convert(V, v) + 1 for (k, v) in out_degrees)
+		
+		@info("writing index section")
+		### write index section
+		for v in vs
+			write_encoded_value(bw, out_degrees[v], compression)
+		end
+		@info("writing data section")
+		### write data section
+		for v in vs
+			ovs = outneighbors(g, v)
+			if !isempty(ovs)
+				# sort the outneighbors in ascending order
+				ovs = sort(collect(V, ovs))
+				# get the delta encoding of the outneighbors
+				# NB: all values in the original vector are greater than 0
+				diffs = delta_encode_vector(ovs)
+				# write the diffs using Elias coding
+				# NB: the starting value is the first outneighbor of the vertex
+				for d in diffs
+					write_encoded_value(bw, d, compression)
+				end
+			end
+		end
+	end
+
+	# flush the bitwriter and close the file
+	flush_bitwriter(bw; flush_last_bits=true)
 	close(f)
 end
 
@@ -712,133 +883,6 @@ function write_elias_compressed_mgs3_graph(g::AbstractGraph{T}, filename::Abstra
 				# NB: the starting value is the first outneighbor of the vertex
 				for d in diffs
 					write_elias_coding(bw, d, compression)
-				end
-			end
-		end
-	end
-
-	# flush the bitwriter and close the file
-	flush_bitwriter(bw; flush_last_bits=true)
-	close(f)
-end
-
-"""
-    write_golomb_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, encoding::Symbol=:children) where {T<:Unsigned}
-
-Write graph in a compressed MGS v3 format (Golomb compression scheme)
-
-Parameters:
-- g: Input graph
-- filename: Output filename
-- encoding: Coding scheme (:children for children section only, :index for index+children sections)
-"""
-function write_golomb_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, encoding::Symbol=:children) where {T<:Unsigned}
-	# Header 12 bytes: 
-	# -> version: 'MGS' 3 bytes string
-	# -> major + minor version: 2 bytes
-	# -> flags: 2 bytes
-	#	 * Byte 1 (2 bits + 6 bits):
-	#    	- graph type (2 bits): 			0x0: directed graph | 0x1: undirected graph
-	#	 	- compression scheme (6 bits): 	0x1: Huffman | 0x2: Elias gamma | 0x3: Elias delta | 0x4: Golomb
-	#	 * Byte 2:
-	#		- coding scheme: 		0x0: data section only | 0x1: index+data section with implicit numbering of vertices
-	#	 	- reserved flags: 		0x0: reserved
-	# -> # vertices: 5 bytes position 
-	#
-	# <'MGS' string 3 bytes> + <16 bits major|minor version> + <flags 2 bytes> + <# vertices 5 bytes>
-	# number of vertices
-	gs = convert(UInt64, nv(g))
-	vs = vertices(g)
-
-	# if the graph has more than 2^40-1 vertices, `T` should be `UInt64`
-	if gs > MGS_MAX_SIZE
-		error("Input graph cannot have more than 2^40-1 vertices")
-	end
-	
-	# `n_bits_v` is the number of bits needed to represent the graph vertices
-	n_bits_v = convert(UInt8, ceil(log(2, gs)))
-	# Get appropriate custom UInt type based on number of bits needed
-	V = infer_uint_custom_type(n_bits_v)
-	
-	if encoding == :children
-		version = HEADER_MGS3_DG_CS0
-	elseif encoding == :index
-		version = HEADER_MGS3_DG_CS1
-	end
-
-	# create the output file (with extension .mgz)
-	f = open(filename * ".mgz", "w")
-
-	# create a bitwriter
-	bw = BitWriter(f)
-	
-	@info("writing header section")
-	### write header
-	# MGS version + parameters (7 bytes)
-	# NB: reinterpret generates an array of length 8 even if version has a length of 7 bytes
-	bytes = reverse(reinterpret(UInt8, [version]))[2:8]
-	write_bytes(bw, bytes)
-
-	# write the number of vertices (5 bytes)
-	bytes = reverse(reinterpret(UInt8, [gs]))[4:8]
-	write_bytes(bw, bytes)
-
-	if encoding == :children
-		@info("writing data section with stop sequence")
-		# stop sequence is equal to 0
-		stop_seq = zero(V)
-
-		### write data section
-		for v in vs
-			ovs = outneighbors(g, v)
-			if !isempty(ovs)
-				# sort the outneighbors in ascending order
-				ovs = sort(collect(V, ovs))
-				# delta encode the neighbors
-				# NB: the starting value is the first element of the `diffs` vector
-				# NB: as we do not deal with muti-graphs, all neighbors are unique
-				# and no delta is equal to 0
-				diffs = delta_encode_vector(ovs)
-				# write the diffs using Golomb coding
-				for d in diffs
-					if d == 0
-						error("Delta is equal to 0. This should not happen as all neighbors are unique.")
-					end
-					write_golomb(bw, d, GOLOMB_BASE)
-				end
-			end
-			# if we did not reach the last parent vertex, write the stop sequence
-			if v < gs
-				# write the stop sequence
-				write_golomb(bw, stop_seq, GOLOMB_BASE)
-			end
-		end
-	elseif encoding == :index
-		# frequencies of each vertex (out- degrees)
-		out_degrees = get_out_degrees(g)
-		out_degrees = Dict{V,V}(k => convert(V, v) for (k, v) in out_degrees)
-
-		@info("writing index section")
-		### write index section
-		for v in vs
-			write_golomb(bw, out_degrees[v], GOLOMB_BASE)
-		end
-		@info("writing data section")
-		### write data section
-		for v in vs
-			ovs = outneighbors(g, v)
-			if !isempty(ovs)
-				ovs = sort(collect(V, ovs))
-				# get the delta encoding of the outneighbors
-				# NB: all values in the original vector are greater than 0
-				diffs = delta_encode_vector(ovs)
-				# write the diffs using Golomb coding
-				# NB: the starting value is the first outneighbor of the vertex
-				for d in diffs
-					if d == 0
-						error("Delta is equal to 0. This should not happen as all neighbors are unique.")
-					end
-					write_golomb(bw, d, GOLOMB_BASE)
 				end
 			end
 		end
@@ -1215,8 +1259,8 @@ function load_huffman_compressed_mgs3_graph(io::IO, graph_type::Symbol, encoding
 	
 	# vertex set
 	vs = range(1, stop=gs)
-	# NB: stop sequence is the code associated to typemax(V)
-	stop_seq = typemax(V)
+	# NB: stop sequence is the code associated to 0
+	stop_seq = zero(V)
 
 	@info("generating graph")
 	@info("adding vertices")
@@ -1424,129 +1468,6 @@ function load_elias_compressed_mgs3_graph(io::IO, graph_type::Symbol, encoding::
 			catch
 				# If we can't read data for this vertex, skip it and continue
 				continue
-			end
-		end
-	end
-
-	close(io)
-	return g
-end
-
-"""
-    load_golomb_compressed_mgs3_graph(io::IO, graph_type::Symbol, encoding::Symbol, gs::UInt64)
-
-Load graph in compressed MGS v3 format with Golomb coding scheme.
-
-Parameters:
-- io: Input stream
-- graph_type: Graph type (:directed or :undirected)
-- encoding: Coding scheme (:children or :index)
-- gs: Number of vertices
-"""
-function load_golomb_compressed_mgs3_graph(io::IO, graph_type::Symbol, encoding::Symbol, gs::UInt64)
-	# `n_size_u` is the number of bits needed to represent the graph vertices
-	n_bits_v = convert(UInt8, ceil(log(2, gs)))
-	# Get appropriate unsigned int type based on number of bits needed
-	V = infer_uint_custom_type(n_bits_v)
-
-	# intialize graph g according to graph type
-	g = graph_type == :directed ? SimpleDiGraph{V}() : SimpleGraph{V}()
-
-	# vertex set
-	vs = range(1, stop=gs)
-	
-	@info("generating graph")
-	@info("adding vertices")
-	# add vertices to graph
-    add_vertices!(g, gs)
-	
-	reader = BitReader(io)
-	
-	if encoding == :children
-		# NB: stop sequence is 0
-		stop_seq = zero(V)
-		
-		@info("reading data section")
-		for v in vs
-			source = convert(V, v)
-			try
-				# read the first neighbor value
-				first_value = read_golomb(reader, GOLOMB_BASE, V)
-				if first_value == stop_seq
-					# go to next vertex
-					continue
-				end
-				# ensure vertex is within bounds
-				if first_value > 0 && first_value <= gs
-					add_edge!(g, source, first_value)
-					prev_value = first_value
-					
-					# read subsequent neighbors as differences
-					while true
-						delta = read_golomb(reader, GOLOMB_BASE, V)
-						if delta == stop_seq
-							# go to next vertex
-							break
-						end
-						prev_value += delta
-						# ensure vertex is within bounds
-						if prev_value > 0 && prev_value <= gs
-							add_edge!(g, source, prev_value)
-						else
-							error("Target vertex is out of bounds.")
-						end
-					end
-				else
-					error("Initial vertex is out of bounds.")
-				end
-			catch e
-				# do nothing
-				#if !(isa(e, EOFError) || isa(e, ArgumentError))
-				#	rethrow(e)
-				#end
-			end
-		end
-	elseif encoding == :index
-		@info("reading index section")
-		out_degrees = Dict{V,V}()
-		# read the out-degrees
-		for v in vs
-			out_degrees[v] = read_golomb(reader, GOLOMB_BASE, V)
-		end
-		@info("reading data section")
-		for v in vs
-			# NB: the out-neighbors are delta encoded
-			degree = out_degrees[v]
-			if degree == 0
-				continue
-			end
-			
-			# read the neighbors for this vertex
-			neighbors = V[]
-			try
-				# read first value
-				first_value = read_golomb(reader, GOLOMB_BASE, V)
-				push!(neighbors, first_value)
-				prev_value = first_value
-				
-				# read remaining deltas
-				for _ in 2:degree
-					delta = read_golomb(reader, GOLOMB_BASE, V)
-					prev_value += delta
-					push!(neighbors, prev_value)
-				end
-				
-				# add all edges for this vertex
-				for neighbor in neighbors
-					if neighbor > 0 && neighbor <= gs
-						add_edge!(g, v, neighbor)
-					else
-						error("Target vertex is out of bounds.")
-					end
-				end
-			catch
-				# if we can't read data for this vertex, throw an error
-				error("Error reading data for vertex $v.")
 			end
 		end
 	end

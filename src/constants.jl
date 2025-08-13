@@ -1,10 +1,12 @@
 module Constants
 
-export BUFFER_SIZE, FIB_NUMBERS, GOLOMB_BASE, ZETA_BASE, ZETA_H_BOUNDS, ZETA_POWER_BASES
+export BUFFER_SIZE, FIB_NUMBERS, GOLOMB_BASE, ZETA_BASE, ZETA_H_BOUNDS, ZETA_POWER_BASES, REF_ENCODING_TH, REF_V_MIN_DEGREE
 
 const BUFFER_SIZE::Int = 4096
 const GOLOMB_BASE::Int = 64
 const ZETA_BASE::Int = 4
+const REF_ENCODING_TH::Int = 3  # Minimum overlap threshold for reference encoding
+const REF_V_MIN_DEGREE::Int = 4  # Minimum degree for a vertex to be considered as reference candidate
 
 # Precomputed Fibonacci numbers <= 2^40
 # NB: this is used for the Fibonacci code

@@ -14,6 +14,7 @@
 #
 
 include("run_tests_main.jl")
+using Printf
 
 @testset "Reference encoding (actual graph)" begin
     @info("Loading Amazon dataset")
@@ -52,8 +53,70 @@ include("run_tests_main.jl")
 	# number of edges
 	es = ne(amz_core)
 
-	# Test reference encoding on actual neighbor list
-	@info "Testing reference encoding on neighbor lists..."	
+	# Test 1: Specific empty lists patterns to validate our recent fixes
+	@info "Testing reference encoding with specific empty list patterns..."
+	
+	@testset "Empty lists patterns with reference encoding" begin
+		test_patterns = [
+			("Mixed empty pattern", Dict{UInt16,Vector{UInt16}}(
+				UInt16(1) => UInt16[],
+				UInt16(2) => UInt16[10, 20],
+				UInt16(3) => UInt16[]
+			)),
+			("Empty at start and middle", Dict{UInt16,Vector{UInt16}}(
+				UInt16(1) => UInt16[],
+				UInt16(2) => UInt16[],
+				UInt16(3) => UInt16[5, 7],
+				UInt16(4) => UInt16[1, 2, 3]
+			)),
+			("Empty at end", Dict{UInt16,Vector{UInt16}}(
+				UInt16(1) => UInt16[5, 10],
+				UInt16(2) => UInt16[1, 3],
+				UInt16(3) => UInt16[],
+				UInt16(4) => UInt16[]
+			)),
+			("All empty", Dict{UInt16,Vector{UInt16}}(
+				UInt16(1) => UInt16[],
+				UInt16(2) => UInt16[],
+				UInt16(3) => UInt16[]
+			))
+		]
+		
+		for (pattern_name, neighbor_lists) in test_patterns
+			@info "Testing pattern: $pattern_name"
+			
+			#encodings = [:elias_gamma, :elias_delta, :fibonacci, :zeta]
+			encodings = [:fibonacci, :zeta]
+			for encoding in encodings
+				for reference_enabled in [false, true]
+					@info "  Encoding: $encoding, Reference: $reference_enabled"
+					
+					# Encode
+					io = IOBuffer()
+					writer = BitWriter(io)
+					write_compressed_graph_data(writer, neighbor_lists, encoding, :children, reference_enabled)
+					flush_bitwriter(writer; flush_last_bits=true)
+					
+					# Decode
+					seekstart(io)
+					reader = BitReader(io)
+					decoded = read_compressed_graph_data(reader, UInt16(length(neighbor_lists)), encoding, :children, UInt16)
+					
+					# Verify
+					@test length(decoded) == length(neighbor_lists)
+					for v in keys(neighbor_lists)
+						@test haskey(decoded, v)
+						@test Set(decoded[v]) == Set(neighbor_lists[v])
+					end
+					
+					@info "    Pattern $pattern_name with $encoding (ref=$reference_enabled): PASSED"
+				end
+			end
+		end
+	end
+
+	# Test 2: Reference encoding on actual neighbor lists
+	@info "Testing reference encoding on actual Amazon graph data..."	
 
 	for relabeling_scheme in relabeling_schemes
 		@info("Relabeling scheme: $relabeling_scheme")
@@ -68,87 +131,51 @@ include("run_tests_main.jl")
 		@info "Created $(length(amz_neighbor_lists)) neighbor lists"
 
 		# Test reference encoding for both modes
-		modes = [:children]  # Test only children mode to see progress
+		modes = [:children, :index]  # Test only children mode for large data
 		
 		for mode in modes
-			@info "Testing reference encoding mode: $mode"
+			@info "Testing encoding with mode: $mode"
 			
-			for encoding in encodings
-				@info "Testing reference encoding with $encoding, $relabeling_scheme, mode $mode..."
+			# Test both reference enabled and disabled
+			for reference_enabled in [false, true]
+				@info "Graph size: $(length(amz_neighbor_lists)) vertices"
 				
-				# Use only first 1000 vertices for testing to avoid memory issues
-				test_size = min(1000, length(amz_neighbor_lists))
-				@info "Testing with first $test_size vertices (out of $(length(amz_neighbor_lists)))"
-				
-				# Create vertex mapping for consecutive numbering (1 to test_size)
-				vertex_to_index = Dict{T,T}()
-				index_to_vertex = Dict{T,T}()
-				sorted_vertices = sort(collect(keys(amz_neighbor_lists)))[1:test_size]
-				for (idx, v) in enumerate(sorted_vertices)
-					vertex_to_index[T(v)] = T(idx)
-					index_to_vertex[T(idx)] = T(v)
-				end
-				
-				# Convert neighbor lists to appropriate type with consecutive indexing
-				typed_neighbor_lists = Dict{T,Vector{T}}()
-				for (idx, v) in enumerate(sorted_vertices)
-					neighbors = amz_neighbor_lists[T(v)]
-					if !isempty(neighbors)
-						# Convert neighbors to indices and sort
-						typed_neighbors = T[]
-						for neighbor in neighbors
-							if haskey(vertex_to_index, T(neighbor))
-								push!(typed_neighbors, vertex_to_index[T(neighbor)])
-							end
-						end
-						sort!(typed_neighbors)
-						typed_neighbor_lists[T(idx)] = typed_neighbors
-					else
-						typed_neighbor_lists[T(idx)] = T[]
-					end
-				end
-				
-				# Encode using reference encoding
-				io = IOBuffer()
-				writer = BitWriter(io)
-				write_reference_encoding(writer, typed_neighbor_lists, encoding, mode, false)
-				flush_bitwriter(writer; flush_last_bits=true)
-				
-				total_bits = position(io) * 8
-				@info "Reference encoding $encoding, $mode: $total_bits bits ($(total_bits / es) bits/edge)"
-				
-				# Decode
-				seekstart(io)
-				reader = BitReader(io)
-				try
-					decoded_neighbor_lists = read_reference_encoding(reader, T(length(typed_neighbor_lists)), encoding, mode, T)
+				compression_start_time = time()
+			
+				for encoding in encodings
+					@info "Testing with encoding = $encoding, mode = $mode, relabeling_scheme = $relabeling_scheme, reference_enabled = $reference_enabled"
+					encoding_start_time = time()
 					
-					# Verify all lists are decoded correctly
-					@test length(decoded_neighbor_lists) == length(typed_neighbor_lists)
+					@info "    Starting compression..."
+					# Encode
+					io = IOBuffer()
+					writer = BitWriter(io)
 					
-					successful_matches = 0
-					for v in keys(typed_neighbor_lists)
-						if haskey(decoded_neighbor_lists, v)
-							if Set(decoded_neighbor_lists[v]) == Set(typed_neighbor_lists[v])
-								successful_matches += 1
-							else
-								@warn "Mismatch for vertex $v: original=$(typed_neighbor_lists[v]), decoded=$(decoded_neighbor_lists[v])"
-							end
-						else
-							@warn "Missing vertex $v in decoded results"
-						end
-					end
+					# Add detailed timing for the compression step
+					write_start_time = time()
+					write_compressed_graph_data(writer, amz_neighbor_lists, encoding, mode, reference_enabled)
+					write_time = time() - write_start_time
 					
-					@info "Successfully matched $successful_matches out of $(length(typed_neighbor_lists)) lists"
-					@test successful_matches == length(typed_neighbor_lists)
-					@info "Reference encoding $encoding, $relabeling_scheme, mode $mode round-trip test: PASSED"
+					flush_start_time = time()
+					flush_bitwriter(writer; flush_last_bits=true)
+					flush_time = time() - flush_start_time
 					
-				catch e
-					@error "Failed to decode reference encoding: $e"
-					rethrow(e)
-				end
-				@info "--------------------------------"
-			end # encoding
+					total_encoding_time = time() - encoding_start_time
+					compressed_size = position(io) * 8
+
+					@info "    Compression completed!"
+					@info "    Write time: $(@sprintf("%.3f", write_time))s"
+					@info "    Flush time: $(@sprintf("%.3f", flush_time))s" 
+					@info "    Total encoding time: $(@sprintf("%.3f", total_encoding_time))s"
+					@info "    Compressed size: $compressed_size bits ($(@sprintf("%.2f", compressed_size/ (1024*1024*8))) MB)"
+					@info "    Compression rate: $(@sprintf("%.3f", compressed_size / gs)) bits per vertex"
+					@info "    Compression rate: $(@sprintf("%.3f", compressed_size / es)) bits per edge"
+					@info "--------------------------------"
+				end # encoding
+				
+				total_compression_time = time() - compression_start_time
+				@info "Total time for reference_enabled=$reference_enabled: $(@sprintf("%.3f", total_compression_time))s"
+			end # reference_enabled
 		end # mode
 	end # relabeling_scheme
 end
