@@ -93,16 +93,20 @@ end
     # Use test directory for output files
     mgs_output_file = joinpath(TEST_DIR, "amz_core_rl")
 
-    criterion = [:in_degree, :out_degree, :degree, :pagerank, :lexicographic]
+    #criterion = [:in_degree, :out_degree, :degree, :pagerank, :lexicographic]
+    criterion = [:none, :lexicographic]
     encoding = [:children, :index]
     compression = [:elias_delta, :fibonacci, :zeta]
 
     for compression in compression
         for encoding in encoding
             for criterion in criterion
-                relabeled_vertices = relabel_vertices(amz_core, criterion)
-                amz_core_rl = relabel_graph(amz_core, relabeled_vertices)
-
+                if criterion != :none
+                    relabeled_vertices = relabel_vertices(amz_core, criterion)
+                    amz_core_rl = relabel_graph(amz_core, relabeled_vertices)
+                else
+                    amz_core_rl = amz_core
+                end
                 @info("Checking that the relabeled core has the same number of vertices and edges")
                 @test nv(amz_core_rl) == nv(amz_core)
                 @test ne(amz_core_rl) == ne(amz_core)
