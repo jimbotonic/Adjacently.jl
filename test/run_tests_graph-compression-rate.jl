@@ -46,14 +46,14 @@ using Printf
     @info "  Integer type: $T ($(8*sizeof(T)) bits)"
     
     # Test configurations
-    encodings = [:elias_delta, :elias_gamma, :fibonacci, :zeta]
+    encodings = [:elias_delta, :fibonacci, :zeta]
     relabeling_schemes = [:none, :lexicographic]
     
     # Compression configurations to test
     compression_configs = [
         (name="Delta Only", use_mix=false, reference=false),
-        (name="Mix Encoding", use_mix=true, reference=false),  
-        (name="Mix + Reference", use_mix=true, reference=true)
+        (name="Mix Mode", use_mix=true, reference=false),  
+        (name="Mix Mode + Reference", use_mix=true, reference=true)
     ]
     
     # Results storage
