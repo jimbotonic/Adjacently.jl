@@ -239,7 +239,7 @@ end
 			
 			io = IOBuffer()
 			writer = BitWriter(io)
-			write_reference_encoding(writer, neighbor_lists, encoding, :children, true)
+			write_compressed_graph_data(writer, neighbor_lists, encoding, :children, true)
 			flush_bitwriter(writer; flush_last_bits=true)
 			
 			# Debug: check what was written
@@ -248,7 +248,7 @@ end
 			
 			seekstart(io)
 			reader = BitReader(io)
-			decoded = read_reference_encoding(reader, UInt16(length(neighbor_lists)), encoding, :children, true, UInt16)
+			decoded = read_compressed_graph_data(reader, UInt16(length(neighbor_lists)), encoding, :children, UInt16)
 			
 			@info "  Original vertices: $(length(neighbor_lists))"
 			@info "  Decoded vertices:  $(length(decoded))"
@@ -270,12 +270,12 @@ end
 			
 			io = IOBuffer()
 			writer = BitWriter(io)
-			write_reference_encoding(writer, neighbor_lists, encoding, :children, true)
+			write_compressed_graph_data(writer, neighbor_lists, encoding, :children, true)
 			flush_bitwriter(writer; flush_last_bits=true)
 			
 			seekstart(io)
 			reader = BitReader(io)
-			decoded = read_reference_encoding(reader, UInt16(length(neighbor_lists)), encoding, :children, true, UInt16)
+			decoded = read_compressed_graph_data(reader, UInt16(length(neighbor_lists)), encoding, :children, UInt16)
 			
 			@test length(decoded) == length(neighbor_lists)
 			for v in keys(neighbor_lists)
@@ -293,12 +293,12 @@ end
 			
 			io = IOBuffer()
 			writer = BitWriter(io)
-			write_reference_encoding(writer, neighbor_lists, encoding, :children, true)
+			write_compressed_graph_data(writer, neighbor_lists, encoding, :children, true)
 			flush_bitwriter(writer; flush_last_bits=true)
 			
 			seekstart(io)
 			reader = BitReader(io)
-			decoded = read_reference_encoding(reader, UInt16(length(neighbor_lists)), encoding, :children, true, UInt16)
+			decoded = read_compressed_graph_data(reader, UInt16(length(neighbor_lists)), encoding, :children, UInt16)
 			
 			@test length(decoded) == length(neighbor_lists)
 			for v in keys(neighbor_lists)
@@ -314,12 +314,12 @@ end
 			
 			io = IOBuffer()
 			writer = BitWriter(io)
-			write_reference_encoding(writer, neighbor_lists, encoding, :children, true)
+			write_compressed_graph_data(writer, neighbor_lists, encoding, :children, true)
 			flush_bitwriter(writer; flush_last_bits=true)
 			
 			seekstart(io)
 			reader = BitReader(io)
-			decoded = read_reference_encoding(reader, UInt16(length(neighbor_lists)), encoding, :children, true, UInt16)
+			decoded = read_compressed_graph_data(reader, UInt16(length(neighbor_lists)), encoding, :children, UInt16)
 			
 			@test length(decoded) == 1
 			@test Set(decoded[UInt16(1)]) == Set(neighbor_lists[UInt16(1)])
@@ -335,12 +335,12 @@ end
 			
 			io = IOBuffer()
 			writer = BitWriter(io)
-			write_reference_encoding(writer, neighbor_lists, encoding, :children, true)
+			write_compressed_graph_data(writer, neighbor_lists, encoding, :children, true)
 			flush_bitwriter(writer; flush_last_bits=true)
 			
 			seekstart(io)
 			reader = BitReader(io)
-			decoded = read_reference_encoding(reader, UInt16(length(neighbor_lists)), encoding, :children, true, UInt16)
+			decoded = read_compressed_graph_data(reader, UInt16(length(neighbor_lists)), encoding, :children, UInt16)
 			
 			@test length(decoded) == length(neighbor_lists)
 			for v in keys(neighbor_lists)
@@ -359,12 +359,12 @@ end
 			
 			io = IOBuffer()
 			writer = BitWriter(io)
-			write_reference_encoding(writer, neighbor_lists, encoding, :children, true)
+			write_compressed_graph_data(writer, neighbor_lists, encoding, :children, true)
 			flush_bitwriter(writer; flush_last_bits=true)
 			
 			seekstart(io)
 			reader = BitReader(io)
-			decoded = read_reference_encoding(reader, UInt16(length(neighbor_lists)), encoding, :children, true, UInt16)
+			decoded = read_compressed_graph_data(reader, UInt16(length(neighbor_lists)), encoding, :children, UInt16)
 			
 			@test length(decoded) == length(neighbor_lists)
 			for v in keys(neighbor_lists)
