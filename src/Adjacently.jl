@@ -39,6 +39,10 @@ include("io.jl")
 using .IO
 export IO
 
+include("index.jl")
+using .Index
+export Index
+
 include("compression.jl")
 using .Compression
 export Compression

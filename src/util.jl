@@ -26,7 +26,8 @@ using ..CustomTypes: UInt24, UInt40
 export get_next_smallest,
        infer_uint_custom_type,
        infer_uint_std_type,
-       to_bytes
+       to_bytes,
+       upgrade_custom_uint_type
 
 ################################################################################    
 # custom implementation of QuickSort
