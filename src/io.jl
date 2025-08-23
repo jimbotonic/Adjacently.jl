@@ -31,6 +31,7 @@ export BitWriter,
 	read_bit, 
 	read_bits, 
 	read_value,
+	peek_bit,
 	flush_bitwriter,
 	load_jls_serialized, 
 	serialize_to_jls, 
@@ -213,6 +214,21 @@ function read_bit(reader::BitReader)::Bool
 end
 
 """
+    peek_bit(reader::BitReader)::Bool
+
+Look at the next bit without advancing the reader.
+
+@param reader::BitReader: the bit reader to peek from
+@return::Bool: the next bit, or error if past end
+"""
+function peek_bit(reader::BitReader)::Bool
+    if reader.index > reader.length
+        error("Attempt to peek past end of buffer")
+    end
+    return reader.buffer[reader.index]
+end
+
+"""
     read_bits(reader::BitReader, n::Int)::Vector{Bool}
 
 read bits from the reader
@@ -308,31 +324,39 @@ end
 ################################################################################
 
 """ 
-    load_adjacency_list_from_csv(filename::AbstractString,separator::Char=',')
+    load_adjacency_list_from_csv(filename::AbstractString, separator::Char=',', use_header::Bool=false)
 
 load graph from CSV adjacency list
 """
-function load_adjacency_list_from_csv(filename::AbstractString, separator::AbstractChar=',')
+function load_adjacency_list_from_csv(filename::AbstractString, separator::AbstractChar=',', use_header::Bool=false)
 	f = open(filename,"r")
 	oni = Dict{UInt64,UInt64}()
 	edges = Array{Tuple{UInt64,UInt64},1}()
 	counter = convert(UInt64,1)
+	
+	# Skip header line if use_header is true
+	if use_header
+		readline(f)  # Skip first line (header)
+	end
+	
 	while !eof(f)
 		line = strip(readline(f))
-		if !startswith(line, "#")
+		if !startswith(line, "#") && !isempty(line)
 			edge = split(line, separator)
-			v1 = parse(UInt64,edge[1])
-			v2 = parse(UInt64,edge[2])
+			if length(edge) >= 2
+				v1 = parse(UInt64,edge[1])
+				v2 = parse(UInt64,edge[2])
 
-			if !haskey(oni, v1)
-				oni[v1] = counter
-				counter += convert(UInt64,1)
+				if !haskey(oni, v1)
+					oni[v1] = counter
+					counter += convert(UInt64,1)
+				end
+				if !haskey(oni, v2)
+					oni[v2] = counter
+					counter += convert(UInt64,1)
+				end
+				push!(edges, (oni[v1], oni[v2]))
 			end
-			if !haskey(oni, v2)
-				oni[v2] = counter
-				counter += convert(UInt64,1)
-			end
-			push!(edges, (oni[v1], oni[v2]))
 		end
 	end
 	close(f)

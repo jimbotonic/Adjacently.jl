@@ -81,7 +81,7 @@ include("run_tests_main.jl")
                         writer = BitWriter(io)
                         
                         start_time = time()
-                        Adjacently.Compression.write_compressed_graph_data(writer, neighbor_lists, encoding, mode, enable_reference)
+                        Adjacently.Compression.write_compressed_graph_data(writer, neighbor_lists, encoding, mode, true, enable_reference)
                         flush_bitwriter(writer; flush_last_bits=true)
                         encoding_time = time() - start_time
                         

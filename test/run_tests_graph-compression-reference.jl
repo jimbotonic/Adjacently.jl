@@ -94,7 +94,7 @@ using Printf
 					# Encode
 					io = IOBuffer()
 					writer = BitWriter(io)
-					write_compressed_graph_data(writer, neighbor_lists, encoding, :children, reference_enabled)
+					write_compressed_graph_data(writer, neighbor_lists, encoding, :children, true, reference_enabled)
 					flush_bitwriter(writer; flush_last_bits=true)
 					
 					# Decode
@@ -153,7 +153,7 @@ using Printf
 					
 					# Add detailed timing for the compression step
 					write_start_time = time()
-					write_compressed_graph_data(writer, amz_neighbor_lists, encoding, mode, reference_enabled)
+					write_compressed_graph_data(writer, amz_neighbor_lists, encoding, mode, true, reference_enabled)
 					write_time = time() - write_start_time
 					
 					flush_start_time = time()
