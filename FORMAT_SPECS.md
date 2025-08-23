@@ -1,5 +1,8 @@
 # Format specifications
 
+
+## Version 1
+
 1. Reference flag:
 
 - Write reference flag (reference_enabled flag):
@@ -17,53 +20,53 @@
 - If :index mode (no shift, no stop value):
     - For each vertex of the graph:
       - If the children list is not empty
-      - If reference_enabled:
-          - Write children flag (children_flag):
-            - 0: mix encoding
-            - 1: reference encoding
-          - If children_flag is mix encoding:
-              - Sort neighbors
-              - Compute the delta encoding of the neighbors list (no value can be 0)
-              - Write mix mode flag (mix_mode flag):
-                - 0: delta only
-                - 1: delta+run-length 
-              - Write the first value based on the specified encoding (direct encoding)
-              - If mix mode is enabled:
-                - For each child vertex:
-                  - Write the vertex flag (vertex_flag):
-                    - 0: delta encoding
-                    - 1: run-length encoding
-                  - If delta encoding:
-                    - Write the encoded value based on the specified encoding (direct encoding)
-                  - If run-length encoding:
-                    - Write [value: T][length: T] (all values get encoded based on the specified encoding) 
-              - Else (mix mode is disabled):
+        - If reference_enabled:
+            - Write children flag (children_flag):
+              - 0: mix encoding
+              - 1: reference encoding
+            - If children_flag is mix encoding:
+                - Sort neighbors
+                - Compute the delta encoding of the neighbors list (no value can be 0)
+                - Write mix mode flag (mix_mode flag):
+                  - 0: delta only
+                  - 1: delta+run-length 
+                - Write the first value based on the specified encoding (direct encoding)
+                - If mix mode is enabled:
                   - For each child vertex:
-                    - Write the delta-encoded value based on the specified encoding (direct encoding)
-          - Else (children_flag is reference encoding)
-            - If reference encoding is relevant:
-              - Write [ref_id T][bitmap_len T][bitmap: N bits][residuals_flag: 1 bit][residuals_len: T?][mix-mode encoded residuals?] (all values get encoded based on the specified encoding)
-            - Else (reference encoding is not relevant):
-              - Use mix mode encoding as specified above
-      - Else (reference is disabled):
-        - Sort neighbors
-        - Compute the delta encoding of the neighbors list (no value can be 0)
-        - Write mix mode flag (mix_mode flag):
-          - 0: delta only
-          - 1: delta+run-length 
-        - Write the first value based on the specified encoding (direct encoding)
-        - If mix mode is enabled:
-          - For each child vertex:
-            - Write the vertex flag (vertex_flag):
-              - 0: delta encoding
-              - 1: run-length encoding
-            - If delta encoding:
-              - Write the delta encoded value based on the specified encoding (direct encoding)
-            - If run-length encoding:
-              - Write [value: T][length: T] (all values get encoded based on the specified encoding) 
-        - Else (mix mode is disabled):
+                    - Write the vertex flag (vertex_flag):
+                      - 0: delta encoding
+                      - 1: run-length encoding
+                    - If delta encoding:
+                      - Write the encoded value based on the specified encoding (direct encoding)
+                    - If run-length encoding:
+                      - Write [value: T][length: T] (all values get encoded based on the specified encoding) 
+                - Else (mix mode is disabled):
+                    - For each child vertex:
+                      - Write the delta-encoded value based on the specified encoding (direct encoding)
+            - Else (children_flag is reference encoding)
+              - If reference encoding is relevant:
+                - Write [ref_id T][bitmap_len T][bitmap: N bits][residuals_flag: 1 bit][residuals_len: T?][mix-mode encoded residuals?] (all values get encoded based on the specified encoding)
+              - Else (reference encoding is not relevant):
+                - Use mix mode encoding as specified above
+        - Else (reference is disabled):
+          - Sort neighbors
+          - Compute the delta encoding of the neighbors list (no value can be 0)
+          - Write mix mode flag (mix_mode flag):
+            - 0: delta only
+            - 1: delta+run-length 
+          - Write the first value based on the specified encoding (direct encoding)
+          - If mix mode is enabled:
             - For each child vertex:
-              - Write the delta-encoded value based on the specified encoding (direct encoding)
+              - Write the vertex flag (vertex_flag):
+                - 0: delta encoding
+                - 1: run-length encoding
+              - If delta encoding:
+                - Write the delta encoded value based on the specified encoding (direct encoding)
+              - If run-length encoding:
+                - Write [value: T][length: T] (all values get encoded based on the specified encoding) 
+          - Else (mix mode is disabled):
+              - For each child vertex:
+                - Write the delta-encoded value based on the specified encoding (direct encoding)
 - If :children mode:
     - For each vertex of the graph:
       - If reference_enabled:

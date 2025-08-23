@@ -239,7 +239,7 @@ end
 			
 			io = IOBuffer()
 			writer = BitWriter(io)
-			write_compressed_graph_data(writer, neighbor_lists, encoding, :children, true)
+			write_compressed_graph_data(writer, neighbor_lists, encoding, :children, true, true)
 			flush_bitwriter(writer; flush_last_bits=true)
 			
 			# Debug: check what was written
@@ -270,7 +270,7 @@ end
 			
 			io = IOBuffer()
 			writer = BitWriter(io)
-			write_compressed_graph_data(writer, neighbor_lists, encoding, :children, true)
+			write_compressed_graph_data(writer, neighbor_lists, encoding, :children, true, true)
 			flush_bitwriter(writer; flush_last_bits=true)
 			
 			seekstart(io)
@@ -293,7 +293,7 @@ end
 			
 			io = IOBuffer()
 			writer = BitWriter(io)
-			write_compressed_graph_data(writer, neighbor_lists, encoding, :children, true)
+			write_compressed_graph_data(writer, neighbor_lists, encoding, :children, true, true)
 			flush_bitwriter(writer; flush_last_bits=true)
 			
 			seekstart(io)
@@ -314,7 +314,7 @@ end
 			
 			io = IOBuffer()
 			writer = BitWriter(io)
-			write_compressed_graph_data(writer, neighbor_lists, encoding, :children, true)
+			write_compressed_graph_data(writer, neighbor_lists, encoding, :children, true, true)
 			flush_bitwriter(writer; flush_last_bits=true)
 			
 			seekstart(io)
@@ -335,7 +335,7 @@ end
 			
 			io = IOBuffer()
 			writer = BitWriter(io)
-			write_compressed_graph_data(writer, neighbor_lists, encoding, :children, true)
+			write_compressed_graph_data(writer, neighbor_lists, encoding, :children, true, true)
 			flush_bitwriter(writer; flush_last_bits=true)
 			
 			seekstart(io)
@@ -359,7 +359,7 @@ end
 			
 			io = IOBuffer()
 			writer = BitWriter(io)
-			write_compressed_graph_data(writer, neighbor_lists, encoding, :children, true)
+			write_compressed_graph_data(writer, neighbor_lists, encoding, :children, true, true)
 			flush_bitwriter(writer; flush_last_bits=true)
 			
 			seekstart(io)

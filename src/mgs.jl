@@ -381,11 +381,11 @@ Supported compression schemes:
 
 @returns nothing
 """
-function write_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, encoding::Symbol=:children, compression::Symbol=:huffman) where {T<:Unsigned}
+function write_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, encoding::Symbol=:children, compression::Symbol=:huffman, use_mix_mode::Bool=true, reference_enabled::Bool=true) where {T<:Unsigned}
     if compression == :huffman
         write_huffman_compressed_mgs3_graph(g, filename, encoding)
     elseif compression == :elias_gamma || compression == :elias_delta || compression == :golomb || compression == :fibonacci || compression == :zeta
-        write_mix_encoded_compressed_mgs3_graph(g, filename, encoding, compression)
+        write_mix_encoded_compressed_mgs3_graph(g, filename, encoding, compression, use_mix_mode, reference_enabled)
     else
         error("Unsupported compression scheme: $compression. Supported schemes are :huffman, :elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta")
     end
@@ -594,7 +594,7 @@ Parameters:
 
 @returns nothing
 """
-function write_mix_encoded_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, coding_scheme::Symbol=:children, compression::Symbol=:elias_delta) where {T<:Unsigned}
+function write_mix_encoded_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, coding_scheme::Symbol=:children, compression::Symbol=:elias_delta, use_mix_mode::Bool=true, reference_enabled::Bool=true) where {T<:Unsigned}
 	# Header 12 bytes: 
 	# -> version: 'MGS' 3 bytes string
 	# -> major + minor version: 2 bytes
@@ -703,7 +703,7 @@ function write_mix_encoded_compressed_mgs3_graph(g::AbstractGraph{T}, filename::
 	# Use the comprehensive write_compressed_graph_data function
 	# This handles mix encoding (delta + run-length) with reference encoding
 	@info("writing compressed graph data using write_compressed_graph_data")
-	write_compressed_graph_data(bw, neighbor_lists, compression, coding_scheme, true, true)
+	write_compressed_graph_data(bw, neighbor_lists, compression, coding_scheme, use_mix_mode, reference_enabled)
 
 	# flush the bitwriter and close the file
 	flush_bitwriter(bw; flush_last_bits=true)
