@@ -19,7 +19,7 @@ using DataStructures
 using SparseArrays
 using ..NodeTypes: Node, EmptyNode, AbstractNode
 using ..CustomTypes: UInt24, UInt40
-using ..IO: BitWriter, BitReader, write_bit, write_bits, read_bit, read_bits, flush, write_value, read_value, flush_bitwriter
+using ..IO: BitWriter, BitReader, write_bit, write_bits, read_bit, read_bits, peek_bit, flush, write_value, read_value, flush_bitwriter
 using ..Constants: FIB_NUMBERS, BUFFER_SIZE, ZETA_H_BOUNDS, ZETA_POWER_BASES, ZETA_BASE, GOLOMB_BASE, REF_ENCODING_TH, REF_V_MIN_DEGREE
 using ..Index
 
@@ -51,6 +51,14 @@ export write_unary_coding,
        read_run_length_delta,
        write_compressed_graph_data,
        read_compressed_graph_data
+
+# Lightweight workspace types for reference building
+struct RefBuildWorkspace{T<:Unsigned}
+    copy_bitmap::Vector{Bool}
+    residuals::Vector{T}
+end
+
+RefBuildWorkspace{T}() where {T<:Unsigned} = RefBuildWorkspace{T}(Bool[], T[])
 
 ################################################################################
 # Basic encoding / decoding
@@ -917,13 +925,12 @@ Read a zeta code from the bit reader.
 @return::T: the decoded value
 """
 function read_zeta(r::BitReader, k::Int, ::Type{T}=UInt8) where {T<:Unsigned}
-    h = read_unary_coding(r, false, T)
+    h = read_unary_coding(r, false, UInt64)  # Read h as UInt64 to avoid overflow in calculations
     
     # Calculate power base: 2^(k*h)
-    # Use UInt64 for intermediate calculations to avoid overflow
-    k_times_h = k * h
+    # Use UInt64 for all intermediate calculations to avoid overflow
+    k_times_h = k * Int(h)
     power_base_u64 = UInt64(1) << k_times_h
-    power_base = T(power_base_u64)
     
     # Calculate alphabet size = 2^(k*(h+1)) - 2^(k*h) = power_base * (2^k - 1)
     # Use UInt64 to avoid overflow
@@ -936,15 +943,15 @@ function read_zeta(r::BitReader, k::Int, ::Type{T}=UInt8) where {T<:Unsigned}
     
     alphabet_size = Int(alphabet_size_u64)
     
-    # Read remainder using same type T as was written
-    remainder = read_truncated_binary_coding(r, alphabet_size, T)
+    # Read remainder using UInt64 to avoid overflow during reading
+    remainder = read_truncated_binary_coding(r, alphabet_size, UInt64)
     
     # Final result: power_base + remainder
     result_u64 = power_base_u64 + UInt64(remainder)
     
     # Check if result fits in original type before converting
     if result_u64 > typemax(T)
-        throw(ArgumentError("Zeta decoding error: result $result_u64 exceeds maximum value $(typemax(T)) for type $T"))
+        throw(ArgumentError("Zeta decoding error: result $result_u64 exceeds maximum value $(typemax(T)) for type $T. Debug info: h=$h, k=$k, power_base=$power_base_u64, remainder=$remainder"))
     end
     
     return T(result_u64)
@@ -1188,8 +1195,8 @@ end
 """
     write_mix_encoded_list(w::BitWriter, delta_list::Vector{T}, encoding::Symbol, use_mix_mode::Bool=true) where {T<:Unsigned}
 
-Write a list using mix encoding (delta + run-length) following FORMAT_SPECS.md exactly.
-This function implements the core mix encoding format used by both index and children modes.
+Write a list using mix mode (delta + run-length) following FORMAT_SPECS.md exactly.
+This function implements the core mix mode format used by both index and children modes.
 
 @param w::BitWriter: the bitwriter
 @param delta_list::Vector{T}: the list of values to write
@@ -1202,14 +1209,14 @@ function write_mix_encoded_list(w::BitWriter, delta_list::Vector{T}, encoding::S
         error("write_mix_encoded_list should not be called with empty lists - handle empty lists at caller level")
     end
     
-    # Write mix-mode flag
+    # write mix mode flag
     write_bit(w, use_mix_mode)
     
     # write the first value
     write_encoded_value(w, delta_list[1], encoding)
     
     if use_mix_mode
-        # mix encoding: write vertex flags and values
+        # mix mode: write vertex flags and values
         i = 2
         while i <= length(delta_list)
             current_value = delta_list[i]
@@ -1222,21 +1229,25 @@ function write_mix_encoded_list(w::BitWriter, delta_list::Vector{T}, encoding::S
                 j += 1
             end
             
-            if run_length >= 2
-                # use run-length encoding: [vertex_flag=1][value][length]
-                write_bit(w, true)  # vertex_flag = 1
-                write_encoded_value(w, current_value, encoding)  # value
-                write_encoded_value(w, T(run_length), encoding)  # length
+            # run-length encoding is used for 3+ consecutive values
+            if run_length >= 3
+                # vertex flag = 1 (run-length encoding)
+                write_bit(w, true)
+                # run length
+                write_encoded_value(w, T(run_length), encoding)
+                # value
+                write_encoded_value(w, current_value, encoding)
                 i += run_length
             else
-                # Use delta encoding: [vertex_flag=0][value]
-                write_bit(w, false)  # vertex_flag = 0
-                write_encoded_value(w, current_value, encoding)  # value
+                # vertex flag = 0 (delta encoding)
+                write_bit(w, false)
+                # value
+                write_encoded_value(w, current_value, encoding)
                 i += 1
             end
         end
     else
-        # Delta only: write remaining values directly
+        # delta-only: write remaining values directly
         for i in 2:length(delta_list)
             write_encoded_value(w, delta_list[i], encoding)
         end
@@ -1251,21 +1262,18 @@ This handles proper termination and value reconstruction according to the new fo
 
 @param max_elements: If provided, stop reading after this many elements have been reconstructed (>= 1 for index mode)
 @param stop_value: If provided, stop reading when this encoded value is encountered in the stream (for children mode)
-@param first_value: If provided, use this value as the first value instead of reading it from the stream
 """
-function read_formatted_mix_encoded_list(r::BitReader, encoding::Symbol, mode::Symbol, ::Type{T}=UInt8; max_elements::Union{Int,Nothing}=nothing, stop_value::Union{T,Nothing}=nothing, first_value::Union{T,Nothing}=nothing) where {T<:Unsigned}
-    # Step 1: read mix_mode flag
+function read_formatted_mix_encoded_list(r::BitReader, encoding::Symbol, mode::Symbol, ::Type{T}=UInt8; max_elements::Union{Int,Nothing}=nothing, stop_value::Union{T,Nothing}=nothing) where {T<:Unsigned}
+    # read mix mode flag
     use_mix_mode = read_bit(r)
     
-    # Step 2: get the first value (either provided or read from stream)
-    if first_value === nothing
-        first_value = read_encoded_value(r, encoding, T)
-    end
+    # read the first value from stream
+    first_value = read_encoded_value(r, encoding, T)
     
-    # Check if first value is the stop value (encoded)
+    # check if first value is the stop value (encoded)
     if stop_value !== nothing
         if first_value == stop_value
-            # This is a stop value, indicating empty list
+            # this is a stop value, indicating empty list
             return T[]
         end
     end
@@ -1273,35 +1281,39 @@ function read_formatted_mix_encoded_list(r::BitReader, encoding::Symbol, mode::S
     delta_list = T[first_value]
     
     if use_mix_mode
-        # mix encoding: read vertex flags and values
+        # mix mode: read vertex flags and values
         while true
-            # Check termination conditions
+            # check termination conditions
             if max_elements !== nothing && length(delta_list) >= max_elements
                 break
             end
             
-            # Try to read vertex flag
+            # try to read vertex flag
             try
                 vertex_flag = read_bit(r)
-                
-                if vertex_flag  # run-length encoding
-                    encoded_value = read_encoded_value(r, encoding, T)
+               
+                # run-length encoding
+                if vertex_flag 
+                    # read the run length and the value
                     run_length = Int(read_encoded_value(r, encoding, T))
+                    value = read_encoded_value(r, encoding, T)
                     
-                    # add the run to delta list
+                    # add the run to the delta list
                     for _ in 1:run_length
                         if max_elements !== nothing && length(delta_list) >= max_elements
                             break
                         end
-                        push!(delta_list, encoded_value)
+                        push!(delta_list, value)
                     end
-                else  # delta encoding
+                # delta-only mode
+                else  
+                    # read the delta value
                     delta_value = read_encoded_value(r, encoding, T)
                     
-                    # Check for stop value
+                    # check for stop value (stop values are written as-is, not shifted)
                     if stop_value !== nothing
                         if delta_value == stop_value
-                            # Hit stop value, terminate reading
+                            # hit stop value, terminate reading
                             break
                         end
                     end
@@ -1309,7 +1321,7 @@ function read_formatted_mix_encoded_list(r::BitReader, encoding::Symbol, mode::S
                     push!(delta_list, delta_value)
                 end
             catch e
-                # End of available data - this is normal termination
+                # end of available data - this is normal termination
                 if isa(e, ErrorException) || isa(e, EOFError)
                     break
                 else
@@ -1317,29 +1329,31 @@ function read_formatted_mix_encoded_list(r::BitReader, encoding::Symbol, mode::S
                 end
             end
         end
+    # delta-only mode
     else
-        # delta only: read remaining values
+        # read remaining values
         while true
-            # Check termination conditions
+            # check termination conditions
             if max_elements !== nothing && length(delta_list) >= max_elements
                 break
             end
             
-            # Try to read next value
+            # try to read next value
             try
+                # NB: no vertex flag is written in delta-only mode
                 delta_value = read_encoded_value(r, encoding, T)
                 
-                # Check for stop value
+                # check for stop value (stop values are written as-is, not shifted)
                 if stop_value !== nothing
                     if delta_value == stop_value
-                        # Hit stop value, terminate reading
+                        # hit stop value, terminate reading
                         break
                     end
                 end
                 
                 push!(delta_list, delta_value)
             catch e
-                # End of available data - this is normal termination
+                # end of available data - this is normal termination
                 if isa(e, ErrorException) || isa(e, EOFError)
                     break
                 else
@@ -1349,14 +1363,14 @@ function read_formatted_mix_encoded_list(r::BitReader, encoding::Symbol, mode::S
         end
     end
     
-    # Apply mode-specific unshifting (reverse of what write function does)
+    # apply mode-specific unshifting (reverse of what write function does)
     if mode == :children && !isempty(delta_list)
-        # The write function applies delta_neighbors .+ T(1) in children mode
-        # So we need to reverse this: delta_list .- T(1)
+        # the write function applies delta_neighbors .+ T(1) in children mode, 
+        # so we need to reverse this: delta_list .- T(1)
         delta_list = delta_list .- T(1)
     end
     
-    # Reconstruct original values from delta encoding
+    # reconstruct original values from delta encoding
     if length(delta_list) <= 1
         return delta_list
     end
@@ -1370,7 +1384,42 @@ function read_formatted_mix_encoded_list(r::BitReader, encoding::Symbol, mode::S
 end
 
 """
-    write_compressed_graph_data(w::BitWriter, neighbor_lists::Dict{T,Vector{T}}, encoding::Symbol, mode::Symbol=:children, reference_enabled::Bool=true) where {T<:Unsigned}
+    _consume_children_trailing_stop(r::BitReader, encoding::Symbol, ::Type{T}=UInt8) where {T<:Unsigned}
+
+Consume exactly one trailing stop marker in children mode, regardless of mix-mode.
+
+End-of-vertex marker in children mode:
+- if mix-mode is enabled, encoder writes: [vertex_flag=0: 1 bit] then [encoded stop value]
+- if mix-mode is disabled, encoder writes: just [encoded stop value]
+
+We do not know mix-mode here; instead, peek the next bit:
+- if it is 0, consume it as the vertex flag, then read and discard one encoded value.
+- if it is 1, directly read and discard one encoded value (the stop value begins with 1 for all supported codes).
+"""
+function _consume_children_trailing_stop(r::BitReader, encoding::Symbol, ::Type{T}=UInt8) where {T<:Unsigned}
+    # safely peek next bit; if at EOF, nothing to consume
+    local next_is_zero
+    try
+        next_is_zero = !peek_bit(r)
+    catch e
+        if isa(e, EOFError) || isa(e, ErrorException)
+            return
+        else
+            rethrow(e)
+        end
+    end
+
+    # if next bit is 0, it's the vertex flag for mix-mode; consume it
+    if next_is_zero
+        _ = read_bit(r)
+    end
+    # read and discard exactly one encoded value (the stop value)
+    _ = read_encoded_value(r, encoding, T)
+    return
+end
+
+"""
+    write_compressed_graph_data(w::BitWriter, neighbor_lists::Dict{T,Vector{T}}, encoding::Symbol, mode::Symbol=:children, use_mix_mode::Bool=true, reference_enabled::Bool=true) where {T<:Unsigned}
 
 Write compressed graph data with mix encoding (delta + run-length) and optional reference encoding.
 
@@ -1380,10 +1429,10 @@ Write compressed graph data with mix encoding (delta + run-length) and optional 
 @param neighbor_lists::Dict{T,Vector{T}}: neighbor lists for each vertex
 @param encoding::Symbol: the compression coding to use for values (:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta)
 @param mode::Symbol: the mode to use (:children, :index)
+@param use_mix_mode::Bool: whether to use mix mode (delta + run-length) (default: true)
 @param reference_enabled::Bool: whether to enable reference encoding (default: true)
-@param use_mix_mode::Bool: whether to use mix mode (default: true)
 """
-function write_compressed_graph_data(w::BitWriter, neighbor_lists::Dict{T,Vector{T}}, encoding::Symbol, mode::Symbol=:children, reference_enabled::Bool=true, use_mix_mode::Bool=true) where {T<:Unsigned}
+function write_compressed_graph_data(w::BitWriter, neighbor_lists::Dict{T,Vector{T}}, encoding::Symbol, mode::Symbol=:children, use_mix_mode::Bool=true, reference_enabled::Bool=true) where {T<:Unsigned}
     # get the number of vertices
     # NB: we assume that the vertices are numbered from 1 to vs
     vs = length(keys(neighbor_lists))
@@ -1395,14 +1444,16 @@ function write_compressed_graph_data(w::BitWriter, neighbor_lists::Dict{T,Vector
     ref_index = nothing
     vertex_to_stream_id = Dict{T,T}()
     stream_id_to_vertex = Dict{T,T}()
+    # Dense vector mapping for faster lookup (index is stream_id)
+    stream_id_to_vertex_vec = T[]
     ref_workspace = nothing
     
     if reference_enabled
-        @info "Building StreamingInvertedIndex for reference encoding..."
+        @debug "Building StreamingInvertedIndex for reference encoding..."
         index_build_start = time()
         
         # Find maximum neighbor ID to size the index appropriately
-        @info "  Finding maximum neighbor ID..."
+        @debug "  Finding maximum neighbor ID..."
         max_neighbor_start = time()
         max_neighbor_id = T(0)
         for neighbors in values(neighbor_lists)
@@ -1411,17 +1462,17 @@ function write_compressed_graph_data(w::BitWriter, neighbor_lists::Dict{T,Vector
             end
         end
         max_neighbor_time = time() - max_neighbor_start
-        @info "  Max neighbor ID: $max_neighbor_id (found in $(round(max_neighbor_time, digits=3))s)"
+        @debug "  Max neighbor ID: $max_neighbor_id (found in $(round(max_neighbor_time, digits=3))s)"
         
         # Create index with sufficient column space
-        @info "  Creating StreamingInvertedIndex..."
+        @debug "  Creating StreamingInvertedIndex..."
         index_create_start = time()
         ref_index = Index.StreamInvertedIndex{T}(max_neighbor_id)
         index_create_time = time() - index_create_start
-        @info "  Index created in $(round(index_create_time, digits=3))s"
+        @debug "  Index created in $(round(index_create_time, digits=3))s"
         
         # Add candidates with degree >= REF_V_MIN_DEGREE to the index
-        @info "  Adding candidates to index (degree >= $REF_V_MIN_DEGREE)..."
+        @debug "  Adding candidates to index (degree >= $REF_V_MIN_DEGREE)..."
         candidates_start = time()
         candidate_count = 0
         progress_interval = max(1, length(neighbor_lists) ÷ 20)  # Progress every 5%
@@ -1431,36 +1482,41 @@ function write_compressed_graph_data(w::BitWriter, neighbor_lists::Dict{T,Vector
                 stream_id = Index.add_candidate!(ref_index, neighbors)
                 vertex_to_stream_id[vertex_id] = stream_id
                 stream_id_to_vertex[stream_id] = vertex_id  # Pre-build reverse mapping
+                # Ensure dense vector mapping capacity and set
+                if stream_id > length(stream_id_to_vertex_vec)
+                    resize!(stream_id_to_vertex_vec, Int(stream_id))
+                end
+                stream_id_to_vertex_vec[Int(stream_id)] = vertex_id
                 candidate_count += 1
             end
             
-            # Progress logging
+            # progress logging
             if i % progress_interval == 0
                 elapsed = time() - candidates_start
-                @info "    Progress: $i/$(length(neighbor_lists)) vertices ($(round(100*i/length(neighbor_lists), digits=1))%), $(candidate_count) candidates, $(round(elapsed, digits=3))s elapsed"
+                @debug "    Progress: $i/$(length(neighbor_lists)) vertices ($(round(100*i/length(neighbor_lists), digits=1))%), $(candidate_count) candidates, $(round(elapsed, digits=3))s elapsed"
             end
         end
         
         candidates_time = time() - candidates_start
         
-        # Create reusable workspace for overlap computations
-        @info "  Creating reusable workspace..."
+        # create reusable workspace for overlap computations
+        @debug "  Creating reusable workspace..."
         workspace_start = time()
         ref_workspace = Index.OverlapWorkspace(ref_index)
         workspace_time = time() - workspace_start
         
         index_build_time = time() - index_build_start
         
-        @info "  Candidates added: $candidate_count/$(length(neighbor_lists)) ($(round(100*candidate_count/length(neighbor_lists), digits=1))%)"
-        @info "  Candidate addition time: $(round(candidates_time, digits=3))s"
-        @info "  Workspace creation time: $(round(workspace_time, digits=3))s"
-        @info "  Total index build time: $(round(index_build_time, digits=3))s"
+        @debug "  Candidates added: $candidate_count/$(length(neighbor_lists)) ($(round(100*candidate_count/length(neighbor_lists), digits=1))%)"
+        @debug "  Candidate addition time: $(round(candidates_time, digits=3))s"
+        @debug "  Workspace creation time: $(round(workspace_time, digits=3))s"
+        @debug "  Total index build time: $(round(index_build_time, digits=3))s"
     end
 
-    # 1. Write reference flag
+    # write reference flag
     write_bit(w, reference_enabled)
 
-    # 2. Index section (if :index mode)
+    # index section (if :index mode)
     if mode == :index
         for v in 1:vs
             # write the out-degree shifted by 1 using the specified encoding
@@ -1469,34 +1525,46 @@ function write_compressed_graph_data(w::BitWriter, neighbor_lists::Dict{T,Vector
         end
     end
 
-    # 3. Data section
-    @info "Starting data section encoding..."
+    # data section
+    @debug "Starting data section encoding..."
     data_section_start = time()
     progress_interval = max(1, vs ÷ 100)  # Progress every 1%
     reference_queries = 0
     references_found = 0
     
+    # Dense mask of available references (by vertex id)
+    available_mask = falses(Int(vs) + 1)
+    # Workspace to build reference data without allocations
+    ref_build_work = RefBuildWorkspace{T}()
+
     for v in 1:vs
         current_neighbors = neighbor_lists[T(v)]
-        
-        # Handle empty lists  
+
+        # handle empty lists
         if isempty(current_neighbors)
             if mode == :index
-                # In index mode, we don't need to write anything for empty lists
+                # in index mode, we don't need to write anything for empty lists
                 # since we already know from the out-degrees that there are no neighbors
                 continue
+            # children mode
             else
-                # In children mode, empty lists must participate in reference encoding flow
+                # in children mode, empty lists must participate in reference encoding flow
                 if reference_enabled
-                    # Write children_flag = 0 (no reference for empty list)
+                    # children_flag = 0 (no existing reference for empty list)
                     write_bit(w, false)
                 end
                 
-                # Write mix-mode flag (0) then stop value to indicate empty list
-                if mode == :children  # Always write stop value in children mode to fix EOF detection
-                    write_bit(w, false)  # mix flag = 0 for delta-only mode
-                    write_encoded_value(w, T(1), encoding)  # stop value indicates empty list
-                end
+                # write mix mode flag
+                # mix mode flag = 0 (delta-only)
+                write_bit(w, true)
+                
+                # NB: if the list is empty, the stop value is the first value
+                # and there is no vertex flag
+
+                # stop value
+                write_encoded_value(w, T(1), encoding)  
+                
+                # continue to the next vertex
                 continue
             end
         end
@@ -1521,18 +1589,27 @@ function write_compressed_graph_data(w::BitWriter, neighbor_lists::Dict{T,Vector
             
             if !isempty(potential_references)
                 reference_queries += 1
-                best_ref = find_best_reference(sorted_neighbors, ref_index, stream_id_to_vertex, ref_workspace, potential_references)
+                # try fast path when we have dense mappings
+                best_ref = find_best_reference_fast(sorted_neighbors, ref_index, stream_id_to_vertex_vec, ref_workspace, available_mask)
+                # if fast path fails (e.g., before any available set), fall back to original Set-based filter
+                # TODO: to be removed
+                if best_ref === nothing
+                    best_ref = find_best_reference(sorted_neighbors, ref_index, stream_id_to_vertex, ref_workspace, potential_references)
+                end
                 if best_ref !== nothing
                     references_found += 1
                     ref_neighbors = sort(neighbor_lists[best_ref])
-                    copy_bitmap, residuals = create_reference_data(sorted_neighbors, ref_neighbors)
-                    # Reference selection is now threshold-based in find_best_reference
+                    # build copy bitmap + residuals using reusable workspace
+                    create_reference_data!(ref_build_work, sorted_neighbors, ref_neighbors)
+                    copy_bitmap = ref_build_work.copy_bitmap
+                    residuals = ref_build_work.residuals
+                    # reference selection is now threshold-based in find_best_reference
                     use_reference = true
                 end
             end
 
             if use_reference
-                # write children_flag = 1 (reference encoding)
+                # children_flag = 1 (reference mode)
                 write_bit(w, true)
                 
                 # write reference data
@@ -1553,59 +1630,67 @@ function write_compressed_graph_data(w::BitWriter, neighbor_lists::Dict{T,Vector
                     
                     # encode residuals with same format as delta encoding
                     residual_deltas = delta_encode_vector(residuals)
-                    
+
+                    # shift residuals by 1 to avoid zeros in children mode
                     if mode == :children
                         residual_deltas = residual_deltas .+ T(1)
                     end
                     
-                    # write residuals using specified mix mode
+                    # write residuals using mix mode
                     write_mix_encoded_list(w, residual_deltas, encoding, use_mix_mode)
                 else
-                    write_bit(w, false)  # residuals_flag = 0
+                    # residuals_flag = 0 (no residuals)
+                    write_bit(w, false)  
                 end
                 
                 push!(potential_references, T(v))
+                available_mask[v] = true
+            # no relevant reference: use mix mode
             else
-                # write children_flag = 0 (mix encoding)
+                # children_flag = 0 (mix mode)
                 write_bit(w, false)
                 write_mix_encoded_list(w, delta_neighbors, encoding, use_mix_mode)
                 push!(potential_references, T(v))
+                available_mask[v] = true
             end
+        # reference disabled: mix mode
         else
-            # reference disabled: use direct mix encoding
             write_mix_encoded_list(w, delta_neighbors, encoding, use_mix_mode)
         end
         
-        # Progress logging
+        # progress logging
         if v % progress_interval == 0
             elapsed = time() - data_section_start
-            @info "  Progress: $v/$vs vertices ($(round(100*v/vs, digits=1))%), $(length(potential_references)) potential refs, $reference_queries queries, $references_found found, $(round(elapsed, digits=3))s elapsed"
+            @debug "  Progress: $v/$vs vertices ($(round(100*v/vs, digits=1))%), $(length(potential_references)) potential refs, $reference_queries queries, $references_found found, $(round(elapsed, digits=3))s elapsed"
         end
         
-        # Write stop value after each vertex list in children mode (including the last vertex to fix EOF detection)
+        # write stop value after each vertex list in children mode
         if mode == :children
+            # NB: the list is not empty, so the stop value is not the first value
+            # and a vertex flag is needed
             if use_mix_mode
-                write_bit(w, false)  # mix flag = 0 for delta-only mode
+                # vertex flag = 0 (delta-only)
+                write_bit(w, false)  
             end
-            write_encoded_value(w, T(1), encoding)  # stop value
+            # stop value
+            write_encoded_value(w, T(1), encoding)  
         end
     end
     
     data_section_time = time() - data_section_start
-    @info "Data section completed!"
-    @info "  Total vertices processed: $vs"
-    @info "  Final potential references: $(length(potential_references))"
-    @info "  Reference queries made: $reference_queries"
-    @info "  References successfully found: $references_found ($(round(references_found > 0 ? 100*references_found/reference_queries : 0.0, digits=1))%)"
-    @info "  Data section encoding time: $(round(data_section_time, digits=3))s"
-    @info "  Average time per vertex: $(round(1000*data_section_time/vs, digits=3))ms"
+    @debug "Data section completed!"
+    @debug "  Total vertices processed: $vs"
+    @debug "  Final potential references: $(length(potential_references))"
+    @debug "  Reference queries made: $reference_queries"
+    @debug "  References successfully found: $references_found ($(round(references_found > 0 ? 100*references_found/reference_queries : 0.0, digits=1))%)"
+    @debug "  Data section encoding time: $(round(data_section_time, digits=3))s"
+    @debug "  Average time per vertex: $(round(1000*data_section_time/vs, digits=3))ms"
 end
-
 
 """
     read_compressed_graph_data(r::BitReader, vs::T, encoding::Symbol, mode::Symbol=:children, ::Type{T}=UInt8) where {T<:Unsigned}
 
-Read compressed graph data with mix encoding (delta + run-length) and optional reference encoding.
+Read compressed graph data with mix mode (delta + run-length) and optional reference mode.
 
 # Format specifications: see FORMAT_SPECS.md
 
@@ -1619,10 +1704,10 @@ Read compressed graph data with mix encoding (delta + run-length) and optional r
 function read_compressed_graph_data(r::BitReader, vs::T, encoding::Symbol, mode::Symbol=:children, ::Type{T}=UInt8) where {T<:Unsigned}
     neighbor_lists = Dict{T,Vector{T}}()
     
-    # 1. Read reference flag  
+    # 1. read reference flag  
     reference_enabled = read_bit(r)
     
-    # 2. Index section (if :index mode)
+    # 2. index section (if :index mode)
     out_degrees = T[]
     if mode == :index
         out_degrees = Vector{T}(undef, vs)
@@ -1632,21 +1717,23 @@ function read_compressed_graph_data(r::BitReader, vs::T, encoding::Symbol, mode:
         end
     end
     
-    # 3. Data section
+    # 3. data section
     if mode == :index
-        # Index mode: read each vertex based on out-degree
+        # index mode: read each vertex based on out-degree
         for v in 1:vs
             if out_degrees[v] == 0
-                # Empty list - no data written for this vertex
+                # empty list - no data written for this vertex
                 neighbor_lists[T(v)] = T[]
             else
-                # Read exactly out_degrees[v] neighbors
+                # read exactly out_degrees[v] neighbors
                 expected_neighbors = Int(out_degrees[v])
+                
+                # reference mode
                 if reference_enabled
-                    # Read children flag
+                    # read children flag
                     children_flag = read_bit(r)
-                    if children_flag  # reference encoding
-                        # Read reference data
+                    if children_flag  # reference mode
+                        # read reference data
                         ref_id = read_encoded_value(r, encoding, T)
                         bitmap_len = Int(read_encoded_value(r, encoding, T))
                         
@@ -1667,36 +1754,38 @@ function read_compressed_graph_data(r::BitReader, vs::T, encoding::Symbol, mode:
                             end
                         end
                         
-                        # Reconstruct from reference
+                        # reconstruct from reference
                         if haskey(neighbor_lists, ref_id)
                             ref_neighbors = neighbor_lists[ref_id]
                             current_neighbors = reconstruct_from_reference(ref_neighbors, copy_bitmap, residuals)
                         else
                             error("Invalid reference ID: $ref_id")
                         end
-                    else  # mix encoding
+                    else  # mix mode
                         current_neighbors = read_formatted_mix_encoded_list(r, encoding, mode, T; max_elements=expected_neighbors)
                     end
                 else
-                    # Reference disabled - mix encoding
+                    # reference disabled - mix mode
                     current_neighbors = read_formatted_mix_encoded_list(r, encoding, mode, T; max_elements=expected_neighbors)
                 end
                 neighbor_lists[T(v)] = current_neighbors
             end
         end
-    # Children mode
-    else
+    # children mode
+    else        
         for v in 1:vs
             current_neighbors = T[]
             
-            # First try to read the vertex data
+            # first try to read the vertex data
             vertex_data_read = false
             try
                 if reference_enabled
-                    # Read children flag
+                    # read children flag
                     children_flag = read_bit(r)
-                    if children_flag  # reference encoding
-                        # Read reference data
+                    
+                    # reference mode: children mode
+                    if children_flag  
+                        # read reference data
                         ref_id = read_encoded_value(r, encoding, T)
                         bitmap_len = Int(read_encoded_value(r, encoding, T))
                         
@@ -1706,7 +1795,6 @@ function read_compressed_graph_data(r::BitReader, vs::T, encoding::Symbol, mode:
                         end
                         
                         residuals_flag = read_bit(r)
-                        residual_deltas = T[]
                         residuals = T[]
                         
                         # in children mode, residuals are terminated by a stop value
@@ -1717,38 +1805,32 @@ function read_compressed_graph_data(r::BitReader, vs::T, encoding::Symbol, mode:
                             residuals = read_formatted_mix_encoded_list(r, encoding, mode, T; stop_value=T(1))
                         end
                         
-                        # Reconstruct from reference
+                        # reconstruct from reference
                         if haskey(neighbor_lists, ref_id)
                             ref_neighbors = neighbor_lists[ref_id]
                             current_neighbors = reconstruct_from_reference(ref_neighbors, copy_bitmap, residuals)
                         else
                             error("Invalid reference ID: $ref_id")
                         end
-                        # Children mode: if there were no residuals, consume the trailing stop marker now
+                        
+                        # children mode: if there were no residuals, consume the trailing stop value now
                         if !residuals_flag
-                            _ = read_formatted_mix_encoded_list(r, encoding, mode, T; stop_value=T(1))
+                            # Consume exactly one trailing stop marker independent of mix-mode
+                            _consume_children_trailing_stop(r, encoding, T)
                         end
-                    # children flag set to 0: mix encoding    
+                    # reference mode: mix mode    
                     else 
-                        if mode == :children
-                            current_neighbors = read_formatted_mix_encoded_list(r, encoding, mode, T; stop_value=T(1))
-                        else
-                            current_neighbors = read_formatted_mix_encoded_list(r, encoding, mode, T)
-                        end
-                    end
-                # reference flag set to 0: mix encoding
-                else
-                    if mode == :children
+                        # read until the stop value
                         current_neighbors = read_formatted_mix_encoded_list(r, encoding, mode, T; stop_value=T(1))
-                    else
-                        current_neighbors = read_formatted_mix_encoded_list(r, encoding, mode, T)
                     end
+                # reference disabled: mix mode
+                else
+                    current_neighbors = read_formatted_mix_encoded_list(r, encoding, mode, T; stop_value=T(1))
                 end
                 
-                # Successfully read vertex data
+                # successfully read vertex data
                 neighbor_lists[T(v)] = current_neighbors
                 vertex_data_read = true
-                
             catch e
                 # EOF while reading vertex data: current vertex and all remaining vertices are empty
                 if isa(e, EOFError) || isa(e, ErrorException)
@@ -1759,9 +1841,8 @@ function read_compressed_graph_data(r::BitReader, vs::T, encoding::Symbol, mode:
                 else
                     rethrow(e)
                 end
-            end
-            
-            # Stop values are consumed by read_formatted_mix_encoded_list when stop_value parameter is provided
+            end 
+            # NB: stop values are consumed by read_formatted_mix_encoded_list when stop_value parameter is provided
         end
     end
     
@@ -1786,30 +1867,30 @@ This optimized version reuses workspace and reverse mapping to eliminate per-que
 function find_best_reference(target::Vector{T}, ref_index::Union{Index.StreamInvertedIndex{T}, Nothing}, 
                            stream_id_to_vertex::Dict{T,T}, work::Union{Index.OverlapWorkspace{T}, Nothing},
                            available::Set{T}) where {T<:Unsigned}
-    # Skip if no index available, no workspace, no candidates available, or target too small
+    # skip if no index available, no workspace, no candidates available, or target too small
     if ref_index === nothing || work === nothing || isempty(available) || length(target) <= 2
         return nothing
     end
     
-    # Compute overlaps with all candidates in the index (reusing workspace)
+    # compute overlaps with all candidates in the index (reusing workspace)
     counts, touched = Index.overlap!(ref_index, target, work)
     
     if isempty(touched)
         return nothing
     end
     
-    # Find best overlap among available references only
+    # find best overlap among available references only
     best_ref = nothing
     best_overlap = 0
     
     for stream_id in touched
         overlap_count = counts[stream_id]
         
-        # Look up corresponding vertex ID using pre-built mapping
+        # look up corresponding vertex ID using pre-built mapping
         if haskey(stream_id_to_vertex, stream_id)
             vertex_id = stream_id_to_vertex[stream_id]
             
-            # Skip if this candidate is not available as reference or overlap too low
+            # skip if this candidate is not available as reference or overlap too low
             if vertex_id in available && overlap_count > best_overlap
                 best_overlap = overlap_count
                 best_ref = vertex_id
@@ -1817,12 +1898,62 @@ function find_best_reference(target::Vector{T}, ref_index::Union{Index.StreamInv
         end
     end
     
-    # Apply threshold: use reference only if overlap exceeds REF_ENCODING_TH
+    # apply threshold: use reference only if overlap exceeds REF_ENCODING_TH
     if best_overlap >= REF_ENCODING_TH
         return best_ref
     end
     
     return nothing
+end
+
+"""
+    find_best_reference_fast(target::Vector{T}, ref_index::Union{Index.StreamInvertedIndex{T}, Nothing},
+                             stream_id_to_vertex_vec::Union{Vector{T},Nothing},
+                             work::Union{Index.OverlapWorkspace{T}, Nothing},
+                             available_mask::Union{Vector{Bool},Nothing}) where {T<:Unsigned}
+
+optimized best-reference selection:
+- uses a dense `stream_id -> vertex` vector mapping when available (avoids Dict lookups)
+- uses a dense `available_mask` Bool vector (avoids Set membership checks)
+- falls back to `nothing` parameters to skip optimization.
+"""
+function find_best_reference_fast(target::Vector{T}, ref_index::Union{Index.StreamInvertedIndex{T}, Nothing},
+                                 stream_id_to_vertex_vec::Union{Vector{T},Nothing},
+                                 work::Union{Index.OverlapWorkspace{T}, Nothing},
+                                 available_mask::Union{AbstractVector{Bool},Nothing}) where {T<:Unsigned}
+    # skip if no index available, no workspace, or target too small
+    if ref_index === nothing || work === nothing || isempty(target)
+        return nothing
+    end
+
+    # compute overlaps with all candidates in the index (reusing workspace)
+    counts, touched = Index.overlap!(ref_index, target, work)
+    if isempty(touched)
+        return nothing
+    end
+
+    # find best overlap among available references only
+    best_ref = nothing
+    best_overlap = 0
+
+    # if dense mappings are available, use them
+    if stream_id_to_vertex_vec !== nothing && available_mask !== nothing
+        @inbounds for stream_id in touched
+            # map to vertex id; skip invalid zeros
+            if stream_id <= length(stream_id_to_vertex_vec)
+                v = stream_id_to_vertex_vec[stream_id]
+                if v != zero(T) && v <= length(available_mask) && available_mask[Int(v)]
+                    ov = counts[stream_id]
+                    if ov > best_overlap
+                        best_overlap = ov
+                        best_ref = v
+                    end
+                end
+            end
+        end
+    end
+
+    return best_overlap >= REF_ENCODING_TH ? best_ref : nothing
 end
 
 """
@@ -1835,31 +1966,59 @@ Create copy bitmap and residuals for reference encoding.
 @return::Tuple{Vector{Bool}, Vector{T}}: (copy_bitmap, residuals)
 """
 function create_reference_data(target::Vector{T}, reference::Vector{T}) where {T<:Unsigned}
-    target_set = Set(target)
-    copy_bitmap = Bool[]
-    residuals = T[]
+    # backward-compatible wrapper allocating fresh buffers
+    work = RefBuildWorkspace{T}()
+    create_reference_data!(work, target, reference)
+    return work.copy_bitmap, work.residuals
+end
+
+"""
+    create_reference_data!(work::RefBuildWorkspace{T}, target::Vector{T}, reference::Vector{T}) where {T<:Unsigned}
+
+Create copy bitmap and residuals for reference encoding assuming both inputs are sorted.
+This version reuses buffers in `work` to avoid per-call allocations and avoids Sets.
+"""
+function create_reference_data!(work::RefBuildWorkspace{T}, target::Vector{T}, reference::Vector{T}) where {T<:Unsigned}
+    # clear the workspace
+    empty!(work.copy_bitmap)
+    empty!(work.residuals)
     
-    # create copy bitmap for reference elements
-    for ref_neighbor in reference
-        if ref_neighbor in target_set
-            push!(copy_bitmap, true)
-        else
-            push!(copy_bitmap, false)
+    # pointers in reference and target
+    i = 1  # pointer in reference
+    j = 1  # pointer in target
+    nref = length(reference)
+    ntgt = length(target)
+
+    # build copy bitmap by scanning both sorted arrays once
+    while i <= nref && j <= ntgt
+        rv = reference[i]
+        tv = target[j]
+        if rv == tv
+            push!(work.copy_bitmap, true)
+            i += 1; j += 1
+        elseif rv < tv
+            push!(work.copy_bitmap, false)
+            i += 1
+        else # tv < rv
+            # target element not in reference → residual
+            push!(work.residuals, tv)
+            j += 1
         end
     end
-    
-    # find residuals (elements in target but not in reference)
-    reference_set = Set(reference)
-    for target_neighbor in target
-        if !(target_neighbor in reference_set)
-            push!(residuals, target_neighbor)
-        end
+
+    # remaining reference elements are not in target
+    while i <= nref
+        push!(work.copy_bitmap, false)
+        i += 1
     end
-    
-    # sort residuals for delta encoding
-    sort!(residuals)
-    
-    return copy_bitmap, residuals
+
+    # remaining target elements are residuals
+    while j <= ntgt
+        push!(work.residuals, target[j])
+        j += 1
+    end
+
+    return work
 end
 
 """
@@ -1873,21 +2032,40 @@ Reconstruct neighbor list from reference data.
 @return::Vector{T}: the reconstructed neighbor list
 """
 function reconstruct_from_reference(reference::Vector{T}, copy_bitmap::Vector{Bool}, residuals::Vector{T}) where {T<:Unsigned}
-    result = T[]
-    
-    # copy selected elements from reference
-    for (i, should_copy) in enumerate(copy_bitmap)
-        if should_copy && i <= length(reference)
-            push!(result, reference[i])
+    # assumes `reference` is sorted and `residuals` is sorted.
+    # produces a sorted merge without an extra sort step.
+    # first, stream selected reference entries, then merge with residuals.
+
+    # collect selected items from reference in order
+    selected = T[]
+    @inbounds for i in 1:min(length(copy_bitmap), length(reference))
+        if copy_bitmap[i]
+            push!(selected, reference[i])
         end
     end
-    
-    # add residuals
-    append!(result, residuals)
-    
-    # sort the final result
-    sort!(result)
-    
+
+    # if one side is empty, return the other directly
+    isempty(selected) && return copy(residuals)
+    isempty(residuals) && return selected
+
+    # merge two sorted lists
+    result = Vector{T}(undef, length(selected) + length(residuals))
+    i = 1; j = 1; k = 1
+    n1 = length(selected); n2 = length(residuals)
+    @inbounds while i <= n1 && j <= n2
+        if selected[i] <= residuals[j]
+            result[k] = selected[i]; i += 1
+        else
+            result[k] = residuals[j]; j += 1
+        end
+        k += 1
+    end
+    @inbounds while i <= n1
+        result[k] = selected[i]; i += 1; k += 1
+    end
+    @inbounds while j <= n2
+        result[k] = residuals[j]; j += 1; k += 1
+    end
     return result
 end
 

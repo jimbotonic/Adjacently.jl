@@ -52,7 +52,7 @@ include("run_tests_main.jl")
                 # Encode
                 io = IOBuffer()
                 writer = BitWriter(io)
-                Adjacently.Compression.write_compressed_graph_data(writer, remapped_neighbor_lists, encoding, mode, use_reference)
+                Adjacently.Compression.write_compressed_graph_data(writer, remapped_neighbor_lists, encoding, mode, true, use_reference)
                 flush_bitwriter(writer; flush_last_bits=true)
 
                 bytes = position(io)
