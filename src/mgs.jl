@@ -87,6 +87,14 @@ HEADER_MGS3_DZ_CS0 = 0x4d475303000600
 # - D0 (directed graph 00 + Zeta compression 000006)
 # - CS1 (coding scheme 1) = 0x10 (index and data sections + reserved)
 HEADER_MGS3_DZ_CS1 = 0x4d475303000610
+# 'MGS' + 0x0300 (major=3, minor=0) 
+# - D0 (directed graph 00 + Fibonacci+Elias Delta hybrid compression 000007)
+# - CS0 (coding scheme 0) = 0x00 (data section only + reserved)
+HEADER_MGS3_DFED_CS0 = 0x4d475303000700
+# 'MGS' + 0x0300 (major=3, minor=0) 
+# - D0 (directed graph 00 + Fibonacci+Elias Delta hybrid compression 000007)
+# - CS1 (coding scheme 1) = 0x10 (index and data sections + reserved)
+HEADER_MGS3_DFED_CS1 = 0x4d475303000710
 
 # maximum number of vertices
 MGS_MAX_SIZE = 0xffffffffff
@@ -378,16 +386,20 @@ Supported compression schemes:
 - :golomb - Golomb coding
 - :fibonacci - Fibonacci coding
 - :zeta - Zeta coding
+- :fed - Fibonacci+Elias Delta hybrid coding
 
 @returns nothing
 """
 function write_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, encoding::Symbol=:children, compression::Symbol=:huffman, use_mix_mode::Bool=true, reference_enabled::Bool=true) where {T<:Unsigned}
-    if compression == :huffman
+	# supported compression schemes
+	supported_schemes = [:huffman, :elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta, :fed]
+	
+	if compression == :huffman
         write_huffman_compressed_mgs3_graph(g, filename, encoding)
-    elseif compression == :elias_gamma || compression == :elias_delta || compression == :golomb || compression == :fibonacci || compression == :zeta
+    elseif compression in supported_schemes
         write_mix_encoded_compressed_mgs3_graph(g, filename, encoding, compression, use_mix_mode, reference_enabled)
     else
-        error("Unsupported compression scheme: $compression. Supported schemes are :huffman, :elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta")
+        error("Unsupported compression scheme: $compression. Supported schemes are :huffman, :elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta, :fed")
     end
 end
 
@@ -672,6 +684,16 @@ function write_mix_encoded_compressed_mgs3_graph(g::AbstractGraph{T}, filename::
 			# encoding: index+data sections with implicit numbering of vertices
 			version = HEADER_MGS3_DZ_CS1
 		end
+	elseif compression == :fed
+		if coding_scheme == :children
+			# 'MGS' + 0x0300 + 0x07 (directed graph + compression) + 0x00 (data section only + reserved)
+			# encoding: data section only with implicit numbering of vertices
+			version = HEADER_MGS3_DFED_CS0
+		elseif coding_scheme == :index
+			# 'MGS' + 0x0300 + 0x07 (directed graph + compression) + 0x10 (index and data sections + reserved)
+			# encoding: index+data sections with implicit numbering of vertices
+			version = HEADER_MGS3_DFED_CS1
+		end
 	else
 		error("Compression scheme not supported")
 	end
@@ -729,6 +751,7 @@ Supported compression schemes:
 - :golomb
 - :fibonacci
 - :zeta
+- :fed
 
 Returns a graph loaded with the compression scheme specified in the header.
 """
@@ -776,23 +799,23 @@ function load_compressed_mgs3_graph(filename::AbstractString)
 		compression = :fibonacci
 	elseif compression_scheme == 0x6
 		compression = :zeta
+	elseif compression_scheme == 0x7
+		compression = :fed
 	else
-		error("Unsupported compression scheme: $compression_scheme. Supported schemes are :huffman, :elias_gamma, :elias_delta, :fibonacci, :zeta")
+		error("Unsupported compression scheme: $compression_scheme. Supported schemes are :huffman, :elias_gamma, :elias_delta, :fibonacci, :zeta, :fed")
 	end
 	# number of vertices
 	gs = reinterpret(UInt64, vcat(reverse(read(f,5)),[0x00,0x00,0x00]))[1]
-	
-	# `n_size_u` is the number of bits needed to represent the graph vertices
-	#n_bits_v = convert(UInt8, ceil(log(2, gs)))
-	# Get appropriate unsigned int type based on number of bits needed
-	#V = infer_uint_custom_type(n_bits_v)
+
+	# supported compression schemes
+	supported_schemes = [:huffman, :elias_gamma, :elias_delta, :fibonacci, :zeta, :fed]
 	
 	if compression == :huffman
 		g = load_huffman_compressed_mgs3_graph(f, graph_type, encoding, gs)
-	elseif compression == :elias_gamma || compression == :elias_delta || compression == :fibonacci || compression == :zeta
+	elseif compression in supported_schemes
 		g = load_mix_encoded_compressed_mgs3_graph(f, graph_type, encoding, gs, compression)
 	else
-		error("Unsupported compression scheme: $compression_scheme. Supported schemes are :huffman, :elias_gamma, :elias_delta, :fibonacci, :zeta")
+		error("Unsupported compression scheme: $compression. Supported schemes are :huffman, :elias_gamma, :elias_delta, :fibonacci, :zeta, :fed")
     end
 
 	close(f)
@@ -806,9 +829,9 @@ load graph in compressed MGS v3 format (Huffman compression scheme)
 
 Parameters:
 - f: Input stream
-- graph_type: Graph type (:directed or :undirected)
-- encoding: Coding scheme (:children or :index)
-- gs: Number of vertices
+- graph_type: graph type (:directed or :undirected)
+- encoding: coding scheme (:children or :index)
+- gs: number of vertices
 """
 function load_huffman_compressed_mgs3_graph(io::IO, graph_type::Symbol, encoding::Symbol, gs::UInt64)
 	# `n_size_u` is the number of bits needed to represent the graph vertices
@@ -934,7 +957,7 @@ Parameters:
 - gs: Number of vertices
 - compression: Compression scheme (:elias_delta, :fibonacci, :zeta)
 
-@returns a graph
+@returns a graph loaded with the compression scheme specified in the header.
 """
 function load_mix_encoded_compressed_mgs3_graph(io::IO, graph_type::Symbol, encoding::Symbol, gs::UInt64, compression::Symbol)
 	# `n_size_u` is the number of bits needed to represent the graph vertices
