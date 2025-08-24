@@ -11,7 +11,7 @@ include("run_tests_main.jl")
 using Logging
 using LightGraphs: vertices, outneighbors, nv, ne
 using Adjacently.IO: load_adjacency_list_from_csv
-using Adjacently.Graph: relabel_vertices, relabel_graph, get_in_out_degrees
+using Adjacently.Relabeling: relabel_vertices, relabel_graph, relabel_vertices_rcm
 using Adjacently.MGS: write_compressed_mgs3_graph, load_compressed_mgs3_graph
 
 @testset "CNR-2000 Lexicographic/RCM + ZETA/FED/FIB (children + ref + mix)" begin
@@ -45,50 +45,9 @@ using Adjacently.MGS: write_compressed_mgs3_graph, load_compressed_mgs3_graph
         @test nv(glex) == n
         @test ne(glex) == m
 
-        # RCM relabeling (outdegree-only, outneighbors, global min-outdegree start, reversed order)
+        # RCM relabeling via library (outdegree-only)
         @info "RCM (outdegree-only) relabeling..."
-        _, outdeg = get_in_out_degrees(g)
-        deg = Dict{eltype(keys(outdeg)), Int}()
-        for (v, d) in outdeg
-            deg[v] = Int(d)
-        end
-        function rcm_order_outdeg(g)
-            V = typeof(g).parameters[1]
-            vs = collect(vertices(g))
-            visited = falses(Int(n) + 1)
-            order = V[]
-            start = vs[argmin(x -> get(deg, x, 0), vs)]
-            queue = V[start]
-            visited[Int(start)] = true
-            push!(order, start)
-            qidx = 1
-            while qidx <= length(queue)
-                v = queue[qidx]
-                qidx += 1
-                neigh = V[ u for u in outneighbors(g, v) if !visited[Int(u)] ]
-                sort!(neigh, by = x -> get(deg, x, 0))
-                for u in neigh
-                    iu = Int(u)
-                    if !visited[iu]
-                        visited[iu] = true
-                        push!(queue, u)
-                        push!(order, u)
-                    end
-                end
-            end
-            for v in vs
-                if !visited[Int(v)]
-                    push!(order, v)
-                end
-            end
-            reverse!(order)
-            return order
-        end
-        order_rcm = rcm_order_outdeg(g)
-        map_rcm = Dict{typeof(order_rcm[1]), typeof(order_rcm[1])}()
-        for (i, v) in enumerate(order_rcm)
-            map_rcm[v] = typeof(v)(i)
-        end
+        map_rcm = relabel_vertices_rcm(g, :out)
         grcm = relabel_graph(g, map_rcm)
         @test nv(grcm) == n
         @test ne(grcm) == m

@@ -13,7 +13,8 @@ include("run_tests_main.jl")
 using Logging, Random
 using Adjacently.MGS: write_compressed_mgs3_graph
 using Adjacently.IO: load_adjacency_list_from_csv
-using Adjacently.Graph: relabel_vertices, relabel_graph, get_neighbor_lists
+using Adjacently.Graph: get_neighbor_lists
+using Adjacently.Relabeling: relabel_vertices, relabel_graph, relabel_vertices_rcm
 
 @testset "CNR-2000 Ordering Comparison" begin
     # Verbose logging for clarity
@@ -119,51 +120,7 @@ using Adjacently.Graph: relabel_vertices, relabel_graph, get_neighbor_lists
         # V will be defined below before use
 
         # Strategy 4: BFS/RCM (approximate RCM with undirected view)
-        @info "Computing BFS/RCM mapping..."
-        function rcm_order(g; V::Type{<:Unsigned}=eltype(vertices(g)))
-            T = eltype(vertices(g))
-            n = nv(g)
-            vs = collect(vertices(g))
-            # degree as undirected approximation = outdegree
-            deg = Dict{T,Int}()
-            for v in vs
-                deg[v] = length(outneighbors(g, v))
-            end
-            # pick start with minimum degree
-            start = argmin(x->deg[x], vs)  # returns a vertex id of type T
-            visited = Dict{T,Bool}()
-            order = T[]
-            q = T(start)
-            push!(order, q)
-            visited[q] = true
-            front = T[q]
-            i = 1
-            while i <= length(front)
-                v = front[i]
-                # neighbors sorted by degree ascending
-                neigh = sort(outneighbors(g, v), by = x -> get(deg, x, 0))
-                for u in neigh
-                    if !get(visited, u, false)
-                        push!(front, u)
-                        push!(order, u)
-                        visited[u] = true
-                    end
-                end
-                i += 1
-            end
-            # add any isolated/leftover vertices
-            for v in vs
-                get(visited, v, false) || push!(order, v)
-            end
-            # Reverse for RCM effect
-            reverse!(order)
-            # ensure return type Vector{V}
-            out = Vector{V}(undef, length(order))
-            for i in eachindex(order)
-                out[i] = convert(V, order[i])
-            end
-            return out
-        end
+        @info "Computing RCM mapping (library :out variant)..."
         # V will be defined below before use
 
         mkpath(output_dir)
@@ -182,7 +139,7 @@ using Adjacently.Graph: relabel_vertices, relabel_graph, get_neighbor_lists
         V = typeof(g).parameters[1]
         order_llp = lp_order(g; V=V)
         order_minhash = minhash_order(g; V=V)
-        order_rcm = rcm_order(g; V=V)
+        map_rcm = relabel_vertices_rcm(g, :out)
         configs = [
             ("lexicographic", () -> begin
                 map = relabel_vertices(g, :lexicographic) # already Dict{V,V}
@@ -191,7 +148,7 @@ using Adjacently.Graph: relabel_vertices, relabel_graph, get_neighbor_lists
             end),
             ("llp",           () -> order_to_mapping(order_llp, V)),
             ("minhash",       () -> order_to_mapping(order_minhash, V)),
-            ("rcm",           () -> order_to_mapping(order_rcm, V))
+            ("rcm",           () -> Dict{V,V}(map_rcm))
         ]
 
         results = []

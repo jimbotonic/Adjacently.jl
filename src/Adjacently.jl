@@ -63,6 +63,10 @@ include("graph.jl")
 using .Graph
 export Graph
 
+include("relabeling.jl")
+using .Relabeling
+export Relabeling
+
 include("cycles.jl")
 using .Cycles
 export Cycles

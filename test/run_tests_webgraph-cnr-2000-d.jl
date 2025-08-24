@@ -11,7 +11,7 @@ using Logging
 using Adjacently.MGS: write_compressed_mgs3_graph, load_compressed_mgs3_graph
 using Adjacently.IO: load_adjacency_list_from_csv, BitWriter, write_value, flush_bitwriter
 using Adjacently.Compression: write_compressed_graph_data
-using Adjacently.Graph: relabel_vertices, relabel_graph
+using Adjacently.Relabeling: relabel_vertices, relabel_graph
 
 @testset "WebGraph CNR-2000 Config D - Mix Mode + Reference" begin
     # Enable debug-level logging for detailed trace
