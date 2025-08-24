@@ -44,8 +44,6 @@ export get_basic_stats,
        get_inclist_from_adjlist, 
        get_sparse_adj_matrix, 
        get_sparse_P_matrix,
-       relabel_vertices,
-       relabel_graph,
        get_sparse_symmetric_P_matrix,
 	   get_neighbor_lists
 
@@ -83,22 +81,27 @@ end
 """
     get_basic_stats(g::AbstractGraph{T}) where {T<:Unsigned}
 
-get # vertices, # of edges and density
-NB: for computing density, we assume a directed graph
+@param g: the graph
+@returns # vertices, # of edges, density
 """
 function get_basic_stats(g::AbstractGraph{T}) where {T<:Unsigned}
 	nvs = nv(g)
 	nes = ne(g)
-	density = nes/(nvs*(nvs-1))
+	if is_directed(g)
+		density = nes/(nvs*(nvs-1))
+	else
+		density = 2*nes/(nvs*(nvs-1))
+	end
 	return nvs,nes,density
 end
 
 """
     get_out_degree_stats(g::AbstractGraph{T}) where {T<:Unsigned}
 
-get out degree stats
+get out-degree stats
 
-retuns avg out-degree, max out-degree, array of sinks vertices
+@param g: the graph
+@returns avg out-degree, max out-degree, array of sink vertices
 """
 function get_out_degree_stats(g::AbstractGraph{T}) where {T<:Unsigned}
 	sum = 0
@@ -123,6 +126,9 @@ end
     get_sinks(g::AbstractGraph{T}) where {T<:Unsigned}
 
 get array of sink vertices in the specified graph
+
+@param g: the graph
+@returns array of sink vertices
 """
 function get_sinks(g::AbstractGraph{T}) where {T<:Unsigned}
 	sinks = T[]
@@ -141,6 +147,9 @@ end
     get_sources(g::AbstractGraph{T}) where {T<:Unsigned}
 
 get array of source vertices in the specified graph
+
+@param g: the graph
+@returns array of source vertices
 """
 function get_sources(g::AbstractGraph{T}) where {T<:Unsigned}
 	achildren = T[]
@@ -160,6 +169,10 @@ end
     subgraph(g::AbstractGraph{T},sids::Array{T,1}) where {T<:Unsigned}
 
 get the subgraph of g induced by the set of vertices sids
+
+@param g: the graph
+@param sids: the set of vertices
+@returns the subgraph of g induced by the set of vertices sids
 """
 function subgraph(g::AbstractGraph{T},sids::Array{T,1}) where {T<:Unsigned}
 	if typeof(g) == SimpleDiGraph{T}
@@ -203,6 +216,11 @@ end
 
 get the subgraph of g induced by the set of vertices sids
 write the subgraph in MGS format v2
+
+@param g: the graph
+@param sids: the set of vertices
+@param name: the name of the file
+@returns the subgraph of g induced by the set of vertices sids
 """
 function subgraph_streamed(g::AbstractGraph{T},sids::Array{T,1},name::String) where {T<:Unsigned}
 	ng = SimpleDiGraph{T}()
@@ -250,6 +268,9 @@ end
 
 get the main SCC
 
+@param g: the graph
+@param sccs: the set of SCCs
+@param name: the name of the file
 @returns ng (core subgraph), oni (old->new vertex indices), noi (new->old vertex indices)
 """
 function get_core(g::AbstractGraph{T}) where {T<:Unsigned}
@@ -292,6 +313,11 @@ end
 
 get the main SCC and write it to the specified file (MGS format)
 write the subgraph in MGS format v2
+
+@param g: the graph
+@param sccs: the set of SCCs
+@param name: the name of the file
+@returns the subgraph of g induced by the set of vertices sids
 """
 function get_core_streamed(g::AbstractGraph{T},sccs::Array{T,1},name::String) where {T<:Unsigned}
 	scc_ids = union(sccs,[])
@@ -331,6 +357,7 @@ end
 
 get the reverse graph (same graph with all edge directions reversed)
 
+@param g: the graph
 @returns reversed graph
 """
 function get_reverse_graph(g::AbstractGraph{T}) where {T<:Unsigned}
@@ -360,7 +387,6 @@ end
 get in-degree of g vertices
 
 @param g: the graph
-
 @returns dictionary (vertex_id -> in-degree)
 """
 function get_in_degrees(g::AbstractGraph{T}) where {T<:Unsigned}
@@ -396,7 +422,6 @@ end
 get out-degree of g vertices
 
 @param g: the graph
-
 @returns dictionary (vertex_id -> out-degree)
 """
 function get_out_degrees(g::AbstractGraph{T}) where {T<:Unsigned}
@@ -413,7 +438,6 @@ end
 get in- and out- degree dictionaries of specified graph
 
 @param g: the graph
-
 @returns in-degree dictionary (vertex_id -> in-degree), out-degree dictionary (vertex_id -> out-degree)
 """
 function get_in_out_degrees(g::AbstractGraph{T}) where {T<:Unsigned}
@@ -431,14 +455,16 @@ end
 
 get the avg out-degree of the specified set of visited nodes
 
+NB: to get the avg in-degree of visited nodes, one can use the reverse graph of g
+
 @param g: the graph
 @param visited: the set of visited nodes
 @param p_avg: current average
 @param np_steps: number of points used to compute p_avg
 
-NB: to get the avg in-degree of visited nodes, one can use the reverse graph of g
+@returns the avg out-degree of the specified set of visited nodes
 """
-function get_avg_out_degree(g::AbstractGraph{T}, visited::Array{T,1}, p_avg::Float64=-1, np_steps::UInt64=0) where {T<:Unsigned}
+function get_avg_out_degree(g::AbstractGraph{T}, visited::Array{T,1}, p_avg::Float64=-1., np_steps::UInt64=0) where {T<:Unsigned}
 	sum = 0.
 	for v in visited
 		sum += length(outneighbors(g,v))
@@ -456,7 +482,6 @@ end
 get the neighbor lists of the graph
 
 @param g: the graph
-
 @returns the neighbor lists as a dictionary (vertex_id -> list of neighbors)
 """
 function get_neighbor_lists(g::AbstractGraph{T}) where {T<:Unsigned}
@@ -479,7 +504,7 @@ get a forward ball centered at the specified vertex
 
 @returns the set of vertex ids in the ball
 """
-function get_forward_ball(v::T, g::AbstractGraph{T}, radius::Int=2, p::Float64=1) where {T<:Unsigned}
+function get_forward_ball(v::T, g::AbstractGraph{T}, radius::Int=2, p::Float64=1.) where {T<:Unsigned}
 	# vertex ids of the ball
 	subids = T[]
 	push!(subids,v)
@@ -601,6 +626,7 @@ end
 
 get sparse adjacency matrix A
 
+@param g: the graph
 @returns the sparse adjacency matrix
 """
 function get_sparse_adj_matrix(g::AbstractGraph{T}) where {T<:Unsigned}
@@ -622,6 +648,7 @@ end
 
 get adjacency matrix A
 
+@param g: the graph
 @returns the adjacency matrix
 """
 function get_adj_matrix(g::AbstractGraph{T}) where {T<:Unsigned}
@@ -640,6 +667,7 @@ end
 
 get P = D^-1 * A matrix
 
+@param g: the graph
 @returns the sparse P matrix
 """
 function get_sparse_P_matrix(g::AbstractGraph{T}) where {T<:Unsigned}
@@ -660,11 +688,10 @@ get P = D*^(-1/2) A* D*^(-1/2) matrix with A* = (A+I)
 NB: we assume there is no sink in the graph
 
 @param g: the graph
-
 @returns the sparse P matrix
 """
 function get_sparse_symmetric_P_matrix(g::AbstractGraph{T}) where {T<:Unsigned}
-	n = length(G.vertices(g))
+	n = length(vertices(g))
 	A = get_sparse_adj_matrix(g)
 	A = A + sparse(I,n,n)
 	S = dropdims(sum(A, dims=2), dims=2)
@@ -672,180 +699,6 @@ function get_sparse_symmetric_P_matrix(g::AbstractGraph{T}) where {T<:Unsigned}
 	range = convert(Array{T,1}, 1:n)
 	D = sparse(range, range, S)
 	return D*A*D
-end
-
-#######
-# Graph relabeling
-#######
-
-"""
-    relabel_graph(g::AbstractGraph{T}, vertex_mapping::Vector{T}) where {T<:Unsigned}
-
-relabel the graph vertices according to the specified mapping
-
-@param g: the graph
-@param vertex_mapping: the mapping of the vertices (vertex_id[old_id] -> new_id)
-
-@returns the relabeled graph
-"""
-function relabel_graph(g::AbstractGraph{T}, vertex_mapping::Dict{T,T}) where {T<:Unsigned}
-	if is_directed(g)
-		ng = SimpleDiGraph{T}()
-	else
-		ng = SimpleGraph{T}()
-	end
-	add_vertices!(ng, length(vertex_mapping))
-	for e in edges(g)
-		src_id = vertex_mapping[src(e)]
-		dst_id = vertex_mapping[dst(e)]
-		add_edge!(ng, src_id, dst_id)
-	end
-	return ng
-end 
-
-"""
-    relabel_vertices(g::AbstractGraph{T}, criterion::Symbol=:in_degree) where {T<:Unsigned}
-
-relabel the vertices of the graph according to the specified criterion
-
-@param g: the graph
-@param criterion: the criterion to relabel the vertices
-
-Vertices are first assigned a score according to the specified criterion.
-Then, they are sorted by score in descending order and relabeled accordingly.
-
-Possible score-based criterion:
-- :in_degree
-- :out_degree
-- :degree
-- :pagerank
-
-Possible lexicographic criterion:
-- :lexicographic
-
-@returns the mapping of the vertices (vertex_id[old_id] -> new_id)
-"""
-function relabel_vertices(g::AbstractGraph{T}, criterion::Symbol=:lexicographic) where {T<:Unsigned}
-	if criterion == :lexicographic
-		return relabel_vertices_lexicographic(g)
-	else
-		return relabel_vertices_score(g, criterion)
-	end
-end
-
-"""
-    relabel_vertices_score(g::AbstractGraph{T}, criterion::Symbol=:in_degree) where {T<:Unsigned}
-
-relabel the vertices of the graph according to the specified score-based criterion
-
-@param g: the graph
-@param criterion: the criterion to relabel the vertices
-
-Possible score-based criterion:
-- :in_degree
-- :out_degree
-- :degree
-- :pagerank
-
-@returns the mapping of the vertices (vertex_id[old_id] -> new_id)
-"""
-function relabel_vertices_score(g::AbstractGraph{T}, criterion::Symbol=:in_degree) where {T<:Unsigned}
-	if criterion == :in_degree
-		vertex_scores = get_in_degrees(g)
-	elseif criterion == :out_degree
-		vertex_scores = get_out_degrees(g)
-	elseif criterion == :degree
-		if is_directed(g)
-			vertex_scores = Dict{T,T}()
-			in_degrees, out_degrees = get_in_out_degrees(g)
-			for v in vertices(g)
-				vertex_scores[v] = in_degrees[v] + out_degrees[v]
-			end
-		else
-			vertex_scores = get_out_degrees(g)
-		end
-	elseif criterion == :pagerank
-		rg = get_reverse_graph(g)
-		vertex_scores = PR(g, rg)
-	else
-		@error("Invalid criterion: $criterion")
-	end
-
-	# create a vector of (vertex, degree) pairs and sort by degree
-	vertex_scores_pairs = [(v, vertex_scores[v]) for v in vertices(g)]
-	# sort by score in descending order
-	sort!(vertex_scores_pairs, by=x->x[2], rev=true)
-	
-	# create the mapping dictionary: old_id -> new_id
-	vertex_mapping = Dict{T,T}()
-	for (new_id, (old_id, _)) in enumerate(vertex_scores_pairs)
-		vertex_mapping[old_id] = convert(T, new_id)
-	end
-	
-	return vertex_mapping
-end
-
-"""
-    relabel_vertices_lexicographic(g::AbstractGraph{T}) where {T<:Unsigned}
-
-relabel the vertices of the graph lexicographically
-
-@param g: the graph
-@returns the mapping of the vertices (vertex_id[old_id] -> new_id)
-"""
-function relabel_vertices_lexicographic(g::AbstractGraph{T}) where {T<:Unsigned}
-	vs = vertices(g)
-	n = nv(g)
-	vertex_mapping = Dict{T,T}()
-	
-	# create sparse bit vectors for each vertex's out-neighbors
-	vertex_bitvectors = Vector{Tuple{T, SparseVector{Bool, T}}}()
-	
-	for v in vs
-		out_neighbors = outneighbors(g, v)
-		# create sparse bit vector: 1 for each out-neighbor
-		# indices where bit is set to 1
-		I = T[]  
-		# values (all true)
-		V = Bool[]
-		# for each out-neighbor, set the bit to 1
-		for neighbor in out_neighbors
-			push!(I, neighbor)
-			push!(V, true)
-		end
-		
-		# create sparse bit vector of size n
-		bitvector = sparsevec(I, V, n)
-		push!(vertex_bitvectors, (v, bitvector))
-	end
-	
-	# sort vertices by their sparse bit vectors in lexicographic order
-	# optimized comparison function for sparse bit vectors
-	function lex_compare(bv1::SparseVector{Bool, T}, bv2::SparseVector{Bool, T})
-		# get sorted unique indices from both vectors
-		all_indices = sort(union(bv1.nzind, bv2.nzind))
-		
-		# compare only at positions where at least one vector has a 1
-		for i in all_indices
-			val1 = i in bv1.nzind
-			val2 = i in bv2.nzind
-			if val1 != val2
-				# false < true
-				return val1 < val2
-			end
-		end
-		# equal vectors
-		return false
-	end
-	
-	sort!(vertex_bitvectors, by=x->x[2], lt=lex_compare)
-	
-	# create the mapping dictionary: old_id -> new_id
-	for (new_id, (old_id, _)) in enumerate(vertex_bitvectors)
-		vertex_mapping[old_id] = convert(T, new_id)
-	end
-	
-	return vertex_mapping
 end
 
 end # module Graph
