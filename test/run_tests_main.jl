@@ -29,8 +29,10 @@ using Adjacently
 using Adjacently.IO: load_adjacency_list_from_csv, load_graph_from_pajek, BitWriter, BitReader, 
 read_bits, flush_bitwriter, write_bit, read_bit
 
-using Adjacently.Graph: get_core, get_reverse_graph, get_basic_stats, relabel_graph, relabel_vertices,
+using Adjacently.Graph: get_core, get_reverse_graph, get_basic_stats,
 get_out_degrees, get_in_degrees, get_in_out_degrees, get_neighbor_lists
+
+using Adjacently.Relabeling: relabel_graph, relabel_vertices
 
 using Adjacently.MGS: write_mgs3_graph, write_compressed_mgs3_graph, load_mgs3_graph, load_compressed_mgs3_graph
 

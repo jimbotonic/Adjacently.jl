@@ -27,7 +27,8 @@ using ..Compression: huffman_encoding, get_huffman_codes!, decode_huffman_values
 	write_golomb, read_golomb, write_fibonacci, read_fibonacci,
 	write_zeta, read_zeta, write_compressed_graph_data, read_compressed_graph_data
 
-using ..Graph: get_basic_stats, get_in_out_degrees, get_out_degrees, relabel_vertices, relabel_graph
+using ..Graph: get_basic_stats, get_in_out_degrees, get_out_degrees
+using ..Relabeling: relabel_vertices, relabel_graph
 using ..Constants: GOLOMB_BASE, ZETA_BASE
 
 # constants
