@@ -11,6 +11,7 @@ using Logging
 using Adjacently.MGS: write_compressed_mgs3_graph, load_compressed_mgs3_graph
 using Adjacently.IO: load_adjacency_list_from_csv, BitWriter, write_value, flush_bitwriter
 using Adjacently.Compression: write_compressed_graph_data
+using Adjacently.Graph: relabel_vertices, relabel_graph
 
 @testset "WebGraph CNR-2000 Config D - Mix Mode + Reference" begin
     # Enable debug-level logging for detailed trace
@@ -42,8 +43,15 @@ using Adjacently.Compression: write_compressed_graph_data
     
     original_vertices = nv(original_graph)
     original_edges = ne(original_graph)
-    
     @info "  Loaded graph: $original_vertices vertices, $original_edges edges"
+
+    # Apply lexicographic reordering before encoding
+    @info "Step 1b: Applying lexicographic relabeling (WebGraph-style)"
+    mapping = relabel_vertices(original_graph, :lexicographic)
+    reordered_graph = relabel_graph(original_graph, mapping)
+    reordered_vertices = nv(reordered_graph)
+    reordered_edges = ne(reordered_graph)
+    @info "  Reordered graph: $reordered_vertices vertices, $reordered_edges edges (unchanged counts)"
     
     # Create output directory
     mkpath(output_dir)
@@ -57,7 +65,7 @@ using Adjacently.Compression: write_compressed_graph_data
     description = "Whole graph with zeta + mix-mode + reference + children"
     suffix = "whole_mix_ref"
     
-    @info "  Using whole graph: $original_vertices vertices, $original_edges edges"
+    @info "  Using lexicographically reordered graph: $reordered_vertices vertices, $reordered_edges edges"
     @info "  Compressing with zeta + mix-mode + reference + children..."
     
     output_path = joinpath(output_dir, output_file * "_" * suffix)
@@ -70,7 +78,7 @@ using Adjacently.Compression: write_compressed_graph_data
     try
         compression_time = @elapsed begin
             # Use modified MGS3 writer with specific parameters
-            write_compressed_mgs3_graph(original_graph, output_path, :children, :zeta, use_mix_mode, use_reference)
+            write_compressed_mgs3_graph(reordered_graph, output_path, :children, :zeta, use_mix_mode, use_reference)
         end
         compression_success = true
         @info "  [PASS] Compression completed successfully in $(round(compression_time, digits=3))s"
@@ -84,8 +92,8 @@ using Adjacently.Compression: write_compressed_graph_data
     
     # Get file statistics
     file_size = filesize(output_path_with_ext)
-    bits_per_vertex = (file_size * 8) / original_vertices
-    bits_per_edge = (file_size * 8) / original_edges
+    bits_per_vertex = (file_size * 8) / reordered_vertices
+    bits_per_edge = (file_size * 8) / reordered_edges
     
     @info "  Compression Results:"
     @info "    File: $(basename(output_path_with_ext))"
@@ -136,19 +144,19 @@ using Adjacently.Compression: write_compressed_graph_data
         loaded_vertices = nv(loaded_graph)
         loaded_edges = ne(loaded_graph)
         
-        @test loaded_vertices == original_vertices
-        @test loaded_edges == original_edges
+        @test loaded_vertices == reordered_vertices
+        @test loaded_edges == reordered_edges
         
         # Quick integrity check (sample-based for large graphs)
-        sample_size = min(1000, original_vertices)
-        sample_vertices = rand(1:original_vertices, sample_size)
+        sample_size = min(1000, reordered_vertices)
+        sample_vertices = rand(1:reordered_vertices, sample_size)
         
         integrity_check = true
         mismatch_count = 0
         
         for v in sample_vertices
-            if v <= original_vertices && v <= nv(original_graph) && v <= nv(loaded_graph)
-                original_neighbors = sort(collect(outneighbors(original_graph, v)))
+            if v <= reordered_vertices && v <= nv(reordered_graph) && v <= nv(loaded_graph)
+                original_neighbors = sort(collect(outneighbors(reordered_graph, v)))
                 loaded_neighbors = sort(collect(outneighbors(loaded_graph, v)))
                 
                 if original_neighbors != loaded_neighbors
@@ -202,6 +210,11 @@ using Adjacently.Compression: write_compressed_graph_data
         @info "  Decompression time: $(round(decompression_time, digits=3))s"
         @info "  Total time: $(round(compression_time + decompression_time, digits=3))s"
     end
+    
+    # Final compression stats
+    @info "  Compression Stats (final):"
+    @info "  Bits per vertex: $(round(bits_per_vertex, digits=3))"
+    @info "  Bits per edge:   $(round(bits_per_edge, digits=3))"
     
     @info "\n  DEBUGGING RECOMMENDATIONS:"
     @info "1. Create a minimal test case with vertices 170-180 to isolate the issue"

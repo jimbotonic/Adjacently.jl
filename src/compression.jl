@@ -19,8 +19,13 @@ using DataStructures
 using SparseArrays
 using ..NodeTypes: Node, EmptyNode, AbstractNode
 using ..CustomTypes: UInt24, UInt40
-using ..IO: BitWriter, BitReader, write_bit, write_bits, read_bit, read_bits, peek_bit, flush, write_value, read_value, flush_bitwriter
-using ..Constants: FIB_NUMBERS, BUFFER_SIZE, ZETA_H_BOUNDS, ZETA_POWER_BASES, ZETA_BASE, GOLOMB_BASE, REF_ENCODING_TH, REF_V_MIN_DEGREE
+
+using ..IO: BitWriter, BitReader, write_bit, write_bits, read_bit, read_bits, peek_bit, 
+flush, write_value, read_value, flush_bitwriter
+
+using ..Constants: FIB_NUMBERS, BUFFER_SIZE, ZETA_H_BOUNDS, ZETA_POWER_BASES, ZETA_BASE, 
+GOLOMB_BASE, REF_ENCODING_TH, REF_V_MIN_DEGREE, FED_BLOCK_SIZE
+
 using ..Index
 
 # Export the functions we want to make available
@@ -47,6 +52,8 @@ export write_unary_coding,
        read_fibonacci,
        write_zeta,
        read_zeta,
+       write_fed,
+       read_fed,
        write_run_length_delta,
        read_run_length_delta,
        write_compressed_graph_data,
@@ -186,7 +193,7 @@ Write a value to the bitwriter using the specified compression code.
 
 @param w::BitWriter: the bitwriter
 @param value::T: the value to write
-@param compression::Symbol: the compression coding to use (:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta)
+@param compression::Symbol: the compression coding to use (:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta, :fed)
 """
 function write_encoded_value(w::BitWriter, value::T, compression::Symbol) where {T<:Unsigned}
     if compression == :elias_gamma
@@ -199,6 +206,8 @@ function write_encoded_value(w::BitWriter, value::T, compression::Symbol) where 
         write_fibonacci(w, value)
     elseif compression == :zeta
         write_zeta(w, value, ZETA_BASE)
+    elseif compression == :fed
+        write_fed(w, value, FED_BLOCK_SIZE)
     else
         throw(ArgumentError("Invalid compression code: $compression"))
     end
@@ -210,7 +219,7 @@ end
 Read a value from the bitreader using the specified compression code.
 
 @param r::BitReader: the bitreader
-@param compression::Symbol: the compression coding to use (:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta)
+@param compression::Symbol: the compression coding to use (:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta, :fed)
 @param T::Type: the type to return (default: UInt8)
 @return::T: the decoded value
 """
@@ -225,6 +234,8 @@ function read_encoded_value(r::BitReader, compression::Symbol, ::Type{T}=UInt8) 
         return read_fibonacci(r, T)
     elseif compression == :zeta
         return read_zeta(r, ZETA_BASE, T)
+    elseif compression == :fed
+        return read_fed(r, T, FED_BLOCK_SIZE)
     else
         throw(ArgumentError("Invalid compression code: $compression"))
     end
@@ -237,7 +248,7 @@ Get what a value would be after encoding and then decoding through a compression
 This is useful for comparing stop values with encoded stream values.
 
 @param value::T: the value to encode/decode
-@param compression::Symbol: the compression coding to use (:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta)
+@param compression::Symbol: the compression coding to use (:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta, :fed)
 @param T::Type: the type to return (default: UInt8)
 @return::T: the value as it would appear after encoding/decoding
 """
@@ -955,6 +966,72 @@ function read_zeta(r::BitReader, k::Int, ::Type{T}=UInt8) where {T<:Unsigned}
     end
     
     return T(result_u64)
+end
+
+################################################################################
+# Fibonacci+Elias Delta Hybrid
+################################################################################
+
+"""
+    write_fed(w::BitWriter, v::T, block_size::Int=FED_BLOCK_SIZE) where {T<:Unsigned}
+
+Write a Fibonacci+Elias Delta hybrid code for value `v`.
+
+Block-Based Fibonacci with Elias Delta Prefix (Hybrid Scheme):
+- For a number N, compute q = floor(N/B) (block index) and r = N mod B (offset within block)
+- Encode q using Elias delta code (efficient for large values)
+- Encode r using Fibonacci code (fixed upper bound, short codes for small values)
+
+@param w::BitWriter: the bitwriter
+@param v::T: the value to encode (must be > 0)
+@param block_size::Int: the block size B (default: FED_BLOCK_SIZE)
+"""
+function write_fed(w::BitWriter, v::T, block_size::Int=FED_BLOCK_SIZE) where {T<:Unsigned}
+    v == 0 && throw(ArgumentError("FED encoding is undefined for 0"))
+    block_size <= 0 && throw(ArgumentError("Block size must be > 0"))
+    
+    # Compute block index and offset
+    q = div(v, block_size)  # block index
+    r = v % block_size      # offset within block
+    
+    # Encode block index q using Elias delta
+    # Note: If q == 0, we still need to encode it (Elias delta handles values ≥ 1)
+    write_elias_delta(w, T(q + 1))  # shift by 1 since Elias delta requires v ≥ 1
+    
+    # Encode offset r using Fibonacci
+    # Note: If r == 0, we need to handle it (Fibonacci requires v ≥ 1)
+    write_fibonacci(w, T(r + 1))    # shift by 1 since Fibonacci requires v ≥ 1
+end
+
+"""
+    read_fed(r::BitReader, ::Type{T}=UInt8, block_size::Int=FED_BLOCK_SIZE) where {T<:Unsigned}
+
+Read a Fibonacci+Elias Delta hybrid code from the bit reader.
+
+Block-Based Fibonacci with Elias Delta Prefix (Hybrid Scheme):
+- First decode block index q from Elias delta code
+- Then decode offset r from Fibonacci code  
+- Return N = q * B + r where B is the block size
+
+@param r::BitReader: the bit reader
+@param T::Type: the type to return (default: UInt8)
+@param block_size::Int: the block size B (default: FED_BLOCK_SIZE)
+@return::T: the decoded value
+"""
+function read_fed(r::BitReader, ::Type{T}=UInt8, block_size::Int=FED_BLOCK_SIZE) where {T<:Unsigned}
+    block_size <= 0 && throw(ArgumentError("Block size must be > 0"))
+    
+    # Decode block index q from Elias delta
+    q = read_elias_delta(r, T) - T(1)  # unshift (we added 1 during encoding)
+    
+    # Decode offset r from Fibonacci
+    r = read_fibonacci(r, T) - T(1)    # unshift (we added 1 during encoding)
+    
+    # Reconstruct original value: N = q * block_size + r
+    # Use explicit type conversion to avoid promotion issues with custom types like UInt24
+    result = T(UInt64(q) * UInt64(block_size) + UInt64(r))
+    
+    return result
 end
 
 ################################################################################
