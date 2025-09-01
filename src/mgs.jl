@@ -604,6 +604,9 @@ Parameters:
 - g: Input graph
 - filename: Output filename
 - encoding: Coding scheme (:children for children section only, :index for index+children sections)
+- compression: Compression scheme to use (default: :elias_delta)
+- use_mix_mode: Whether to use mix mode (default: true)
+- reference_enabled: Whether to enable reference encoding (default: true)
 
 @returns nothing
 """
@@ -956,7 +959,9 @@ Parameters:
 - graph_type: Graph type (:directed or :undirected)
 - encoding: Coding scheme (:children or :index)
 - gs: Number of vertices
-- compression: Compression scheme (:elias_delta, :fibonacci, :zeta)
+- compression: Compression scheme (:elias_delta, :fibonacci, :zeta, :fed)
+- use_mix_mode: Whether to use mix mode (default: true)
+- reference_enabled: Whether to enable reference encoding (default: true)
 
 @returns a graph loaded with the compression scheme specified in the header.
 """

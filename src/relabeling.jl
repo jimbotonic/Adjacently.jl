@@ -21,7 +21,7 @@ using ..CustomLightGraphs: SimpleDiGraph, SimpleGraph, SimpleEdge
 using ..Graph: get_in_degrees, get_out_degrees, get_in_out_degrees, get_reverse_graph
 using ..PageRank: PR
 
-export relabel_graph, relabel_vertices, relabel_vertices_score, relabel_vertices_lexicographic, relabel_vertices_rcm
+export relabel_graph, relabel_vertices, relabel_vertices_score, relabel_vertices_lexicographic, relabel_vertices_rcm, relabel_vertices_webgraph_lex
 
 """
     relabel_graph(g::AbstractGraph{T}, vertex_mapping::Vector{T}) where {T<:Unsigned}
@@ -79,6 +79,8 @@ Possible RCM criterion:
 function relabel_vertices(g::AbstractGraph{T}, mode::Symbol=:lexicographic, criterion::Symbol=:in_degree) where {T<:Unsigned}
 	if mode == :lexicographic
 		return relabel_vertices_lexicographic(g)
+	elseif mode == :webgraph_lex
+		return relabel_vertices_webgraph_lex(g)
 	elseif mode == :score
 		return relabel_vertices_score(g, criterion)
 	elseif mode == :rcm
@@ -327,6 +329,75 @@ function relabel_vertices_rcm(g::AbstractGraph{T}, criterion::Symbol=:sym) where
     else
         error("Unsupported RCM mode: $criterion. Use :out or :sym")
     end
+end
+
+"""
+    relabel_vertices_webgraph_lex(g::AbstractGraph{T}) where {T<:Unsigned}
+
+WebGraph-style lexicographic relabeling optimized for better compression.
+Uses a more efficient bit-vector comparison that prioritizes compression.
+
+@param g: the graph
+@returns the mapping of the vertices (vertex_id[old_id] -> new_id)
+"""
+function relabel_vertices_webgraph_lex(g::AbstractGraph{T}) where {T<:Unsigned}
+	vs = vertices(g)
+	n = nv(g)
+	vertex_mapping = Dict{T,T}()
+	
+	# Create compact representations optimized for web graph structure
+	vertex_sigs = Vector{Tuple{T, Vector{T}}}()
+	
+	for v in vs
+		# Get out-neighbors, already sorted by vertex ID for web graphs
+		out_neighbors = sort!(collect(outneighbors(g, v)))
+		
+		# For web graphs, shorter neighbor lists often indicate different page types
+		# Priority: empty lists first, then by lexicographic comparison
+		push!(vertex_sigs, (v, out_neighbors))
+	end
+	
+	# Sort with WebGraph-inspired comparison:
+	# 1. Empty neighbor lists first (sinks/leaves)
+	# 2. Length-based grouping for better reference encoding
+	# 3. Lexicographic within groups
+	function webgraph_compare(sig1::Tuple{T, Vector{T}}, sig2::Tuple{T, Vector{T}})
+		_, neighbors1 = sig1
+		_, neighbors2 = sig2
+		
+		# Empty lists first
+		if isempty(neighbors1) && !isempty(neighbors2)
+			return true
+		elseif !isempty(neighbors1) && isempty(neighbors2)
+			return false
+		elseif isempty(neighbors1) && isempty(neighbors2)
+			return false  # equal
+		end
+		
+		# Group by length for better reference window efficiency
+		len1, len2 = length(neighbors1), length(neighbors2)
+		if len1 != len2 && (len1 <= 3 || len2 <= 3)
+			return len1 < len2  # Small lists first for better references
+		end
+		
+		# Lexicographic comparison
+		for i in 1:min(len1, len2)
+			if neighbors1[i] != neighbors2[i]
+				return neighbors1[i] < neighbors2[i]
+			end
+		end
+		
+		return len1 < len2
+	end
+	
+	sort!(vertex_sigs, lt=webgraph_compare)
+	
+	# Create the mapping dictionary: old_id -> new_id
+	for (new_id, (old_id, _)) in enumerate(vertex_sigs)
+		vertex_mapping[old_id] = convert(T, new_id)
+	end
+	
+	return vertex_mapping
 end
 
 end # module
