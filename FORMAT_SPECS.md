@@ -1,133 +1,163 @@
-# Format specifications
+# MGS Graph Compression Format Specification
 
+## Overview
 
-## Version 1
+The MGS (Modified Graph Storage) format compresses directed graphs using multiple encoding techniques:
+- **Delta encoding**: Compress sorted neighbor lists using differences
+- **Hybrid mix-mode encoding**: Adaptively combine delta, run-length, and interval encoding
+- **Reference encoding**: Reuse similar neighbor lists with bitmaps for differences
+- **Multiple encodings**: Elias Gamma/Delta, Golomb, Fibonacci, Zeta, FED (Fibonacci+Elias Delta Hybrid)
 
-1. Reference flag:
+## File Structure
 
-- Write reference flag (reference_enabled flag):
-  - 0: mix encoding only (delta + run-length)
-  - 1: reference encoding + mix encoding
+```
+[Header Section] [Data Section]
+```
 
-2. Index section ? (only added for index mode)
+### Header Section
+- Version identifier
+- Graph metadata (vertices, edges)
+- Encoding parameters
 
-- If :index mode:
-    - For each vertex
-      - Write the out-degree shifted by 1 by using the specified encoding (direct encoding)
+### Data Section Layout
 
-3. Data section
+#### 1. Configuration Flags
+- **Reference flag** (1 bit): 0=hybrid mix only, 1=reference+hybrid mix enabled
 
-- If :index mode (no shift, no stop value):
-    - For each vertex of the graph:
-      - If the children list is not empty
-        - If reference_enabled:
-            - Write children flag (children_flag):
-              - 0: mix encoding
-              - 1: reference encoding
-            - If children_flag is mix encoding:
-                - Sort neighbors
-                - Compute the delta encoding of the neighbors list (no value can be 0)
-                - Write mix mode flag (mix_mode flag):
-                  - 0: delta only
-                  - 1: delta+run-length 
-                - Write the first value based on the specified encoding (direct encoding)
-                - If mix mode is enabled:
-                  - For each child vertex:
-                    - Write the vertex flag (vertex_flag):
-                      - 0: delta encoding
-                      - 1: run-length encoding
-                    - If delta encoding:
-                      - Write the encoded value based on the specified encoding (direct encoding)
-                    - If run-length encoding:
-                      - Write [value: T][length: T] (all values get encoded based on the specified encoding) 
-                - Else (mix mode is disabled):
-                    - For each child vertex:
-                      - Write the delta-encoded value based on the specified encoding (direct encoding)
-            - Else (children_flag is reference encoding)
-              - If reference encoding is relevant:
-                - Write [ref_id T][bitmap_len T][bitmap: N bits][residuals_flag: 1 bit][residuals_len: T?][mix-mode encoded residuals?] (all values get encoded based on the specified encoding)
-              - Else (reference encoding is not relevant):
-                - Use mix mode encoding as specified above
-        - Else (reference is disabled):
-          - Sort neighbors
-          - Compute the delta encoding of the neighbors list (no value can be 0)
-          - Write mix mode flag (mix_mode flag):
-            - 0: delta only
-            - 1: delta+run-length 
-          - Write the first value based on the specified encoding (direct encoding)
-          - If mix mode is enabled:
-            - For each child vertex:
-              - Write the vertex flag (vertex_flag):
-                - 0: delta encoding
-                - 1: run-length encoding
-              - If delta encoding:
-                - Write the delta encoded value based on the specified encoding (direct encoding)
-              - If run-length encoding:
-                - Write [value: T][length: T] (all values get encoded based on the specified encoding) 
-          - Else (mix mode is disabled):
-              - For each child vertex:
-                - Write the delta-encoded value based on the specified encoding (direct encoding)
-- If :children mode:
-    - For each vertex of the graph:
-      - If reference_enabled:
-          - Write children flag (children_flag):
-            - 0: mix encoding
-            - 1: reference encoding
-          - If children_flag is mix encoding:
-              - Sort neighbors
-              - Compute the delta encoding of the neighbors list (all values are >= 1)
-              - Shift all values by 1
-              - Write mix mode flag (mix_mode flag):
-                - 0: delta only
-                - 1: delta+run-length 
-              - If the children list is not empty:
-                - Write the first value based on the specified encoding (direct encoding)
-                - If mix mode is enabled:
-                  - For each child vertex:
-                    - Write the vertex flag (vertex_flag):
-                      - 0: delta encoding
-                      - 1: run-length encoding
-                    - If delta encoding:
-                      - Write the delta encoded value based on the specified encoding (direct encoding)
-                    - If run-length encoding:
-                      - Write [value: T][length: T] (all values get encoded based on the specified encoding)
-                  - Write the vertex flag 0 (delta encoding)
-                  - Write the stop value 
-                - Else (mix mode is disabled):
-                    - For each child vertex:
-                      - Write the delta encoded value based on the specified encoding (direct encoding)
-                      - Write the stop value
-              - Else (children list is empty):
-                - Write the stop value (mix-mode flag was assumed to be set to 0)
-          - Else (children_flag is reference encoding):
-            - If reference encoding is relevant:
-              - Write [ref_id T][bitmap_len T][bitmap: N bits][residuals_flag: 1 bit][mix-mode encoded residuals shifted by 1?] (note the slightly different format as compared to index mode)
-              - Write the stop value
-            - Else (reference encoding is not relevant):
-              - Use mix mode encoding as specified above
-      - If reference is disabled:
-        - Sort neighbors
-        - Compute the delta encoding of the neighbors list (no value can be 0)
-        - Write mix mode flag (mix_mode flag):
-          - 0: delta only
-          - 1: delta+run-length 
-        - Shift all values by 1
-        - If the children list is not empty:
-          - Write the first value based on the specified encoding (direct encoding)
-          - If mix mode is enabled:
-            - For each child vertex:
-              - Write the vertex flag (vertex_flag):
-                - 0: delta encoding
-                - 1: run-length encoding
-              - If delta encoding:
-                - Write the delta encoded value (direct encoding)
-              - If run-length encoding:
-                - Write [value: T][length: T] (all values get encoded based on the specified encoding) 
-            - Write the vertex flag 0 (delta encoding)
-            - Write the stop value 
-          - If mix mode is disabled:
-              - For each child vertex:
-                - Write the delta encoded value based on the specified encoding (direct encoding)
-              - Write the stop value
-        - Else (children list is empty):
-          - Write the stop value (mix-mode flag was assumed to be set to 0)
+#### 2. Index Section (`:index` mode only)
+For each vertex:
+- Out-degree encoded with specified encoding (shifted by +1 to avoid 0)
+
+#### 3. Neighbor Lists
+
+**For each vertex:**
+
+##### With Reference Encoding Enabled:
+```
+children_flag (1 bit): 0=mix, 1=reference
+
+If hybrid mix encoding (children_flag=0):
+  [Hybrid mix-mode encoded neighbors]
+
+If reference encoding (children_flag=1):
+  ref_id (encoded): Reference vertex ID
+  bitmap_len (encoded): Length of difference bitmap  
+  bitmap (N bits): Bit vector of differences from reference
+  residuals_flag (1 bit): 0=no residuals, 1=residuals follow
+  [Traditional mix-mode encoded residuals] (if residuals_flag=1)
+```
+
+##### Without Reference Encoding:
+```
+[Hybrid mix-mode encoded neighbors]
+```
+
+#### 4. Hybrid Mix-Mode Encoding
+
+The hybrid approach adaptively combines delta, run-length, and interval encoding for optimal compression:
+
+```
+use_run_length_and_interval (1 bit): 0=delta only, 1=hybrid sections
+first_value (encoding): First delta value
+
+If delta only (flag=0):
+  For each remaining value:
+    delta_value (encoding): Delta-encoded gap
+  
+If hybrid sections (flag=1):
+  num_sections (encoding): Number of encoding sections
+  
+  For each section:
+    section_flag (1 bit): 0=delta section, 1=advanced section
+    
+    If delta section (section_flag=0):
+      count (encoding): Number of delta values
+      For each value:
+        delta_value (encoding): Delta-encoded gap
+    
+    If advanced section (section_flag=1):
+      second_flag (1 bit): 0=run-length, 1=interval
+      
+      If run-length (second_flag=0):
+        count (encoding): Number of run-length pairs
+        For each pair:
+          gap_value (encoding): Delta gap
+          run_length (encoding): Number of repetitions
+      
+      If interval (second_flag=1):
+        count (encoding): Number of intervals
+        For each interval:
+          start_gap (encoding): Gap to interval start
+          length (encoding): Interval length (adjusted by MIN_INTERVAL_LENGTH)
+```
+
+**Traditional Mix-Mode (for residuals):**
+```
+mix_mode_flag (1 bit): 0=delta only, 1=delta+run-length
+first_neighbor (encoding): First neighbor value
+
+If delta+run-length (mix_mode_flag=1):
+  For each remaining neighbor:
+    vertex_flag (1 bit): 0=delta, 1=run-length
+    If delta: gap_value (encoding)
+    If run-length: [gap_value (encoding)] [repeat_count (encoding)]
+  
+If delta only (mix_mode_flag=0):
+  For each remaining neighbor:
+    gap_value (encoding)
+```
+
+#### 5. Mode-Specific Details
+
+**Index Mode (`:index`)**:
+- No value shifting required
+- No stop values needed
+- Empty neighbor lists encoded implicitly via index
+
+**Children Mode (`:children`)**:
+- All gap values shifted by +1 before encoding (to avoid 0)
+- Stop value written after each neighbor list
+- Empty neighbor lists get stop value only
+
+## Encoding Methods
+
+| Method | Description | Use Case |
+|--------|-------------|----------|
+| `elias_gamma` | γ(n) = unary(⌊log₂(n)⌋+1) + binary(n-2^⌊log₂(n)⌋) | Small integers |
+| `elias_delta` | δ(n) = γ(⌊log₂(n)⌋+1) + binary(n-2^⌊log₂(n)⌋) | Medium integers |
+| `golomb` | Base-64 Golomb coding | Geometric distributions |
+| `fibonacci` | Fibonacci sequence representation | Varied distributions |
+| `zeta` | ζ_k(n) with parameter k=4 | Power-law distributions |
+| `fed` | Block-based Fibonacci+Elias Delta hybrid | Large value ranges |
+
+## Constants
+
+```julia
+REF_WINDOW_SIZE = 7           # Reference window size
+MAX_REF_COUNT = 3             # Max references per vertex
+MIN_INTERVAL_LENGTH = 4       # Min consecutive neighbors for intervals
+FED_BLOCK_SIZE = 64           # FED encoding block size
+REF_ENCODING_TH = 3           # Minimum overlap threshold for reference encoding
+REF_V_MIN_DEGREE = 4          # Minimum degree for reference candidate vertices
+```
+
+## Hybrid Encoding Algorithm
+
+The hybrid mix-mode encoding automatically selects the best encoding method for each section of delta values:
+
+1. **Pattern Analysis**: Analyze delta sequences for:
+   - Consecutive runs of identical values (run-length opportunities)
+   - Consecutive integer sequences of length ≥ MIN_INTERVAL_LENGTH (interval opportunities)
+   - Remaining irregular deltas (delta encoding)
+
+2. **Adaptive Sectioning**: Group similar patterns into sections:
+   - Delta sections: Irregular gap values
+   - Run-length sections: Repeated gap values
+   - Interval sections: Consecutive neighbor ranges
+
+3. **Optimal Selection**: Choose encoding per section based on:
+   - Delta: Standard gap encoding
+   - Run-length: Gap + repetition count (efficient for social graphs)
+   - Interval: Start + length (efficient for grid/mesh graphs)
+
+This adaptive approach maximizes compression for diverse graph topologies while maintaining format compatibility.
