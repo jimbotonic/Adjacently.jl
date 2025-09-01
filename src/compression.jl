@@ -24,7 +24,7 @@ using ..IO: BitWriter, BitReader, write_bit, write_bits, read_bit, read_bits, pe
 flush, write_value, read_value, flush_bitwriter
 
 using ..Constants: FIB_NUMBERS, BUFFER_SIZE, ZETA_H_BOUNDS, ZETA_POWER_BASES, ZETA_BASE, 
-GOLOMB_BASE, REF_ENCODING_TH, REF_V_MIN_DEGREE, FED_BLOCK_SIZE
+GOLOMB_BASE, REF_ENCODING_TH, REF_V_MIN_DEGREE, FED_BLOCK_SIZE, MIN_INTERVAL_LENGTH
 
 using ..Index
 
@@ -56,6 +56,9 @@ export write_unary_coding,
        read_fed,
        write_run_length_delta,
        read_run_length_delta,
+       compress_intervals,
+       write_intervals_and_residuals,
+       read_intervals_and_residuals,
        write_compressed_graph_data,
        read_compressed_graph_data
 
@@ -1035,6 +1038,131 @@ function read_fed(r::BitReader, ::Type{T}=UInt8, block_size::Int=FED_BLOCK_SIZE)
 end
 
 ################################################################################
+# Interval compression (WebGraph-style)
+################################################################################
+
+"""
+    compress_intervals(neighbors::Vector{T}, min_interval_length::Int=4) where {T<:Unsigned}
+
+Compress consecutive neighbor ranges as intervals (WebGraph-style).
+Returns (intervals, residuals) where intervals are consecutive ranges ≥ min_interval_length.
+
+@param neighbors::Vector{T}: sorted list of neighbors
+@param min_interval_length::Int: minimum length for interval compression (default: 4)
+@return: (intervals, residuals) - intervals as [(start,length)], residuals as remaining values
+"""
+function compress_intervals(neighbors::Vector{T}, min_interval_length::Int=4) where {T<:Unsigned}
+    isempty(neighbors) && return (Tuple{T,T}[], T[])
+    
+    intervals = Tuple{T,T}[]  # (start, length)
+    residuals = T[]
+    i = 1
+    
+    while i <= length(neighbors)
+        # Check for consecutive sequence starting at i
+        consecutive_len = 1
+        while i + consecutive_len <= length(neighbors) && 
+              neighbors[i + consecutive_len] == neighbors[i] + T(consecutive_len)
+            consecutive_len += 1
+        end
+        
+        if consecutive_len >= min_interval_length
+            # Create interval: (start, length)
+            push!(intervals, (neighbors[i], T(consecutive_len)))
+            i += consecutive_len
+        else
+            # Add to residuals
+            for j in 0:(consecutive_len-1)
+                push!(residuals, neighbors[i + j])
+            end
+            i += consecutive_len
+        end
+    end
+    
+    return (intervals, residuals)
+end
+
+"""
+    write_intervals_and_residuals(w::BitWriter, neighbors::Vector{T}, encoding::Symbol, min_interval_length::Int=4) where {T<:Unsigned}
+
+Write neighbor list using interval compression + residual encoding.
+
+@param w::BitWriter: the bitwriter
+@param neighbors::Vector{T}: sorted list of neighbors  
+@param encoding::Symbol: encoding for residuals
+@param min_interval_length::Int: minimum interval length
+"""
+function write_intervals_and_residuals(w::BitWriter, neighbors::Vector{T}, encoding::Symbol, min_interval_length::Int=4) where {T<:Unsigned}
+    isempty(neighbors) && return
+    
+    intervals, residuals = compress_intervals(neighbors, min_interval_length)
+    
+    # Write number of intervals (add 1 to avoid 0 with elias_gamma)
+    write_encoded_value(w, T(length(intervals)) + T(1), :elias_gamma)
+    
+    # Write intervals: (start, length) pairs with delta encoding
+    if !isempty(intervals)
+        prev_start = T(0)
+        for (start, length) in intervals
+            # Delta encode start positions
+            write_encoded_value(w, start - prev_start, encoding)
+            # Encode interval length (already >= min_interval_length, add 1 to avoid 0)
+            write_encoded_value(w, length - T(min_interval_length) + T(1), encoding)
+            prev_start = start
+        end
+    end
+    
+    # Write residuals with delta encoding
+    if !isempty(residuals)
+        write_delta(w, residuals, encoding)
+    end
+end
+
+"""
+    read_intervals_and_residuals(r::BitReader, encoding::Symbol, min_interval_length::Int=4, ::Type{T}=UInt8) where {T<:Unsigned}
+
+Read neighbor list from interval compression + residual encoding.
+
+@param r::BitReader: the bitreader
+@param encoding::Symbol: encoding used for residuals
+@param min_interval_length::Int: minimum interval length used
+@param T::Type: the type to return
+@return::Vector{T}: reconstructed neighbor list
+"""
+function read_intervals_and_residuals(r::BitReader, encoding::Symbol, min_interval_length::Int=4, ::Type{T}=UInt8) where {T<:Unsigned}
+    # Read number of intervals (subtract 1)
+    num_intervals = read_encoded_value(r, :elias_gamma, T) - T(1)
+    
+    neighbors = T[]
+    
+    # Read intervals
+    if num_intervals > 0
+        prev_start = T(0)
+        for _ in 1:num_intervals
+            # Read delta-encoded start
+            start_delta = read_encoded_value(r, encoding, T)
+            start = prev_start + start_delta
+            # Read length (subtract 1 and add back min_interval_length)
+            length = read_encoded_value(r, encoding, T) - T(1) + T(min_interval_length)
+            
+            # Reconstruct interval
+            for j in 0:(Int(length)-1)
+                push!(neighbors, start + T(j))
+            end
+            prev_start = start
+        end
+    end
+    
+    # Read residuals
+    residuals = read_delta(r, encoding, T)
+    append!(neighbors, residuals)
+    
+    # Sort the combined result
+    sort!(neighbors)
+    return neighbors
+end
+
+################################################################################
 # Run-length + delta code
 ################################################################################
 
@@ -1332,7 +1460,467 @@ function write_mix_encoded_list(w::BitWriter, delta_list::Vector{T}, encoding::S
 end
 
 """
-    read_formatted_mix_encoded_list(r::BitReader, encoding::Symbol, mode::Symbol, ::Type{T}=UInt8; stop_value::Union{T,Nothing}=nothing, max_elements::Union{Int,Nothing}=nothing) where {T<:Unsigned}
+    write_hybrid_mix_encoded_list(w::BitWriter, delta_list::Vector{T}, encoding::Symbol, use_run_length_and_interval::Bool=true, min_interval_length::Int=MIN_INTERVAL_LENGTH, is_children_mode::Bool=false) where {T<:Unsigned}
+
+Write a delta-encoded list using hybrid mix mode encoding that adaptively combines:
+- Delta encoding for irregular patterns
+- Run-length encoding for repeated delta values  
+- Interval encoding for consecutive sequences (reconstructed from deltas)
+
+The encoding format uses bit flags to indicate section types:
+- 0: Delta section (count + encoded delta values)
+- 1: Section type flag follows
+  - 10: Run-length section (count + value/length pairs)
+  - 11: Interval section (count + start/length pairs)
+
+@param w::BitWriter: the bitwriter
+@param delta_list::Vector{T}: the delta-encoded neighbor list (like write_mix_encoded_list)
+@param encoding::Symbol: the compression coding to use (:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta)
+@param use_run_length_and_interval::Bool: enable hybrid features (default: true)
+@param min_interval_length::Int: minimum length for interval compression (default: MIN_INTERVAL_LENGTH)
+"""
+function write_hybrid_mix_encoded_list(w::BitWriter, delta_list::Vector{T}, encoding::Symbol, use_run_length_and_interval::Bool=true, min_interval_length::Int=MIN_INTERVAL_LENGTH, is_children_mode::Bool=false) where {T<:Unsigned}
+    if isempty(delta_list)
+        error("write_hybrid_mix_encoded_list should not be called with empty lists")
+    end
+    
+    # Decide whether to use hybrid mode for this list
+    hybrid_active = use_run_length_and_interval && length(delta_list) > 1
+    
+    @debug "write_hybrid_mix_encoded_list: list_length=$(length(delta_list)), use_run_length_and_interval=$use_run_length_and_interval, hybrid_active=$hybrid_active"
+
+    # Write hybrid mode flag
+    write_bit(w, hybrid_active)
+    
+    # Write the first value (same as write_mix_encoded_list)
+    write_encoded_value(w, delta_list[1], encoding)
+    
+    if !hybrid_active
+        # Simple delta mode - write remaining values directly like write_mix_encoded_list
+        for i in 2:length(delta_list)
+            write_encoded_value(w, delta_list[i], encoding)
+        end
+        return
+    end
+    
+    # length(delta_list) >= 2 here
+    
+    # Hybrid mode - analyze patterns in remaining delta values (2:end)
+    remaining_deltas = delta_list[2:end]
+    
+    # Reconstruct original neighbors to find intervals. In children mode the
+    # input deltas are shifted by +1, so unshift before reconstruction.
+    local original_neighbors
+    if is_children_mode
+        if length(delta_list) == 0
+            original_neighbors = T[]
+        else
+            unshifted = similar(delta_list)
+            @inbounds begin
+                unshifted[1] = delta_list[1] - one(T)
+                for i in 2:length(delta_list)
+                    unshifted[i] = delta_list[i] - one(T)
+                end
+            end
+            original_neighbors = reconstruct_from_delta(unshifted)
+        end
+    else
+        original_neighbors = reconstruct_from_delta(delta_list)
+    end
+    sections = analyze_delta_patterns_hybrid(remaining_deltas, original_neighbors[2:end], min_interval_length)
+    
+    # Count section types for debugging
+    delta_count = count(s -> s.type == :delta, sections)
+    run_length_count = count(s -> s.type == :run_length, sections) 
+    interval_count = count(s -> s.type == :interval, sections)
+    @debug "  Section summary: total=$(length(sections)), delta=$delta_count, run_length=$run_length_count, interval=$interval_count"
+    
+    # Write number of sections
+    write_encoded_value(w, T(length(sections)), encoding)
+    
+    # Write each section with its type flag
+    for section in sections
+        if section.type == :delta
+            # Delta section: flag=0, count, values
+            write_bit(w, false)
+            write_encoded_value(w, T(length(section.data)), encoding)
+            for val in section.data
+                write_encoded_value(w, val, encoding)
+            end
+        elseif section.type == :run_length
+            # Run-length section: flag=1,0, count, value/length pairs
+            write_bit(w, true)
+            write_bit(w, false)
+            write_encoded_value(w, T(length(section.data) ÷ 2), encoding)  # number of pairs
+            for val in section.data
+                write_encoded_value(w, val, encoding)
+            end
+        elseif section.type == :interval
+            # Interval section: flag=1,1, count, start/length pairs
+            write_bit(w, true)
+            write_bit(w, true)
+            write_encoded_value(w, T(length(section.data) ÷ 2), encoding)  # number of pairs
+            for val in section.data
+                write_encoded_value(w, val, encoding)
+            end
+        end
+    end
+end
+
+"""
+    analyze_delta_patterns_hybrid(delta_values::Vector{T}, original_neighbors::Vector{T}, min_interval_length::Int=MIN_INTERVAL_LENGTH) where {T<:Unsigned}
+
+Analyze delta values (from position 2 onwards) to determine optimal hybrid encoding sections.
+Uses original neighbors to detect intervals, then creates appropriate sections.
+Returns a vector of encoding sections, each with a type (:delta, :run_length, :interval) and data.
+"""
+function analyze_delta_patterns_hybrid(delta_values::Vector{T}, original_neighbors::Vector{T}, min_interval_length::Int=MIN_INTERVAL_LENGTH) where {T<:Unsigned}
+    if isempty(delta_values)
+        return []
+    end
+    
+    sections = []
+    delta_i = 1  # index into delta_values
+    orig_i = 1   # index into original_neighbors
+    
+    while delta_i <= length(delta_values) && orig_i <= length(original_neighbors)
+        # Check for consecutive interval starting at current position in original neighbors
+        interval_len = find_consecutive_length(original_neighbors, orig_i)
+        
+        if interval_len >= min_interval_length
+            # Create interval section: start and length
+            @debug "  Found interval: start=$(original_neighbors[orig_i]), length=$interval_len at orig_pos=$orig_i"
+            push!(sections, (type=:interval, data=[original_neighbors[orig_i], T(interval_len)]))
+            delta_i += interval_len
+            orig_i += interval_len
+            continue
+        end
+        
+        # No interval found, create delta section for this region
+        delta_start = delta_i
+        delta_end = delta_i
+        orig_end = orig_i
+        
+        # Extend delta section until we find a good interval
+        while orig_end < length(original_neighbors)
+            next_interval_len = find_consecutive_length(original_neighbors, orig_end + 1)
+            if next_interval_len >= min_interval_length
+                break
+            end
+            delta_end += 1
+            orig_end += 1
+        end
+        
+        # Create delta section from the delta values
+        if delta_end >= delta_start && delta_end <= length(delta_values)
+            section_deltas = delta_values[delta_start:delta_end]
+            
+            # Check if delta values have run-length patterns worth encoding
+            run_length_sections = find_run_length_patterns(section_deltas)
+            append!(sections, run_length_sections)
+        end
+        
+        delta_i = delta_end + 1
+        orig_i = orig_end + 1
+    end
+    
+    return sections
+end
+
+"""
+    find_consecutive_length(neighbors::Vector{T}, start::Int) where {T<:Unsigned}
+
+Find the length of consecutive sequence starting at given position.
+Returns the length of the consecutive sequence (1 if no sequence).
+"""
+function find_consecutive_length(neighbors::Vector{T}, start::Int) where {T<:Unsigned}
+    if start > length(neighbors)
+        return 0
+    end
+    
+    len = 1
+    while start + len <= length(neighbors) && 
+          neighbors[start + len] == neighbors[start] + T(len)
+        len += 1
+    end
+    
+    return len
+end
+
+"""
+    find_run_length_patterns(delta_values::Vector{T}) where {T<:Unsigned}
+
+Find run-length patterns in delta values and create appropriate sections.
+Returns a vector of sections (delta or run_length).
+"""
+function find_run_length_patterns(delta_values::Vector{T}) where {T<:Unsigned}
+    sections = []
+    i = 1
+    
+    while i <= length(delta_values)
+        # Count consecutive occurrences
+        current_val = delta_values[i]
+        run_len = 1
+        while i + run_len <= length(delta_values) && 
+              delta_values[i + run_len] == current_val
+            run_len += 1
+        end
+        
+        if run_len >= 3  # Use run-length for 3+ consecutive values
+            @debug "  Found run-length: value=$current_val, length=$run_len at delta_pos=$i"
+            push!(sections, (type=:run_length, data=[current_val, T(run_len)]))
+            i += run_len
+        else
+            # Create delta section - collect individual values until next run
+            delta_start = i
+            delta_end = i
+            
+            # Extend until we find another run-length opportunity
+            while delta_end < length(delta_values)
+                next_run = count_consecutive(delta_values, delta_end + 1)
+                if next_run >= 3
+                    break
+                end
+                delta_end += 1
+            end
+            
+            push!(sections, (type=:delta, data=delta_values[delta_start:delta_end]))
+            i = delta_end + 1
+        end
+    end
+    
+    return sections
+end
+
+"""
+    count_consecutive(values::Vector{T}, start::Int) where {T<:Unsigned}
+
+Count consecutive occurrences of the same value starting at given position.
+"""
+function count_consecutive(values::Vector{T}, start::Int) where {T<:Unsigned}
+    if start > length(values)
+        return 0
+    end
+    
+    count = 1
+    val = values[start]
+    while start + count <= length(values) && values[start + count] == val
+        count += 1
+    end
+    
+    return count
+end
+
+"""
+    read_hybrid_mix_encoded_list(r::BitReader, encoding::Symbol, mode::Symbol, ::Type{T}=UInt8; max_elements::Union{Int,Nothing}=nothing, stop_value::Union{T,Nothing}=nothing) where {T<:Unsigned}
+
+Read a hybrid mix-encoded delta list that matches the write_hybrid_mix_encoded_list format.
+Returns the reconstructed delta-encoded values (like read_mix_encoded_list).
+
+@param r::BitReader: the bitreader
+@param encoding::Symbol: the compression coding used (:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta)
+@param mode::Symbol: the mode (:children or :index)
+@param T::Type: the unsigned integer type to use
+@param max_elements: maximum elements to read (for index mode)
+@param stop_value: stop value to watch for (for children mode)
+@return Vector{T}: the reconstructed delta-encoded list
+"""
+function read_hybrid_mix_encoded_list(r::BitReader, encoding::Symbol, mode::Symbol, ::Type{T}=UInt8; max_elements::Union{Int,Nothing}=nothing, stop_value::Union{T,Nothing}=nothing) where {T<:Unsigned}
+    # Read hybrid mode flag
+    use_run_length_and_interval = read_bit(r)
+    
+    # Read the first value (same as read_mix_encoded_list)
+    first_value = read_encoded_value(r, encoding, T)
+    
+    # Check if first value is the stop value for children mode
+    if stop_value !== nothing && first_value == stop_value
+        return T[]  # Empty list
+    end
+    
+    result = T[first_value]
+    elements_read = 1
+    stop_consumed = false
+    # Track last reconstructed original value on the fly to correctly
+    # expand interval sections and keep bit alignment consistent.
+    shift = mode == :children ? one(T) : zero(T)
+    shift_int = Int(shift)
+    last_original = mode == :children ? (Int(first_value) - shift_int) : Int(first_value)
+    
+    if !use_run_length_and_interval
+        # Simple delta mode - read remaining values directly (same as read_mix_encoded_list)
+        while true
+            if max_elements !== nothing && elements_read >= max_elements
+                break
+            end
+            
+            # In children mode, a trailing stop may be prefixed by a vertex-flag 0.
+            # If we detect it, consume and stop without trying to parse an encoded value.
+            if stop_value !== nothing
+                try
+                    if !peek_bit(r)
+                        _consume_children_trailing_stop(r, encoding, T)
+                        stop_consumed = true
+                        break
+                    end
+                catch e
+                    if isa(e, EOFError) || isa(e, ErrorException)
+                        break
+                    else
+                        rethrow(e)
+                    end
+                end
+            end
+
+            value = read_encoded_value(r, encoding, T)
+            
+            if stop_value !== nothing && value == stop_value
+                stop_consumed = true
+                break
+            end
+            
+            push!(result, value)
+            elements_read += 1
+        end
+        # In children mode, if not yet consumed above, consume trailing stop now.
+        if stop_value !== nothing && !stop_consumed
+            _consume_children_trailing_stop(r, encoding, T)
+            stop_consumed = true
+        end
+        # fall through to common post-processing (unshift + reconstruct)
+    else
+        # Hybrid mode - read sections
+        num_sections = read_encoded_value(r, encoding, T)
+    
+    for i in 1:num_sections
+        section_flag = read_bit(r)
+        
+        if !section_flag
+            # Delta section: flag=0, count, values
+            count = read_encoded_value(r, encoding, T)
+            for j in 1:count
+                if max_elements !== nothing && elements_read >= max_elements
+                    break
+                end
+                
+                value = read_encoded_value(r, encoding, T)
+                push!(result, value)
+                elements_read += 1
+                # update last original using decoded delta (accounting for shift)
+                last_original += (Int(value) - shift_int)
+            end
+            
+        else
+            # Read second flag bit
+            second_flag = read_bit(r)
+            
+            if !second_flag
+                # Run-length section: flag=1,0, count, value/length pairs
+                num_pairs = read_encoded_value(r, encoding, T)
+                
+                for j in 1:num_pairs
+                    value = read_encoded_value(r, encoding, T)
+                    length = read_encoded_value(r, encoding, T)
+                    
+                    # Expand run-length back to individual values and update last_original
+                    for k in 1:length
+                        if max_elements !== nothing && elements_read >= max_elements
+                            break
+                        end
+                        push!(result, value)
+                        elements_read += 1
+                        last_original += (Int(value) - shift_int)
+                    end
+                end
+                
+            else
+                # Interval section: flag=1,1, count, start/length pairs
+                num_pairs = read_encoded_value(r, encoding, T)
+                
+                for j in 1:num_pairs
+                    start = read_encoded_value(r, encoding, T)
+                    length = read_encoded_value(r, encoding, T)
+                    
+                    # First encoded delta to reach the interval start from last_original
+                    if max_elements !== nothing && elements_read >= max_elements
+                        break
+                    end
+                    raw_delta = Int(start) - last_original
+                    if raw_delta < 0
+                        @warn "Interval start before last_original" last_original start elements_read
+                        error("Invalid interval ordering: start < previous original")
+                    end
+                    first_delta = raw_delta + shift_int
+                    push!(result, T(first_delta))
+                    elements_read += 1
+                    last_original = Int(start)
+                    
+                    # Add (length-1) consecutive 1 deltas (encoded with shift in children mode)
+                    for k in 1:(Int(length) - 1)
+                        if max_elements !== nothing && elements_read >= max_elements
+                            break
+                        end
+                        push!(result, T(Int(one(T)) + shift_int))
+                        elements_read += 1
+                        last_original += 1
+                    end
+                end
+            end
+        end
+        
+        if max_elements !== nothing && elements_read >= max_elements
+            break
+        end
+        end
+    end
+    
+    # Consume trailing stop marker in children mode, matching writer behavior
+    # In children mode, the writer may precede the encoded stop value with a
+    # vertex-flag bit depending on the encoding path. Use the generic consumer
+    # to remain aligned regardless of mix/hybrid mode details.
+    if stop_value !== nothing && !stop_consumed
+        _consume_children_trailing_stop(r, encoding, T)
+    end
+    
+    # Apply mode-specific unshifting (reverse of what write function does)
+    if mode == :children && !isempty(result)
+        # the write function applies delta_neighbors .+ T(1) in children mode, 
+        # so we need to reverse this: result .- T(1)
+        result = result .- T(1)
+    end
+    
+    # Reconstruct original values from delta encoding
+    if length(result) <= 1
+        return result
+    end
+    
+    original_list = T[result[1]]
+    for i in 2:length(result)
+        push!(original_list, original_list[end] + result[i])
+    end
+    
+    return original_list
+end
+
+"""
+    reconstruct_from_delta(delta_values::Vector{T}) where {T<:Unsigned}
+
+Reconstruct original values from delta-encoded values.
+"""
+function reconstruct_from_delta(delta_values::Vector{T}) where {T<:Unsigned}
+    if isempty(delta_values)
+        return T[]
+    end
+    
+    result = T[delta_values[1]]
+    for i in 2:length(delta_values)
+        push!(result, result[end] + delta_values[i])
+    end
+    
+    return result
+end
+
+"""
+    read_mix_encoded_list(r::BitReader, encoding::Symbol, mode::Symbol, ::Type{T}=UInt8; stop_value::Union{T,Nothing}=nothing, max_elements::Union{Int,Nothing}=nothing) where {T<:Unsigned}
 
 Read a mix-encoded list that exactly matches the write_mix_encoded_list format.
 This handles proper termination and value reconstruction according to the new format specifications.
@@ -1340,7 +1928,7 @@ This handles proper termination and value reconstruction according to the new fo
 @param max_elements: If provided, stop reading after this many elements have been reconstructed (>= 1 for index mode)
 @param stop_value: If provided, stop reading when this encoded value is encountered in the stream (for children mode)
 """
-function read_formatted_mix_encoded_list(r::BitReader, encoding::Symbol, mode::Symbol, ::Type{T}=UInt8; max_elements::Union{Int,Nothing}=nothing, stop_value::Union{T,Nothing}=nothing) where {T<:Unsigned}
+function read_mix_encoded_list(r::BitReader, encoding::Symbol, mode::Symbol, ::Type{T}=UInt8; max_elements::Union{Int,Nothing}=nothing, stop_value::Union{T,Nothing}=nothing) where {T<:Unsigned}
     # read mix mode flag
     use_mix_mode = read_bit(r)
     
@@ -1496,9 +2084,143 @@ function _consume_children_trailing_stop(r::BitReader, encoding::Symbol, ::Type{
 end
 
 """
+    estimate_reference_encoding_cost(ref_id::T, copy_bitmap::Vector{Bool}, residuals::Vector{T}, encoding::Symbol, mode::Symbol) where {T<:Unsigned}
+
+Estimate the bit cost of encoding a vertex using reference encoding.
+Returns the estimated number of bits required.
+"""
+function estimate_reference_encoding_cost(ref_id::T, copy_bitmap::Vector{Bool}, residuals::Vector{T}, encoding::Symbol, mode::Symbol) where {T<:Unsigned}
+    cost = 0
+    
+    # ref_id cost
+    cost += estimate_encoded_value_cost(T(ref_id), encoding)
+    
+    # bitmap_len cost  
+    cost += estimate_encoded_value_cost(T(length(copy_bitmap)), encoding)
+    
+    # bitmap bits
+    cost += length(copy_bitmap)
+    
+    # residuals_flag
+    cost += 1
+    
+    if !isempty(residuals)
+        # residuals_len for index mode
+        if mode == :index
+            cost += estimate_encoded_value_cost(T(length(residuals)), encoding)
+        end
+        
+        # residuals data (using traditional mix encoding)
+        cost += estimate_mix_encoding_cost(residuals, encoding)
+    end
+    
+    return cost
+end
+
+"""
+    estimate_hybrid_mix_encoding_cost(delta_neighbors::Vector{T}, encoding::Symbol, use_mix_mode::Bool) where {T<:Unsigned}
+
+Estimate the bit cost of encoding a vertex using hybrid mix encoding.
+Returns the estimated number of bits required.
+"""
+function estimate_hybrid_mix_encoding_cost(delta_neighbors::Vector{T}, encoding::Symbol, use_mix_mode::Bool) where {T<:Unsigned}
+    if isempty(delta_neighbors)
+        return 0
+    end
+    
+    cost = 0
+    hybrid_active = use_mix_mode && length(delta_neighbors) > 1
+    
+    # Hybrid mode flag
+    cost += 1
+    
+    # First value
+    cost += estimate_encoded_value_cost(delta_neighbors[1], encoding)
+    
+    if !hybrid_active
+        # Simple delta mode - remaining values
+        for i in 2:length(delta_neighbors)
+            cost += estimate_encoded_value_cost(delta_neighbors[i], encoding)
+        end
+    else
+        # Estimate hybrid sections cost (simplified estimation)
+        remaining_deltas = delta_neighbors[2:end]
+        
+        # Rough estimation: assume mostly delta encoding with some patterns
+        # This could be more sophisticated by actually analyzing patterns
+        
+        # Number of sections (estimated)
+        estimated_sections = max(1, length(remaining_deltas) ÷ 4)  # Rough estimate
+        cost += estimate_encoded_value_cost(T(estimated_sections), encoding)
+        
+        # Section costs (simplified - assume mostly delta sections)
+        for delta in remaining_deltas
+            cost += 1  # section flag
+            cost += estimate_encoded_value_cost(T(1), encoding)  # count
+            cost += estimate_encoded_value_cost(delta, encoding)  # value
+        end
+    end
+    
+    return cost
+end
+
+"""
+    estimate_mix_encoding_cost(values::Vector{T}, encoding::Symbol) where {T<:Unsigned}
+
+Estimate the bit cost of traditional mix encoding.
+"""
+function estimate_mix_encoding_cost(values::Vector{T}, encoding::Symbol) where {T<:Unsigned}
+    if isempty(values)
+        return 1  # mix_mode_flag
+    end
+    
+    cost = 1  # mix_mode_flag
+    cost += estimate_encoded_value_cost(values[1], encoding)  # first value
+    
+    # Simplified: assume delta-only mode for estimation
+    for i in 2:length(values)
+        cost += 1  # vertex_flag
+        cost += estimate_encoded_value_cost(values[i], encoding)
+    end
+    
+    return cost
+end
+
+"""
+    estimate_encoded_value_cost(value::T, encoding::Symbol) where {T<:Unsigned}
+
+Estimate the bit cost of encoding a single value with the given encoding scheme.
+This is a simplified estimation - actual cost depends on bit-level details.
+"""
+function estimate_encoded_value_cost(value::T, encoding::Symbol) where {T<:Unsigned}
+    if value == 0
+        return 1  # Special case
+    end
+    
+    # Rough bit cost estimates for different encodings
+    if encoding == :fibonacci
+        # Fibonacci encoding roughly log_φ(n) + log_φ(n)/φ bits
+        return ceil(Int, log(2, max(1, value)) * 1.44) + 2
+    elseif encoding == :elias_gamma
+        # Elias gamma: 2⌊log₂(n)⌋ + 1 bits  
+        return 2 * floor(Int, log(2, max(1, value))) + 1
+    elseif encoding == :elias_delta
+        # Elias delta: roughly log₂(n) + 2log₂(log₂(n)) bits
+        log_val = max(1, log(2, max(1, value)))
+        return ceil(Int, log_val + 2 * log(2, max(1, log_val)))
+    elseif encoding == :zeta
+        # Zeta coding with k=4: roughly log₄(n) + k bits
+        return ceil(Int, log(4, max(1, value))) + 4
+    else
+        # Default fallback
+        return ceil(Int, log(2, max(1, value))) + 2
+    end
+end
+
+"""
     write_compressed_graph_data(w::BitWriter, neighbor_lists::Dict{T,Vector{T}}, encoding::Symbol, mode::Symbol=:children, use_mix_mode::Bool=true, reference_enabled::Bool=true) where {T<:Unsigned}
 
-Write compressed graph data with mix encoding (delta + run-length) and optional reference encoding.
+Write compressed graph data with hybrid mix encoding (delta + run-length + intervals) and optional reference encoding.
 
 # Format specifications: see FORMAT_SPECS.md
 
@@ -1524,7 +2246,7 @@ function write_compressed_graph_data(w::BitWriter, neighbor_lists::Dict{T,Vector
     # Dense vector mapping for faster lookup (index is stream_id)
     stream_id_to_vertex_vec = T[]
     ref_workspace = nothing
-    
+ 
     if reference_enabled
         @debug "Building StreamingInvertedIndex for reference encoding..."
         index_build_start = time()
@@ -1671,6 +2393,7 @@ function write_compressed_graph_data(w::BitWriter, neighbor_lists::Dict{T,Vector
                 # if fast path fails (e.g., before any available set), fall back to original Set-based filter
                 # TODO: to be removed
                 if best_ref === nothing
+                    @debug "fast path failed, falling back to original Set-based filter"
                     best_ref = find_best_reference(sorted_neighbors, ref_index, stream_id_to_vertex, ref_workspace, potential_references)
                 end
                 if best_ref !== nothing
@@ -1686,53 +2409,91 @@ function write_compressed_graph_data(w::BitWriter, neighbor_lists::Dict{T,Vector
             end
 
             if use_reference
-                # children_flag = 1 (reference mode)
-                write_bit(w, true)
+                # Compare reference encoding cost vs hybrid mix encoding cost
+                ref_cost = estimate_reference_encoding_cost(best_ref, copy_bitmap, residuals, encoding, mode)
+                hybrid_cost = estimate_hybrid_mix_encoding_cost(delta_neighbors, encoding, use_mix_mode)
                 
-                # write reference data
-                write_encoded_value(w, T(best_ref), encoding)  # ref_id
-                write_encoded_value(w, T(length(copy_bitmap)), encoding)  # bitmap_len
-                for bit in copy_bitmap
-                    write_bit(w, bit)
-                end
+                # Choose the more efficient encoding
+                use_reference_final = ref_cost <= hybrid_cost
+                @debug "Encoding comparison: vertex=$v, ref_cost=$ref_cost, hybrid_cost=$hybrid_cost, chosen=$(use_reference_final ? "reference" : "hybrid"), savings=$(abs(ref_cost - hybrid_cost)) bits"
                 
-                # write residuals
-                if !isempty(residuals)
-                    write_bit(w, true)  # residuals_flag = 1
-
-                    # residuals_len need to be written only for index mode
-                    if mode == :index
-                        write_encoded_value(w, T(length(residuals)), encoding)  # residuals_len
-                    end
-                    
-                    # encode residuals with same format as delta encoding
-                    residual_deltas = delta_encode_vector(residuals)
-
-                    # shift residuals by 1 to avoid zeros in children mode
-                    if mode == :children
-                        residual_deltas = residual_deltas .+ T(1)
-                    end
-                    
-                    # write residuals using mix mode
-                    write_mix_encoded_list(w, residual_deltas, encoding, use_mix_mode)
+                if use_reference_final
+                    @debug "CHOICE: Reference encoding chosen: vertex=$v, ref_id=$best_ref, copy_bitmap_len=$(length(copy_bitmap)), residuals_len=$(length(residuals))"
+                    # children_flag = 1 (reference mode)
+                    write_bit(w, true)
                 else
-                    # residuals_flag = 0 (no residuals)
-                    write_bit(w, false)  
+                    # Use hybrid encoding instead of reference
+                    @debug "CHOICE: Hybrid mix encoding chosen over reference: vertex=$v, neighbors_count=$(length(sorted_neighbors))"
+                    # children_flag = 0 (hybrid mix mode)
+                    write_bit(w, false)
+                    # Use hybrid encoding
+                    write_hybrid_mix_encoded_list(w, delta_neighbors, encoding, use_mix_mode)
+                    push!(potential_references, T(v))
+                    available_mask[v] = true
                 end
                 
-                push!(potential_references, T(v))
-                available_mask[v] = true
+                if use_reference_final
+                    # write reference data
+                    write_encoded_value(w, T(best_ref), encoding)  # ref_id
+                    write_encoded_value(w, T(length(copy_bitmap)), encoding)  # bitmap_len
+                    for bit in copy_bitmap
+                        write_bit(w, bit)
+                    end
+                    
+                    # write residuals
+                    if !isempty(residuals)
+                        write_bit(w, true)  # residuals_flag = 1
+
+                        # residuals_len need to be written only for index mode
+                        if mode == :index
+                            write_encoded_value(w, T(length(residuals)), encoding)  # residuals_len
+                        end
+                    
+                        # encode residuals with same format as delta encoding
+                        residual_deltas = delta_encode_vector(residuals)
+
+                        # shift residuals by 1 to avoid zeros in children mode
+                        if mode == :children
+                            residual_deltas = residual_deltas .+ T(1)
+                        end
+                        
+                        # write residuals using mix mode
+                        @debug "writing mix encoded list with use_mix_mode=$use_mix_mode, mode=$mode"
+                        write_mix_encoded_list(w, residual_deltas, encoding, use_mix_mode)
+                    else
+                        # residuals_flag = 0 (no residuals)
+                        write_bit(w, false)  
+                    end
+                    
+                    push!(potential_references, T(v))
+                    available_mask[v] = true
+                end
             # no relevant reference: use mix mode
             else
-                # children_flag = 0 (mix mode)
+                @debug "CHOICE: Hybrid mix encoding (no reference found): vertex=$v, neighbors_count=$(length(sorted_neighbors))"
+                # children_flag = 0 (hybrid mix mode)
                 write_bit(w, false)
-                write_mix_encoded_list(w, delta_neighbors, encoding, use_mix_mode)
+                # delta encode the neighbors
+                delta_neighbors = delta_encode_vector(sorted_neighbors)
+                if mode == :children
+                    delta_neighbors = delta_neighbors .+ T(1)  # shift by 1 to avoid zeros
+                end
+                @debug "writing hybrid mix encoded list with use_mix_mode=$use_mix_mode, MIN_INTERVAL_LENGTH=$MIN_INTERVAL_LENGTH, mode=$mode"
+                # use_mix_mode enables hybrid encoding (run-length + interval)
+                write_hybrid_mix_encoded_list(w, delta_neighbors, encoding, use_mix_mode, MIN_INTERVAL_LENGTH, mode == :children)
                 push!(potential_references, T(v))
                 available_mask[v] = true
             end
-        # reference disabled: mix mode
+        # reference disabled: use hybrid compression method
         else
-            write_mix_encoded_list(w, delta_neighbors, encoding, use_mix_mode)
+            # delta encode the neighbors
+            delta_neighbors = delta_encode_vector(sorted_neighbors)
+            if mode == :children
+                delta_neighbors = delta_neighbors .+ T(1)  # shift by 1 to avoid zeros
+            end
+            @debug "writing hybrid mix encoded list with use_mix_mode=$use_mix_mode, MIN_INTERVAL_LENGTH=$MIN_INTERVAL_LENGTH, mode=$mode"
+            # use_mix_mode enables hybrid encoding (run-length + interval)
+            write_hybrid_mix_encoded_list(w, delta_neighbors, encoding, use_mix_mode, MIN_INTERVAL_LENGTH, mode == :children)
         end
         
         # progress logging
@@ -1767,7 +2528,7 @@ end
 """
     read_compressed_graph_data(r::BitReader, vs::T, encoding::Symbol, mode::Symbol=:children, ::Type{T}=UInt8) where {T<:Unsigned}
 
-Read compressed graph data with mix mode (delta + run-length) and optional reference mode.
+Read compressed graph data with hybrid mix mode (delta + run-length + intervals) and optional reference mode.
 
 # Format specifications: see FORMAT_SPECS.md
 
@@ -1780,6 +2541,7 @@ Read compressed graph data with mix mode (delta + run-length) and optional refer
 """
 function read_compressed_graph_data(r::BitReader, vs::T, encoding::Symbol, mode::Symbol=:children, ::Type{T}=UInt8) where {T<:Unsigned}
     neighbor_lists = Dict{T,Vector{T}}()
+    
     
     # 1. read reference flag  
     reference_enabled = read_bit(r)
@@ -1812,10 +2574,10 @@ function read_compressed_graph_data(r::BitReader, vs::T, encoding::Symbol, mode:
                     if children_flag  # reference mode
                         # read reference data
                         ref_id = read_encoded_value(r, encoding, T)
-                        bitmap_len = Int(read_encoded_value(r, encoding, T))
+                        bitmap_len = read_encoded_value(r, encoding, T)
                         
                         copy_bitmap = Bool[]
-                        for _ in 1:bitmap_len
+                        for _ in 1:Int(bitmap_len)
                             push!(copy_bitmap, read_bit(r))
                         end
                         
@@ -1824,10 +2586,10 @@ function read_compressed_graph_data(r::BitReader, vs::T, encoding::Symbol, mode:
                         
                         if residuals_flag
                             # in index mode, we know the length of the residuals
-                            residuals_len = Int(read_encoded_value(r, encoding, T))
+                            residuals_len = read_encoded_value(r, encoding, T)
                             if residuals_len > 0
                                 # NB: the original values are reconstructed from the delta encoding
-                                residuals = read_formatted_mix_encoded_list(r, encoding, mode, T; max_elements=residuals_len)
+                                residuals = read_mix_encoded_list(r, encoding, mode, T; max_elements=Int(residuals_len))
                             end
                         end
                         
@@ -1838,12 +2600,14 @@ function read_compressed_graph_data(r::BitReader, vs::T, encoding::Symbol, mode:
                         else
                             error("Invalid reference ID: $ref_id")
                         end
-                    else  # mix mode
-                        current_neighbors = read_formatted_mix_encoded_list(r, encoding, mode, T; max_elements=expected_neighbors)
+                    else  # read the appropriate format
+                        # For now, assume hybrid format since that's what we're using in the new version
+                        current_neighbors = read_hybrid_mix_encoded_list(r, encoding, mode, T; max_elements=expected_neighbors)
                     end
                 else
-                    # reference disabled - mix mode
-                    current_neighbors = read_formatted_mix_encoded_list(r, encoding, mode, T; max_elements=expected_neighbors)
+                    # reference disabled - read the appropriate format
+                    # For now, assume hybrid format since that's what we're using in the new version
+                    current_neighbors = read_hybrid_mix_encoded_list(r, encoding, mode, T; max_elements=expected_neighbors)
                 end
                 neighbor_lists[T(v)] = current_neighbors
             end
@@ -1864,10 +2628,10 @@ function read_compressed_graph_data(r::BitReader, vs::T, encoding::Symbol, mode:
                     if children_flag  
                         # read reference data
                         ref_id = read_encoded_value(r, encoding, T)
-                        bitmap_len = Int(read_encoded_value(r, encoding, T))
+                        bitmap_len = read_encoded_value(r, encoding, T)
                         
                         copy_bitmap = Bool[]
-                        for _ in 1:bitmap_len
+                        for _ in 1:Int(bitmap_len)
                             push!(copy_bitmap, read_bit(r))
                         end
                         
@@ -1877,9 +2641,9 @@ function read_compressed_graph_data(r::BitReader, vs::T, encoding::Symbol, mode:
                         # in children mode, residuals are terminated by a stop value
                         if residuals_flag
                             # NB: 
-                            # - the unshifting is done in the read_formatted_mix_encoded_list function
+                            # - the unshifting is done in the read_mix_encoded_list function
                             # - the original values are reconstructed from the delta encoding
-                            residuals = read_formatted_mix_encoded_list(r, encoding, mode, T; stop_value=T(1))
+                            residuals = read_mix_encoded_list(r, encoding, mode, T; stop_value=T(1))
                         end
                         
                         # reconstruct from reference
@@ -1895,14 +2659,18 @@ function read_compressed_graph_data(r::BitReader, vs::T, encoding::Symbol, mode:
                             # Consume exactly one trailing stop marker independent of mix-mode
                             _consume_children_trailing_stop(r, encoding, T)
                         end
-                    # reference mode: mix mode    
+                    # reference mode: read the appropriate format
                     else 
-                        # read until the stop value
-                        current_neighbors = read_formatted_mix_encoded_list(r, encoding, mode, T; stop_value=T(1))
+                        # The writer used either write_mix_encoded_list or write_hybrid_mix_encoded_list
+                        # Both start with a flag, but we need to determine which format to use
+                        # For now, assume hybrid format since that's what we're using in the new version
+                        current_neighbors = read_hybrid_mix_encoded_list(r, encoding, mode, T; stop_value=T(1))
                     end
-                # reference disabled: mix mode
+                # reference disabled: read the appropriate format  
                 else
-                    current_neighbors = read_formatted_mix_encoded_list(r, encoding, mode, T; stop_value=T(1))
+                    # The writer used either write_mix_encoded_list or write_hybrid_mix_encoded_list
+                    # For now, assume hybrid format since that's what we're using in the new version
+                    current_neighbors = read_hybrid_mix_encoded_list(r, encoding, mode, T; stop_value=T(1))
                 end
                 
                 # successfully read vertex data
@@ -1919,7 +2687,7 @@ function read_compressed_graph_data(r::BitReader, vs::T, encoding::Symbol, mode:
                     rethrow(e)
                 end
             end 
-            # NB: stop values are consumed by read_formatted_mix_encoded_list when stop_value parameter is provided
+            # NB: stop values are consumed by read_mix_encoded_list when stop_value parameter is provided
         end
     end
     
