@@ -27,7 +27,7 @@ end
 const FED_BLOCK_SIZE::Int = 64
 
 # Compression parameters
-const REF_WINDOW_SIZE::Int = 7         # Reference window size
+const REF_WINDOW_SIZE::Int = 1024      # Reference window size (optimal balance)
 const MAX_REF_COUNT::Int = 3           # Maximum references per node  
 const MIN_INTERVAL_LENGTH::Int = 4     # Minimum length for interval compression
 

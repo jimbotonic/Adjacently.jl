@@ -31,74 +31,123 @@ using ..Graph: get_basic_stats, get_in_out_degrees, get_out_degrees
 using ..Relabeling: relabel_vertices, relabel_graph
 using ..Constants: GOLOMB_BASE, ZETA_BASE
 
-# constants
-# 'MGS' + 0x0300 (major=3, minor=0) 
-# - D0 (directed graph + no compression)
-# - CS0 (coding scheme 0) = 0x00 (data section only + reserved)
-HEADER_MGS3_D0_CS0 = 0x4d475303000000
-# 'MGS' + 0x0300 (major=3, minor=0) 
-# - D0 (directed graph + no compression)
-# - CS1 (coding scheme 1) = 0x10 (index and data sections + reserved)
-HEADER_MGS3_D0_CS1 = 0x4d475303000010
-# 'MGS' + 0x0300 (major=3, minor=0) 
-# - D1 (directed graph 00 + Huffman compression 000001)
-# - CS0 (coding scheme 0) = 0x00 (data section only + reserved)
-HEADER_MGS3_DH_CS0 = 0x4d475303000100
-# 'MGS' + 0x0300 (major=3, minor=0) 
-# - D0 (directed graph 00 + Huffman compression 000001)
-# - CS1 (coding scheme 1) = 0x10 (index and data sections + reserved)
-HEADER_MGS3_DH_CS1 = 0x4d475303000110
-# 'MGS' + 0x0300 (major=3, minor=0) 
-# - D0 (directed graph 00 + Elias gamma compression 000002)
-# - CS0 (coding scheme 0) = 0x00 (data section only + reserved)
-HEADER_MGS3_DEG_CS0 = 0x4d475303000200
-# 'MGS' + 0x0300 (major=3, minor=0) 
-# - D0 (directed graph 00 + Elias gamma compression 000002)
-# - CS1 (coding scheme 1) = 0x10 (index and data sections + reserved)
-HEADER_MGS3_DEG_CS1 = 0x4d475303000210
-# 'MGS' + 0x0300 (major=3, minor=0) 
-# - D0 (directed graph 00 + Elias delta compression 000003)
-# - CS0 (coding scheme 0) = 0x00 (data section only + reserved)
-HEADER_MGS3_DED_CS0 = 0x4d475303000300
-# 'MGS' + 0x0300 (major=3, minor=0) 
-# - D0 (directed graph 00 + Elias delta compression 000003)
-# - CS1 (coding scheme 1) = 0x10 (index and data sections + reserved)
-HEADER_MGS3_DED_CS1 = 0x4d475303000310
-# 'MGS' + 0x0300 (major=3, minor=0) 
-# - D0 (directed graph 00 + Golomb compression 000004)
-# - CS0 (coding scheme 0) = 0x00 (data section only + reserved)
-HEADER_MGS3_DG_CS0 = 0x4d475303000400
-# 'MGS' + 0x0300 (major=3, minor=0) 
-# - D0 (directed graph 00 + Golomb compression 000004)
-# - CS1 (coding scheme 1) = 0x10 (index and data sections + reserved)
-HEADER_MGS3_DG_CS1 = 0x4d475303000410
-# 'MGS' + 0x0300 (major=3, minor=0) 
-# - D0 (directed graph 00 + Fibonacci compression 000005)
-# - CS0 (coding scheme 0) = 0x00 (data section only + reserved)
-HEADER_MGS3_DF_CS0 = 0x4d475303000500
-# 'MGS' + 0x0300 (major=3, minor=0) 
-# - D0 (directed graph 00 + Fibonacci compression 000005)
-# - CS1 (coding scheme 1) = 0x10 (index and data sections + reserved)
-HEADER_MGS3_DF_CS1 = 0x4d475303000510
-# 'MGS' + 0x0300 (major=3, minor=0) 
-# - D0 (directed graph 00 + Zeta compression 000006)
-# - CS0 (coding scheme 0) = 0x00 (data section only + reserved)
-HEADER_MGS3_DZ_CS0 = 0x4d475303000600
-# 'MGS' + 0x0300 (major=3, minor=0) 
-# - D0 (directed graph 00 + Zeta compression 000006)
-# - CS1 (coding scheme 1) = 0x10 (index and data sections + reserved)
-HEADER_MGS3_DZ_CS1 = 0x4d475303000610
-# 'MGS' + 0x0300 (major=3, minor=0) 
-# - D0 (directed graph 00 + Fibonacci+Elias Delta hybrid compression 000007)
-# - CS0 (coding scheme 0) = 0x00 (data section only + reserved)
-HEADER_MGS3_DFED_CS0 = 0x4d475303000700
-# 'MGS' + 0x0300 (major=3, minor=0) 
-# - D0 (directed graph 00 + Fibonacci+Elias Delta hybrid compression 000007)
-# - CS1 (coding scheme 1) = 0x10 (index and data sections + reserved)
-HEADER_MGS3_DFED_CS1 = 0x4d475303000710
+# constants for new header format
+# Header structure: 'MGS' (3 bytes) + major/minor version (2 bytes) + flags (2 bytes) + vertices (5 bytes)
+# 
+# New flag byte structure:
+# Byte 1: graph_type (2 bits) | coding_scheme (2 bits) | integer_encoding (4 bits)  
+# Byte 2: option_flags (8 bits)
+#
+# Graph type constants
+const GRAPH_TYPE_DIRECTED = 0b00
+const GRAPH_TYPE_UNDIRECTED = 0b01
+#
+# Coding scheme constants  
+const CODING_SCHEME_CHILDREN = 0b00
+const CODING_SCHEME_INDEX = 0b01
+#
+# Integer encoding constants (4 bits, values 1-6)
+const INT_ENCODING_ELIAS_GAMMA = 0x1
+const INT_ENCODING_ELIAS_DELTA = 0x2
+const INT_ENCODING_GOLOMB = 0x3
+const INT_ENCODING_FED = 0x4
+const INT_ENCODING_ZETA = 0x5
+const INT_ENCODING_FIBONACCI = 0x6
+#
+# Option flag constants (8 bits)
+const OPTION_NONE = 0b00000000          # no options
+const OPTION_DELTA = 0b00000001         # complex delta encoding only
+const OPTION_MIX = 0b00000011           # complex delta + mix encoding (run-length + interval)
+const OPTION_HYBRID = 0b00000111        # complex delta + mix + reference only
+const OPTION_HYBRID_PLUS = 0b00001111   # complex delta + mix + recursive reference
+const OPTION_HUFFMAN = 0b10000000       # Huffman compression
+
 
 # maximum number of vertices
 MGS_MAX_SIZE = 0xffffffffff
+
+# Helper functions for new header format
+function create_header_flags(graph_type::Symbol, coding_scheme::Symbol, integer_encoding::Symbol, option_flags::UInt8)
+    """Create header flags bytes according to new format."""
+    
+    # Map symbols to constants
+    gt = graph_type == :directed ? GRAPH_TYPE_DIRECTED : GRAPH_TYPE_UNDIRECTED
+    cs = coding_scheme == :children ? CODING_SCHEME_CHILDREN : CODING_SCHEME_INDEX
+    
+    ie = if integer_encoding == :elias_gamma
+        INT_ENCODING_ELIAS_GAMMA
+    elseif integer_encoding == :elias_delta
+        INT_ENCODING_ELIAS_DELTA
+    elseif integer_encoding == :golomb
+        INT_ENCODING_GOLOMB
+    elseif integer_encoding == :fed
+        INT_ENCODING_FED
+    elseif integer_encoding == :zeta
+        INT_ENCODING_ZETA
+    elseif integer_encoding == :fibonacci
+        INT_ENCODING_FIBONACCI
+    else
+        error("Unsupported integer encoding: $integer_encoding")
+    end
+    
+    # Construct byte 1: graph_type (2 bits) | coding_scheme (2 bits) | integer_encoding (4 bits)
+    byte1 = UInt8((gt << 6) | (cs << 4) | ie)
+    
+    # Byte 2 is the option flags
+    byte2 = option_flags
+    
+    return (byte1, byte2)
+end
+
+function decode_header_flags(byte1::UInt8, byte2::UInt8)
+    """Decode header flags bytes according to new format."""
+    
+    # Extract fields from byte 1
+    graph_type_bits = (byte1 >> 6) & 0b11
+    coding_scheme_bits = (byte1 >> 4) & 0b11
+    integer_encoding_bits = byte1 & 0b1111
+    
+    # Map bits back to symbols
+    graph_type = graph_type_bits == GRAPH_TYPE_DIRECTED ? :directed : :undirected
+    coding_scheme = coding_scheme_bits == CODING_SCHEME_CHILDREN ? :children : :index
+    
+    integer_encoding = if integer_encoding_bits == INT_ENCODING_ELIAS_GAMMA
+        :elias_gamma
+    elseif integer_encoding_bits == INT_ENCODING_ELIAS_DELTA
+        :elias_delta
+    elseif integer_encoding_bits == INT_ENCODING_GOLOMB
+        :golomb
+    elseif integer_encoding_bits == INT_ENCODING_FED
+        :fed
+    elseif integer_encoding_bits == INT_ENCODING_ZETA
+        :zeta
+    elseif integer_encoding_bits == INT_ENCODING_FIBONACCI
+        :fibonacci
+    else
+        error("Unknown integer encoding: $integer_encoding_bits")
+    end
+    
+    # Decode option flags
+    option_flags = byte2
+    
+    return (graph_type, coding_scheme, integer_encoding, option_flags)
+end
+
+function get_option_flags(use_mix_mode::Bool, reference_enabled::Bool, recursive_reference::Bool, huffman::Bool=false)
+    """Get option flags based on compression features."""
+    
+    if huffman
+        return OPTION_HUFFMAN
+    elseif recursive_reference && reference_enabled && use_mix_mode
+        return OPTION_HYBRID_PLUS  # delta + mix + recursive reference
+    elseif reference_enabled && use_mix_mode
+        return OPTION_HYBRID       # delta + mix + reference only
+    elseif use_mix_mode
+        return OPTION_MIX          # delta + mix encoding
+    else
+        return OPTION_DELTA        # delta encoding only
+    end
+end
 
 # Export the functions we want to make available
 export write_mgs3_graph, 
@@ -110,9 +159,9 @@ export write_mgs3_graph,
        write_golomb_compressed_mgs3_graph,
 	   write_fibonacci_compressed_mgs3_graph,
 	   write_zeta_compressed_mgs3_graph,
-	   write_mix_encoded_compressed_mgs3_graph,
+	   write_complex_encoded_compressed_mgs3_graph,
 	   load_huffman_compressed_mgs3_graph,
-	   load_mix_encoded_compressed_mgs3_graph
+	   load_complex_encoded_compressed_mgs3_graph
 
 ################################################################################
 # Write uncompressed MGS v3 graph
@@ -159,28 +208,29 @@ function write_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, encodin
 	#  The difference of size should >= 0 
 	diff_size = p_size_t - n_size_t
 
-	if encoding == :children
-		# 'MGS' + 0x0300 + 0x00 (directed graph + no compression) + 0x00 (data section only + reserved)
-		# encoding: data section only with implicit numbering of vertices
-  		version = HEADER_MGS3_D0_CS0
-	elseif encoding == :index
-		# 'MGS' + 0x0300 + 0x00 (directed graph + no compression) + 0x10 (index and data sections + reserved)
-		# encoding: index+data sections with implicit numbering of vertices
-  		version = HEADER_MGS3_D0_CS1
-	end
+	# Create header using new format (uncompressed graph = no options)
+	option_flags = OPTION_NONE  # No compression options for uncompressed graph
+	
+	# We don't have integer encoding for uncompressed graphs, so use elias_delta as default
+	flag_byte1, flag_byte2 = create_header_flags(:directed, encoding, :elias_delta, option_flags)
+	
+	# Construct 12-byte header
+	header_bytes = UInt8[
+		# 'MGS' signature (3 bytes)
+		0x4d, 0x47, 0x53,
+		# Major version = 3, Minor version = 0 (2 bytes)
+		0x03, 0x00,
+		# Flag bytes (2 bytes)
+		flag_byte1, flag_byte2,
+		# Number of vertices (5 bytes, little-endian UInt40)
+		(gs & 0xff), ((gs >> 8) & 0xff), ((gs >> 16) & 0xff), ((gs >> 24) & 0xff), ((gs >> 32) & 0xff)
+	]
 
 	# create the output file (with extension .mgs)
 	f = open(filename * ".mgs", "w")
 	
-	### write header
-	# MGS version + parameters (7 bytes)
-	# NB: reinterpret generates an array of length 8 even if version has a length of 7 bytes
-	bytes = reverse(reinterpret(UInt8, [version]))[2:8]
-	write(f, bytes)
-
-	# write the number of vertices (5 bytes)
-	bytes = reverse(reinterpret(UInt8, [gs]))[4:8]
-	write(f, bytes)
+	### write header (12 bytes total with new format)
+	write(f, header_bytes)
 	
 	# coding scheme: data section only with implicit numbering of vertices
 	if encoding == :children
@@ -380,8 +430,11 @@ Supported encoding schemes:
 - :children
 - :index
 
-Supported compression schemes:
+Supported compression types:
 - :huffman - Huffman coding (default)
+- :complex - complex encoding (delta + mix + reference + recursive reference)
+
+Supported integer encodings:
 - :elias_gamma - Elias gamma coding
 - :elias_delta - Elias delta coding
 - :golomb - Golomb coding
@@ -389,18 +442,26 @@ Supported compression schemes:
 - :zeta - Zeta coding
 - :fed - Fibonacci+Elias Delta hybrid coding
 
+Supported complex encoding options:
+- :delta - delta encoding only
+- :mix - mix encoding (run-length + interval)
+- :hybrid - hybrid encoding (delta + mix + reference only)
+- :hybrid+ - hybrid+ encoding (delta + mix + recursive reference)
+
 @returns nothing
 """
-function write_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, encoding::Symbol=:children, compression::Symbol=:huffman, use_mix_mode::Bool=true, reference_enabled::Bool=true) where {T<:Unsigned}
-	# supported compression schemes
-	supported_schemes = [:huffman, :elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta, :fed]
-	
+function write_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, coding_scheme::Symbol=:children, compression::Symbol=:huffman, integer_encoding::Symbol=:fibonacci, use_mix_mode::Bool=true, reference_enabled::Bool=true, recursive_reference::Bool=true) where {T<:Unsigned}
+	# supported compression
+	supported_compressions = [:huffman, :complex]
+	supported_complex_options = [:delta, :mix, :hybrid, :hybrid_plus]
+	supported_integer_encodings = [:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta, :fed]
+
 	if compression == :huffman
-        write_huffman_compressed_mgs3_graph(g, filename, encoding)
-    elseif compression in supported_schemes
-        write_mix_encoded_compressed_mgs3_graph(g, filename, encoding, compression, use_mix_mode, reference_enabled)
+        write_huffman_compressed_mgs3_graph(g, filename, coding_scheme)
+    elseif compression == :complex
+        write_complex_encoded_compressed_mgs3_graph(g, filename, coding_scheme, integer_encoding, use_mix_mode, reference_enabled, recursive_reference)
     else
-        error("Unsupported compression scheme: $compression. Supported schemes are :huffman, :elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta, :fed")
+        error("Unsupported compression scheme: $compression. Supported schemes are :huffman, :complex")
     end
 end
 
@@ -421,19 +482,7 @@ Parameters:
 @returns nothing
 """
 function write_huffman_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, coding_scheme::Symbol=:children) where {T<:Unsigned}
-	# Header 12 bytes: 
-	# -> version: 'MGS' 3 bytes string
-	# -> major + minor version: 2 bytes
-	# -> flags: 2 bytes
-	#	 * Byte 1 (2 bits + 6 bits):
-	#    	- graph type (2 bits): 			0x0: directed graph | 0x1: undirected graph
-	#	 	- compression scheme (6 bits): 	0x1: Huffman | 0x2: Elias gamma | 0x3: Elias delta | 0x4: Golomb | 0x5: Fibonacci | 0x6: Zeta
-	#	 * Byte 2:
-	#		- coding scheme: 		0x0: data section only | 0x1: index+data section with implicit numbering of vertices
-	#	 	- reserved flags: 		0x0: reserved
-	# -> # vertices: 5 bytes position 
-	#
-	# <'MGS' string 3 bytes> + <16 bits major|minor version> + <flags 2 bytes> + <# vertices 5 bytes>
+	# Header format: see MGS_HEADER.md
 	vs = vertices(g)
 	# number of vertices
 	gs = convert(UInt64, length(vs))
@@ -456,15 +505,23 @@ function write_huffman_compressed_mgs3_graph(g::AbstractGraph{T}, filename::Abst
 	#  The difference of size should >= 0 
 	diff_size = p_size_t - n_size_t
 
-	if coding_scheme == :children
-		# 'MGS' + 0x0300 + 0x01 (directed graph + Huffman compression) + 0x00 (data section only + reserved)
-		# encoding: data section only with implicit numbering of vertices
-  		version = HEADER_MGS3_DH_CS0
-	elseif coding_scheme == :index
-		# 'MGS' + 0x0300 + 0x01 (directed graph + Huffman compression) + 0x10 (index and data sections + reserved)
-		# encoding: index+data sections with implicit numbering of vertices
-  		version = HEADER_MGS3_DH_CS1
-	end
+	# Create header using new format (Huffman uses special option flag)
+	option_flags = OPTION_HUFFMAN  # Huffman compression flag
+	
+	# For Huffman, we still need an integer encoding (doesn't matter since Huffman overrides)
+	flag_byte1, flag_byte2 = create_header_flags(:directed, coding_scheme, :elias_delta, option_flags)
+	
+	# Construct 12-byte header
+	header_bytes = UInt8[
+		# 'MGS' signature (3 bytes)
+		0x4d, 0x47, 0x53,
+		# Major version = 3, Minor version = 0 (2 bytes)
+		0x03, 0x00,
+		# Flag bytes (2 bytes)
+		flag_byte1, flag_byte2,
+		# Number of vertices (5 bytes, little-endian UInt40)
+		(gs & 0xff), ((gs >> 8) & 0xff), ((gs >> 16) & 0xff), ((gs >> 24) & 0xff), ((gs >> 32) & 0xff)
+	]
 
 	# create the output file (with extension .mgz)
 	f = open(filename * ".mgz", "w")
@@ -511,16 +568,9 @@ function write_huffman_compressed_mgs3_graph(g::AbstractGraph{T}, filename::Abst
 	R = Dict{V, BitArray{1}}()
 	[R[value] = key for (key, value) in C]
 
-	@info("writing header section")
-	### write header
-	# MGS version + parameters (7 bytes)
-	# NB: reinterpret generates an array of length 8 even if version has a length of 7 bytes
-	bytes = reverse(reinterpret(UInt8, [version]))[2:8]
-	write(f, bytes)
-
-	# write the number of vertices (5 bytes)
-	bytes = reverse(reinterpret(UInt8, [gs]))[4:8]
-	write(f, bytes)
+	@info("writing header section (new format)")
+	### write header (12 bytes total with new format)
+	write(f, header_bytes)
 	
 	@info("writing frequency section")
 	### write frequency section
@@ -592,13 +642,13 @@ function write_huffman_compressed_mgs3_graph(g::AbstractGraph{T}, filename::Abst
 end
 
 ################################################################################
-# Mix-encoding (delta + run-length) + reference + variable length encoding of MGS v3 graph
+# Complex-encoding (delta + run-length + interval + recursive reference) + variable length encoding of MGS v3 graph
 ################################################################################
 
 """
-    write_mix_encoded_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, coding_scheme::Symbol=:children, compression::Symbol=:elias_delta) where {T<:Unsigned}
+    write_complex_encoded_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, coding_scheme::Symbol=:children, compression::Symbol=:elias_delta) where {T<:Unsigned}
 
-Write graph in a compressed MGS v3 format (Mix-encoding (delta + run-length) + reference + variable length encoding)
+Write graph in a compressed MGS v3 format (Complex-encoding (delta + run-length + interval + recursive reference) + variable length encoding)
 
 Parameters:
 - g: Input graph
@@ -607,23 +657,12 @@ Parameters:
 - compression: Compression scheme to use (default: :elias_delta)
 - use_mix_mode: Whether to use mix mode (default: true)
 - reference_enabled: Whether to enable reference encoding (default: true)
+- recursive_reference: Whether to enable recursive reference encoding (default: true)
 
 @returns nothing
 """
-function write_mix_encoded_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, coding_scheme::Symbol=:children, compression::Symbol=:elias_delta, use_mix_mode::Bool=true, reference_enabled::Bool=true) where {T<:Unsigned}
-	# Header 12 bytes: 
-	# -> version: 'MGS' 3 bytes string
-	# -> major + minor version: 2 bytes
-	# -> flags: 2 bytes
-	#	 * Byte 1 (2 bits + 6 bits):
-	#    	- graph type (2 bits): 			0x0: directed graph | 0x1: undirected graph
-	#	 	- compression scheme (6 bits): 	0x1: Huffman | 0x2: Elias gamma | 0x3: Elias delta | 0x4: Golomb | 0x5: Fibonacci | 0x6: Zeta
-	#	 * Byte 2:
-	#		- coding scheme: 		0x0: data section only | 0x1: index+data section with implicit numbering of vertices
-	#	 	- reserved flags: 		0x0: reserved
-	# -> # vertices: 5 bytes position 
-	#
-	# <'MGS' string 3 bytes> + <16 bits major|minor version> + <flags 2 bytes> + <# vertices 5 bytes>
+function write_complex_encoded_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, coding_scheme::Symbol=:children, integer_encoding::Symbol=:elias_delta, use_mix_mode::Bool=true, reference_enabled::Bool=true, recursive_reference::Bool=true) where {T<:Unsigned}
+	# Header format: see MGS_HEADER.md
 	vs = vertices(g)
 	# number of vertices
 	gs = convert(UInt64, length(vs))
@@ -638,69 +677,26 @@ function write_mix_encoded_compressed_mgs3_graph(g::AbstractGraph{T}, filename::
 	# Get appropriate custom UInt type based on number of bits needed
 	V = infer_uint_custom_type(n_bits_v)
 
-	if compression == :elias_gamma
-		if coding_scheme == :children
-			# 'MGS' + 0x0300 + 0x02 (directed graph + compression) + 0x00 (data section only + reserved)
-			# encoding: data section only with implicit numbering of vertices
-			version = HEADER_MGS3_DEG_CS0
-		elseif coding_scheme == :index
-			# 'MGS' + 0x0300 + 0x02 (directed graph + compression) + 0x10 (index and data sections + reserved)
-			# encoding: index+data sections with implicit numbering of vertices
-			version = HEADER_MGS3_DEG_CS1
-		end
-	elseif compression == :elias_delta
-		if coding_scheme == :children
-			# 'MGS' + 0x0300 + 0x03 (directed graph + compression) + 0x00 (data section only + reserved)
-			# encoding: data section only with implicit numbering of vertices
-			version = HEADER_MGS3_DED_CS0
-		elseif coding_scheme == :index
-			# 'MGS' + 0x0300 + 0x03 (directed graph + compression) + 0x10 (index and data sections + reserved)
-			# encoding: index+data sections with implicit numbering of vertices
-			version = HEADER_MGS3_DED_CS1
-		end
-	elseif compression == :golomb
-		if coding_scheme == :children
-			# 'MGS' + 0x0300 + 0x04 (directed graph + compression) + 0x00 (data section only + reserved)
-			# encoding: data section only with implicit numbering of vertices
-			version = HEADER_MGS3_DG_CS0
-		elseif coding_scheme == :index
-			# 'MGS' + 0x0300 + 0x04 (directed graph + compression) + 0x10 (index and data sections + reserved)
-			# encoding: index+data sections with implicit numbering of vertices
-			version = HEADER_MGS3_DG_CS1
-		end
-	elseif compression == :fibonacci
-		if coding_scheme == :children
-			# 'MGS' + 0x0300 + 0x05 (directed graph + compression) + 0x00 (data section only + reserved)
-			# encoding: data section only with implicit numbering of vertices
-			version = HEADER_MGS3_DF_CS0
-		elseif coding_scheme == :index
-			# 'MGS' + 0x0300 + 0x05 (directed graph + compression) + 0x10 (index and data sections + reserved)
-			# encoding: index+data sections with implicit numbering of vertices
-			version = HEADER_MGS3_DF_CS1
-		end
-	elseif compression == :zeta
-		if coding_scheme == :children
-			# 'MGS' + 0x0300 + 0x06 (directed graph + compression) + 0x00 (data section only + reserved)
-			# encoding: data section only with implicit numbering of vertices
-			version = HEADER_MGS3_DZ_CS0
-		elseif coding_scheme == :index
-			# 'MGS' + 0x0300 + 0x06 (directed graph + compression) + 0x10 (index and data sections + reserved)
-			# encoding: index+data sections with implicit numbering of vertices
-			version = HEADER_MGS3_DZ_CS1
-		end
-	elseif compression == :fed
-		if coding_scheme == :children
-			# 'MGS' + 0x0300 + 0x07 (directed graph + compression) + 0x00 (data section only + reserved)
-			# encoding: data section only with implicit numbering of vertices
-			version = HEADER_MGS3_DFED_CS0
-		elseif coding_scheme == :index
-			# 'MGS' + 0x0300 + 0x07 (directed graph + compression) + 0x10 (index and data sections + reserved)
-			# encoding: index+data sections with implicit numbering of vertices
-			version = HEADER_MGS3_DFED_CS1
-		end
-	else
-		error("Compression scheme not supported")
-	end
+	# Create header using new format
+	# Header: 'MGS' (3 bytes) + major/minor version (2 bytes) + flags (2 bytes) + vertices (5 bytes)
+	
+	# Get option flags based on compression features  
+	option_flags = get_option_flags(use_mix_mode, reference_enabled, recursive_reference)
+	
+	# Create flag bytes using new format
+	flag_byte1, flag_byte2 = create_header_flags(:directed, coding_scheme, integer_encoding, option_flags)
+	
+	# Construct 12-byte header  
+	header_bytes = UInt8[
+		# 'MGS' signature (3 bytes)
+		0x4d, 0x47, 0x53,
+		# Major version = 3, Minor version = 0 (2 bytes)
+		0x03, 0x00,
+		# Flag bytes (2 bytes) 
+		flag_byte1, flag_byte2,
+		# Number of vertices (5 bytes, little-endian UInt40)
+		(gs & 0xff), ((gs >> 8) & 0xff), ((gs >> 16) & 0xff), ((gs >> 24) & 0xff), ((gs >> 32) & 0xff)
+	]
 
 	# create the output file (with extension .mgz)
 	f = open(filename * ".mgz", "w")
@@ -708,16 +704,10 @@ function write_mix_encoded_compressed_mgs3_graph(g::AbstractGraph{T}, filename::
 	# create a bitwriter
 	bw = BitWriter(f)
 
-	@info("writing header section")
-	### write header
-	# MGS version + parameters (7 bytes)
-	# NB: reinterpret generates an array of length 8 even if version has a length of 7 bytes
-	bytes = reverse(reinterpret(UInt8, [version]))[2:8]
-	write_bytes(bw, bytes)
-
-	# write the number of vertices (5 bytes)
-	bytes = reverse(reinterpret(UInt8, [gs]))[4:8]
-	write_bytes(bw, bytes)
+	@info("writing header section (new format)")
+	### write header (12 bytes total)
+	# Write all header bytes at once
+	write_bytes(bw, header_bytes)
 
 	# Build neighbor lists from graph for write_compressed_graph_data
 	neighbor_lists = Dict{V,Vector{V}}()
@@ -729,7 +719,7 @@ function write_mix_encoded_compressed_mgs3_graph(g::AbstractGraph{T}, filename::
 	# Use the comprehensive write_compressed_graph_data function
 	# This handles mix encoding (delta + run-length) with reference encoding
 	@info("writing compressed graph data using write_compressed_graph_data")
-	write_compressed_graph_data(bw, neighbor_lists, compression, coding_scheme, use_mix_mode, reference_enabled)
+	write_compressed_graph_data(bw, neighbor_lists, coding_scheme, integer_encoding, use_mix_mode, reference_enabled, recursive_reference)
 
 	# flush the bitwriter and close the file
 	flush_bitwriter(bw; flush_last_bits=true)
@@ -760,66 +750,43 @@ Supported compression schemes:
 Returns a graph loaded with the compression scheme specified in the header.
 """
 function load_compressed_mgs3_graph(filename::AbstractString)
-	# Header 12 bytes: 
-	# -> version: 'MGS' 3 bytes string
-	# -> major + minor version: 2 bytes
-	# -> flags: 2 bytes
-	#	 * Byte 1 (2 bits + 6 bits):
-	#    	- graph type (2 bits): 			0x0: directed graph | 0x1: undirected graph
-	#	 	- compression scheme (6 bits): 	0x1: Huffman | 0x2: Elias gamma | 0x3: Elias delta | 0x4: Golomb | 0x5: Fibonacci | 0x6: Zeta
-	#	 * Byte 2 (4 bits + 4 bits):
-	#		- coding scheme: 		0x0: data section only | 0x1: index+data section with implicit numbering of vertices
-	#	 	- reserved flags: 		0x0: reserved
-	# -> # vertices: 5 bytes position 
-	#
-	# <'MGS' string 3 bytes> + <16 bits major|minor version> + <flags 2 bytes> + <# vertices 5 bytes>
+	# Header format: see MGS_HEADER.md
 	f = open(filename, "r")
 	
-	# read header
-	version = read(f,5)
-	# major version
-	major_version = version[4]
-	# minor version
-	minor_version = version[5]
-
-	# flags
-	flags = read(f,2)
-	# graph type
-	graph_type = flags[1] >> 6 == 0x0 ? :directed : :undirected
-	# compression scheme
-	compression_scheme = flags[1] & 0x3F
-	# coding scheme
-	encoding = flags[2] >> 4 == 0x0 ? :children : :index
-
-	if compression_scheme == 0x1
-		compression = :huffman
-	elseif compression_scheme == 0x2
-		compression = :elias_gamma
-	elseif compression_scheme == 0x3
-		compression = :elias_delta
-	elseif compression_scheme == 0x4
-		compression = :golomb
-	elseif compression_scheme == 0x5
-		compression = :fibonacci
-	elseif compression_scheme == 0x6
-		compression = :zeta
-	elseif compression_scheme == 0x7
-		compression = :fed
-	else
-		error("Unsupported compression scheme: $compression_scheme. Supported schemes are :huffman, :elias_gamma, :elias_delta, :fibonacci, :zeta, :fed")
+	# read header (12 bytes total with new format)
+	header_bytes = read(f, 12)
+	
+	# Verify MGS signature 
+	if header_bytes[1:3] != [0x4d, 0x47, 0x53]  # 'MGS'
+		error("Invalid MGS file signature")
 	end
-	# number of vertices
-	gs = reinterpret(UInt64, vcat(reverse(read(f,5)),[0x00,0x00,0x00]))[1]
+	
+	# Extract version
+	major_version = header_bytes[4]
+	minor_version = header_bytes[5]
+	
+	# Extract and decode flags (new format)
+	flag_byte1 = header_bytes[6] 
+	flag_byte2 = header_bytes[7]
+	
+	# Decode header flags using new format
+	graph_type, encoding, compression, option_flags = decode_header_flags(flag_byte1, flag_byte2)
+	
+	# Extract number of vertices (5 bytes, little-endian)
+	gs_bytes = header_bytes[8:12]
+	gs = UInt64(gs_bytes[1]) | (UInt64(gs_bytes[2]) << 8) | (UInt64(gs_bytes[3]) << 16) | 
+		 (UInt64(gs_bytes[4]) << 24) | (UInt64(gs_bytes[5]) << 32)
 
 	# supported compression schemes
-	supported_schemes = [:huffman, :elias_gamma, :elias_delta, :fibonacci, :zeta, :fed]
+	supported_schemes = [:elias_gamma, :elias_delta, :golomb, :fed, :zeta, :fibonacci]
 	
-	if compression == :huffman
+	# Check if Huffman is enabled via option flags
+	if (option_flags & OPTION_HUFFMAN) != 0
 		g = load_huffman_compressed_mgs3_graph(f, graph_type, encoding, gs)
 	elseif compression in supported_schemes
-		g = load_mix_encoded_compressed_mgs3_graph(f, graph_type, encoding, gs, compression)
+		g = load_complex_encoded_compressed_mgs3_graph(f, graph_type, encoding, gs, compression)
 	else
-		error("Unsupported compression scheme: $compression. Supported schemes are :huffman, :elias_gamma, :elias_delta, :fibonacci, :zeta, :fed")
+		error("Unsupported compression scheme: $compression. Supported integer encodings are: $(join(supported_schemes, ", "))")
     end
 
 	close(f)
@@ -950,22 +917,22 @@ function load_huffman_compressed_mgs3_graph(io::IO, graph_type::Symbol, encoding
 end
 
 """
-    load_mix_encoded_compressed_mgs3_graph(io::IO, graph_type::Symbol, encoding::Symbol, gs::UInt64, compression::Symbol)
+    load_complex_encoded_compressed_mgs3_graph(io::IO, graph_type::Symbol, encoding::Symbol, gs::UInt64, compression::Symbol)
 
-Load graph in compressed MGS v3 format (Mix-encoding (delta + run-length) + reference + variable length encoding)
+Load graph in compressed MGS v3 format (Complex-encoding (delta + run-length + interval + recursive reference) + variable length encoding)
 
 Parameters:
 - io: Input stream
 - graph_type: Graph type (:directed or :undirected)
-- encoding: Coding scheme (:children or :index)
+- coding_scheme: Coding scheme (:children or :index)
 - gs: Number of vertices
-- compression: Compression scheme (:elias_delta, :fibonacci, :zeta, :fed)
+- integer_encoding: Integer encoding (:elias_delta, :fibonacci, :zeta, :fed)
 - use_mix_mode: Whether to use mix mode (default: true)
 - reference_enabled: Whether to enable reference encoding (default: true)
 
 @returns a graph loaded with the compression scheme specified in the header.
 """
-function load_mix_encoded_compressed_mgs3_graph(io::IO, graph_type::Symbol, encoding::Symbol, gs::UInt64, compression::Symbol)
+function load_complex_encoded_compressed_mgs3_graph(io::IO, graph_type::Symbol, coding_scheme::Symbol, gs::UInt64, integer_encoding::Symbol)
 	# `n_size_u` is the number of bits needed to represent the graph vertices
 	n_bits_v = convert(UInt8, ceil(log(2, gs)))
 	# Get appropriate unsigned int type based on number of bits needed
@@ -985,7 +952,7 @@ function load_mix_encoded_compressed_mgs3_graph(io::IO, graph_type::Symbol, enco
 	@info("reading compressed graph data using read_compressed_graph_data")
 	# Use the comprehensive read_compressed_graph_data function
 	# This handles mix encoding (delta + run-length) with reference encoding
-	neighbor_lists = read_compressed_graph_data(reader, V(gs), compression, encoding, V)
+	neighbor_lists = read_compressed_graph_data(reader, V(gs), coding_scheme, integer_encoding, V)
 	
 	@info("building graph from neighbor lists")
 	# Build graph from the decoded neighbor lists
