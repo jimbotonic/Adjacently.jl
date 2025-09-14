@@ -1,0 +1,59 @@
+=== CNR-2000 Graph Statistics ===
+Loading graph...
+
+--- Basic Properties ---
+Nodes: 325557
+Arcs: 3216152
+Average degree: 9.879
+Density: -0.002319
+
+--- Degree Analysis ---
+  Processing node 0/325557
+  Processing node 50000/325557
+  Processing node 100000/325557
+  Processing node 150000/325557
+  Processing node 200000/325557
+  Processing node 250000/325557
+  Processing node 300000/325557
+Maximum outdegree: 2716
+Maximum indegree: 18235
+Dangling nodes (outdegree=0): 78056 (23.98%)
+Sink nodes (indegree=0): 0 (0.00%)
+
+--- Degree Distribution ---
+Top 10 outdegree values:
+  Outdegree 2716: 1 nodes
+  Outdegree 1452: 1 nodes
+  Outdegree 1424: 1 nodes
+  Outdegree 1338: 1 nodes
+  Outdegree 1311: 1 nodes
+  Outdegree 1307: 3 nodes
+  Outdegree 1303: 1 nodes
+  Outdegree 1274: 4 nodes
+  Outdegree 1238: 4 nodes
+  Outdegree 1222: 1 nodes
+Top 10 indegree values:
+  Indegree 18235: 5 nodes
+  Indegree 18234: 2 nodes
+  Indegree 18223: 2 nodes
+  Indegree 18217: 1 nodes
+  Indegree 17813: 1 nodes
+  Indegree 17804: 9 nodes
+  Indegree 17793: 1 nodes
+  Indegree 17616: 1 nodes
+  Indegree 17611: 8 nodes
+  Indegree 17610: 9 nodes
+
+--- Connectivity Analysis ---
+Weakly connected components: 7
+Largest component size: 325239 (99.90%)
+
+--- Storage Information ---
+Graph file size: 1.1 MB
+Offset file size: 317.7 KB
+OBL file size: 282.2 KB
+Total BVGraph size: 1.7 MB
+Bits per arc: 4.426
+Bits per node: 43.720
+
+=== Analysis Complete ===
