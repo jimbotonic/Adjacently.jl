@@ -15,13 +15,14 @@
 
 module Relabeling
 
-using LightGraphs, DataStructures, Logging, SparseArrays
+using LightGraphs, DataStructures, Logging, SparseArrays, Random
 using ..CustomTypes: UInt24, UInt40
 using ..CustomLightGraphs: SimpleDiGraph, SimpleGraph, SimpleEdge
 using ..Graph: get_in_degrees, get_out_degrees, get_in_out_degrees, get_reverse_graph
 using ..PageRank: PR
 
-export relabel_graph, relabel_vertices, relabel_vertices_score, relabel_vertices_lexicographic, relabel_vertices_rcm, relabel_vertices_webgraph_lex
+export relabel_graph, relabel_vertices, relabel_vertices_score, relabel_vertices_lexicographic, relabel_vertices_rcm, relabel_vertices_webgraph_lex,
+       relabel_vertices_llp, relabel_vertices_minhash
 
 """
     relabel_graph(g::AbstractGraph{T}, vertex_mapping::Vector{T}) where {T<:Unsigned}
@@ -85,6 +86,12 @@ function relabel_vertices(g::AbstractGraph{T}, mode::Symbol=:lexicographic, crit
 		return relabel_vertices_score(g, criterion)
 	elseif mode == :rcm
 		return relabel_vertices_rcm(g, criterion)
+	elseif mode == :llp
+		# criterion selects neighbor type: :out or :sym
+		return relabel_vertices_llp(g, criterion)
+	elseif mode == :minhash
+		# criterion selects neighbor type: :out or :sym
+		return relabel_vertices_minhash(g, criterion)
 	else
 		@error("Invalid mode: $mode")
 	end
@@ -140,6 +147,135 @@ function relabel_vertices_score(g::AbstractGraph{T}, criterion::Symbol=:in_degre
 	end
 	
 	return vertex_mapping
+end
+
+"""
+    relabel_vertices_llp(g::AbstractGraph{T}, neighbor_mode::Symbol=:sym; passes::Int=5) where {T<:Unsigned}
+
+Layered Label Propagation (LLP) style relabeling. It clusters vertices by
+iteratively propagating the most frequent neighbor label, then orders clusters
+and vertices to group similar neighborhoods and improve compression locality.
+
+@param g: the graph
+@param neighbor_mode: :out (directed out-neighbors) or :sym (union of in/out)
+@param passes: number of label-propagation passes
+@returns Dict{T,T}: mapping old_id -> new_id
+"""
+function relabel_vertices_llp(g::AbstractGraph{T}, neighbor_mode::Symbol=:sym; passes::Int=5) where {T<:Unsigned}
+    n = nv(g)
+    vs = collect(vertices(g))
+    # initialize labels to unique ids
+    labels = Dict{T,T}(v => v for v in vs)
+
+    # utility to iterate neighbors according to mode
+    neigh_iter(v) = neighbor_mode == :out ? outneighbors(g, v) : union(outneighbors(g, v), inneighbors(g, v))
+
+    # label propagation passes
+    for _ in 1:max(passes, 1)
+        # process vertices in simple order (could randomize for variety)
+        for v in vs
+            counts = Dict{T,Int}()
+            for u in neigh_iter(v)
+                lu = labels[u]
+                counts[lu] = get(counts, lu, 0) + 1
+            end
+            if !isempty(counts)
+                # pick most frequent label, tie-break by smallest label id
+                best_label = nothing
+                best_count = -1
+                for (lab, c) in counts
+                    if c > best_count || (c == best_count && (best_label === nothing || lab < best_label))
+                        best_label = lab; best_count = c
+                    end
+                end
+                labels[v] = best_label::T
+            end
+        end
+    end
+
+    # group vertices by label
+    groups = Dict{T, Vector{T}}()
+    for v in vs
+        lab = labels[v]
+        push!(get!(groups, lab, T[]), v)
+    end
+
+    # order groups by size descending, tie-break by label id
+    group_keys = collect(keys(groups))
+    sort!(group_keys, by = k -> (-length(groups[k]), k))
+
+    # within each group: sort by out-degree (ascending) then lexicographic neighbors
+    outdeg = get_out_degrees(g)
+    ordered_vertices = T[]
+    for k in group_keys
+        verts = groups[k]
+        sort!(verts, by = v -> (get(outdeg, v, zero(T)), length(outneighbors(g, v)), v))
+        append!(ordered_vertices, verts)
+    end
+
+    # build mapping
+    mapping = Dict{T,T}()
+    for (i, v) in enumerate(ordered_vertices)
+        mapping[v] = T(i)
+    end
+    return mapping
+end
+
+"""
+    relabel_vertices_minhash(g::AbstractGraph{T}, neighbor_mode::Symbol=:out; k::Int=32, seed::UInt64=0x9e3779b97f4a7c15) where {T<:Unsigned}
+
+MinHash-based relabeling: compute a k-dimensional MinHash signature of each
+vertex's neighbor set (out-neighbors by default), then sort vertices by their
+signature to cluster similar adjacency lists before relabeling.
+
+@param g: the graph
+@param neighbor_mode: :out (default) or :sym (union of in/out)
+@param k: number of hash functions (signature length)
+@param seed: RNG seed to derive hash functions
+@returns Dict{T,T}: mapping old_id -> new_id
+"""
+function relabel_vertices_minhash(g::AbstractGraph{T}, neighbor_mode::Symbol=:out; k::Int=32, seed::UInt64=0x9e3779b97f4a7c15) where {T<:Unsigned}
+    n = nv(g)
+    k = max(1, k)
+    vs = collect(vertices(g))
+
+    # derive k pairs (a,b) for universal hashing h(x) = a*x + b in UInt64 space
+    rng = Random.MersenneTwister(seed)
+    a = [rand(rng, UInt64) | 1 for _ in 1:k]  # force odd to reduce trivial cycles
+    b = [rand(rng, UInt64) for _ in 1:k]
+
+    # neighbor iterator
+    neigh_iter(v) = neighbor_mode == :out ? outneighbors(g, v) : union(outneighbors(g, v), inneighbors(g, v))
+
+    # compute signatures
+    UMAX = typemax(UInt64)
+    signatures = Vector{Tuple{T, Vector{UInt64}}}(undef, length(vs))
+    idx = 0
+    for v in vs
+        idx += 1
+        sig = fill(UMAX, k)
+        for u in neigh_iter(v)
+            xu = UInt64(u)
+            @inbounds for i in 1:k
+                # mix then take min
+                hv = a[i] * (xu ⊻ 0x9e3779b97f4a7c15) + b[i]
+                if hv < sig[i]
+                    sig[i] = hv
+                end
+            end
+        end
+        signatures[idx] = (v, sig)
+    end
+
+    # sort by signature lexicographically; tie-break by out-degree and id
+    outdeg = get_out_degrees(g)
+    sort!(signatures, lt = (x,y)->(x[2] < y[2] || (x[2] == y[2] && (get(outdeg, x[1], zero(T)) < get(outdeg, y[1], zero(T)) || (get(outdeg, x[1], zero(T)) == get(outdeg, y[1], zero(T)) && x[1] < y[1])))))
+
+    mapping = Dict{T,T}()
+    for (i, (v, _)) in enumerate(signatures)
+        mapping[v] = T(i)
+    end
+    return mapping
 end
 
 """
