@@ -103,9 +103,11 @@ Base.typemax(::Type{UInt40}) = reinterpret(UInt40, 0xFFFFFFFFFF)
 # Implement arithmetic operations
 Base.:+(x::UInt24, y::UInt24) = reinterpret(UInt24, (reinterpret(UInt32, x) + reinterpret(UInt32, y)) & 0xFFFFFF)
 Base.:-(x::UInt24, y::UInt24) = reinterpret(UInt24, (reinterpret(UInt32, x) - reinterpret(UInt32, y)) & 0xFFFFFF)
+Base.:*(x::UInt24, y::UInt24) = reinterpret(UInt24, (reinterpret(UInt32, x) * reinterpret(UInt32, y)) & 0xFFFFFF)
 
 Base.:+(x::UInt40, y::UInt40) = reinterpret(UInt40, (reinterpret(UInt64, x) + reinterpret(UInt64, y)) & 0xFFFFFFFFFF)
 Base.:-(x::UInt40, y::UInt40) = reinterpret(UInt40, (reinterpret(UInt64, x) - reinterpret(UInt64, y)) & 0xFFFFFFFFFF)
+Base.:*(x::UInt40, y::UInt40) = reinterpret(UInt40, (reinterpret(UInt64, x) * reinterpret(UInt64, y)) & 0xFFFFFFFFFF)
 
 # Implement right shift for UInt24
 function >>(x::UInt24, n::Unsigned)

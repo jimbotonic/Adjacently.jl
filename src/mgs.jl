@@ -450,7 +450,7 @@ Supported complex encoding options:
 
 @returns nothing
 """
-function write_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, coding_scheme::Symbol=:children, compression::Symbol=:huffman, integer_encoding::Symbol=:fibonacci, use_mix_mode::Bool=true, reference_enabled::Bool=true, recursive_reference::Bool=true) where {T<:Unsigned}
+function write_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, coding_scheme::Symbol=:children, compression::Symbol=:huffman, integer_encoding::Symbol=:fibonacci, use_mix_mode::Bool=true, reference_enabled::Bool=true, recursive_reference::Bool=true, ref_window_size::Int=1024) where {T<:Unsigned}
 	# supported compression
 	supported_compressions = [:huffman, :complex]
 	supported_complex_options = [:delta, :mix, :hybrid, :hybrid_plus]
@@ -459,7 +459,7 @@ function write_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractStri
 	if compression == :huffman
         write_huffman_compressed_mgs3_graph(g, filename, coding_scheme)
     elseif compression == :complex
-        write_complex_encoded_compressed_mgs3_graph(g, filename, coding_scheme, integer_encoding, use_mix_mode, reference_enabled, recursive_reference)
+        write_complex_encoded_compressed_mgs3_graph(g, filename, coding_scheme, integer_encoding, use_mix_mode, reference_enabled, recursive_reference, ref_window_size)
     else
         error("Unsupported compression scheme: $compression. Supported schemes are :huffman, :complex")
     end
@@ -661,7 +661,7 @@ Parameters:
 
 @returns nothing
 """
-function write_complex_encoded_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, coding_scheme::Symbol=:children, integer_encoding::Symbol=:elias_delta, use_mix_mode::Bool=true, reference_enabled::Bool=true, recursive_reference::Bool=true) where {T<:Unsigned}
+function write_complex_encoded_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, coding_scheme::Symbol=:children, integer_encoding::Symbol=:elias_delta, use_mix_mode::Bool=true, reference_enabled::Bool=true, recursive_reference::Bool=true, ref_window_size::Int=1024) where {T<:Unsigned}
 	# Header format: see MGS_HEADER.md
 	vs = vertices(g)
 	# number of vertices
@@ -719,7 +719,7 @@ function write_complex_encoded_compressed_mgs3_graph(g::AbstractGraph{T}, filena
 	# Use the comprehensive write_compressed_graph_data function
 	# This handles mix encoding (delta + run-length) with reference encoding
 	@info("writing compressed graph data using write_compressed_graph_data")
-	write_compressed_graph_data(bw, neighbor_lists, coding_scheme, integer_encoding, use_mix_mode, reference_enabled, recursive_reference)
+	write_compressed_graph_data(bw, neighbor_lists, coding_scheme, integer_encoding, use_mix_mode, reference_enabled, recursive_reference, ref_window_size)
 
 	# flush the bitwriter and close the file
 	flush_bitwriter(bw; flush_last_bits=true)

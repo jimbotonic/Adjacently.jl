@@ -79,4 +79,12 @@ include("distribution.jl")
 using .Distribution
 export Distribution
 
+include("clustering.jl")
+using .Clustering
+export Clustering
+
+include("rcge.jl")
+using .RCGE
+export RCGE
+
 end # module Adjacently
