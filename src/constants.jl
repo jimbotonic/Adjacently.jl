@@ -1,12 +1,12 @@
 module Constants
 
-export BUFFER_SIZE, FIB_NUMBERS, GOLOMB_BASE, ZETA_BASE, ZETA_H_BOUNDS, ZETA_POWER_BASES, 
-REF_ENCODING_TH, REF_V_MIN_DEGREE, FED_BLOCK_SIZE, REF_WINDOW_SIZE, MAX_REF_COUNT, 
-MIN_INTERVAL_LENGTH
+export BUFFER_SIZE, FIB_NUMBERS, GOLOMB_BASE, ZETA_BASE, ZETA_H_BOUNDS, ZETA_POWER_BASES,
+REF_ENCODING_TH, REF_V_MIN_DEGREE, FED_BLOCK_SIZE, REF_WINDOW_SIZE, MAX_REF_COUNT,
+MIN_INTERVAL_LENGTH, MIN_RUN_LENGTH
 
 const BUFFER_SIZE::Int = 4096
 const GOLOMB_BASE::Int = 64
-const ZETA_BASE::Int = 4
+const ZETA_BASE::Int = 3
 
 # Reference encoding constants
 const REF_ENCODING_TH::Int = 3  # Minimum overlap threshold for reference encoding
@@ -28,8 +28,9 @@ const FED_BLOCK_SIZE::Int = 64
 
 # Compression parameters
 const REF_WINDOW_SIZE::Int = 1024      # Reference window size (optimal balance)
-const MAX_REF_COUNT::Int = 3           # Maximum references per node  
+const MAX_REF_COUNT::Int = 3           # Maximum references per node
 const MIN_INTERVAL_LENGTH::Int = 4     # Minimum length for interval compression
+const MIN_RUN_LENGTH::Int = 3          # Minimum repetitions for run-length encoding
 
 # Precomputed zeta bounds for fast h calculation
 # ZETA_H_BOUNDS[k] = vector of threshold values where h increments
