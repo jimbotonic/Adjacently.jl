@@ -1,3 +1,20 @@
+#
+# Adjacently: Julia Complex Directed Networks Library
+# Copyright (C) 2016-2025 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+
+include("run_tests_main.jl")
+
 #!/usr/bin/env julia
 
 #
@@ -6,7 +23,6 @@
 # This isolates the bit alignment issue causing UInt24 overflow at vertex 175
 #
 
-include("run_tests_main.jl")
 using Logging
 using Adjacently.MGS: write_compressed_mgs3_graph, load_compressed_mgs3_graph
 using Adjacently.IO: load_adjacency_list_from_csv, BitWriter, write_value, flush_bitwriter
