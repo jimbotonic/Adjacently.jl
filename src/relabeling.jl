@@ -536,4 +536,102 @@ function relabel_vertices_webgraph_lex(g::AbstractGraph{T}) where {T<:Unsigned}
 	return vertex_mapping
 end
 
+"""
+    relabel_vertices_bfs(g::AbstractGraph{T}, start_vertex::Union{Nothing,T}=nothing) where {T<:Unsigned}
+
+Relabel vertices using Breadth-First Search (BFS) traversal order.
+This is the ordering strategy used by WebGraph for optimal compression.
+
+The BFS ordering tends to group vertices that are close in the graph structure,
+which improves reference encoding effectiveness since nearby vertices in the
+traversal order are likely to have similar adjacency lists.
+
+@param g::AbstractGraph{T}: the graph to relabel
+@param start_vertex::Union{Nothing,T}: starting vertex for BFS (if nothing, uses highest out-degree vertex)
+@return vertex_mapping::Dict{T,T}: mapping from old vertex IDs to new vertex IDs
+"""
+function relabel_vertices_bfs(g::AbstractGraph{T}, start_vertex::Union{Nothing,T}=nothing) where {T<:Unsigned}
+    n = nv(g)
+    vertex_mapping = Dict{T,T}()
+
+    # If no start vertex specified, choose vertex with highest out-degree
+    if start_vertex === nothing
+        max_degree = -1
+        start_vertex = T(1)
+        for v in vertices(g)
+            deg = length(outneighbors(g, v))
+            if deg > max_degree
+                max_degree = deg
+                start_vertex = v
+            end
+        end
+    end
+
+    # BFS traversal
+    visited = Set{T}()
+    queue = T[]
+    bfs_order = T[]
+
+    # Start BFS from the chosen vertex
+    push!(queue, start_vertex)
+    push!(visited, start_vertex)
+
+    while !isempty(queue)
+        v = popfirst!(queue)
+        push!(bfs_order, v)
+
+        # Visit neighbors in sorted order for deterministic results
+        neighbors = sort(collect(outneighbors(g, v)))
+        for neighbor in neighbors
+            if !(neighbor in visited)
+                push!(visited, neighbor)
+                push!(queue, neighbor)
+            end
+        end
+    end
+
+    # Handle disconnected components: add unvisited vertices in degree order
+    if length(visited) < n
+        unvisited = T[]
+        for v in vertices(g)
+            if !(v in visited)
+                push!(unvisited, v)
+            end
+        end
+
+        # Sort unvisited by out-degree (descending)
+        sort!(unvisited, by=v -> -length(outneighbors(g, v)))
+
+        # Continue BFS from each unvisited component
+        for start_v in unvisited
+            if start_v in visited
+                continue
+            end
+
+            push!(queue, start_v)
+            push!(visited, start_v)
+
+            while !isempty(queue)
+                v = popfirst!(queue)
+                push!(bfs_order, v)
+
+                neighbors = sort(collect(outneighbors(g, v)))
+                for neighbor in neighbors
+                    if !(neighbor in visited)
+                        push!(visited, neighbor)
+                        push!(queue, neighbor)
+                    end
+                end
+            end
+        end
+    end
+
+    # Create mapping: old_id -> new_id
+    for (new_id, old_id) in enumerate(bfs_order)
+        vertex_mapping[old_id] = T(new_id)
+    end
+
+    return vertex_mapping
+end
+
 end # module

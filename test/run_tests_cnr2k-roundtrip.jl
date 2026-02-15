@@ -20,27 +20,27 @@ include("run_tests_main.jl")
 # Complete round-trip test: compress and decompress CNR-2000
 # Verifies that encoding/decoding preserves the graph structure
 
-using Pkg
-Pkg.activate(@__DIR__)
+#using Pkg
+#Pkg.activate(@__DIR__)
 
 using LightGraphs: nv, ne, outneighbors
 using Adjacently
 using Adjacently.IO: load_adjacency_list_from_csv
-using Adjacently.Relabeling: relabel_vertices_rcm, relabel_graph
+using Adjacently.Relabeling: relabel_vertices_rcm, relabel_vertices_llp, relabel_vertices_bfs, relabel_graph
 using Adjacently.MGS: write_compressed_mgs3_graph, load_compressed_mgs3_graph
 
 println("=" ^ 80)
-println("CNR-2000 Complete Round-Trip Test")
+println("CNR-2000 Complete Round-Trip Test with RCM Ordering")
 println("=" ^ 80)
 
 # Load and relabel
-println("\n📊 Loading CNR-2000 dataset...")
+println("\n Loading CNR-2000 dataset...")
 graph_original = load_adjacency_list_from_csv("datasets/webgraph/cnr-2000/cnr-2000.csv", ',', true)
 vertices_count = nv(graph_original)
 edges_count = ne(graph_original)
 println("  Graph: $vertices_count vertices, $edges_count edges")
 
-println("\n🔄 Applying RCM relabeling...")
+println("\n🔄 Applying RCM (Reverse Cuthill-McKee) relabeling...")
 rcm_mapping = relabel_vertices_rcm(graph_original, :out)
 graph = relabel_graph(graph_original, rcm_mapping)
 println("  RCM applied successfully")
@@ -55,6 +55,7 @@ println(" STEP 1: COMPRESSION")
 println("=" ^ 80)
 
 println("\n Compressing CNR-2000...")
+println("  Using RCM ordering + Fibonacci encoding + adaptive block/RLE/raw encoding")
 compress_start = time()
 
 write_compressed_mgs3_graph(
@@ -62,7 +63,7 @@ write_compressed_mgs3_graph(
     output_file,
     :children,                # coding_scheme
     :complex,                 # compression
-    :fibonacci,               # integer_encoding
+    :fibonacci,               # integer_encoding (Fibonacci performs best)
     true,                     # use_mix_mode
     true,                     # reference_enabled
     true,                     # recursive_reference

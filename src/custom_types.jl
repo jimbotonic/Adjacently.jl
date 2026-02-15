@@ -70,11 +70,15 @@ end
 
 # Custom -> STD conversion
 function Base.reinterpret(::Type{UInt32}, x::UInt24)
-    return unsafe_load(Ptr{UInt32}(pointer_from_objref(Ref(x))))
+    # Mask to 24 bits: unsafe_load reads 4 bytes from a 3-byte value,
+    # so the high byte may contain uninitialized memory.
+    return unsafe_load(Ptr{UInt32}(pointer_from_objref(Ref(x)))) & 0x00FFFFFF
 end
 
 function Base.reinterpret(::Type{UInt64}, x::UInt40)
-    return unsafe_load(Ptr{UInt64}(pointer_from_objref(Ref(x))))
+    # Mask to 40 bits: unsafe_load reads 8 bytes from a 5-byte value,
+    # so the high bytes may contain uninitialized memory.
+    return unsafe_load(Ptr{UInt64}(pointer_from_objref(Ref(x)))) & 0x000000FFFFFFFFFF
 end
 
 # Basic arithmetic constants
