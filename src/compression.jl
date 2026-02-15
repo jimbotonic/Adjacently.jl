@@ -67,8 +67,18 @@ export write_unary_coding,
        read_compressed_graph_data,
        write_bitpacked_bitmap,
        write_rle_ones_deltas,
+       write_bitmap_rle_ones,
+       read_bitmap_rle_ones,
+       write_bitmap_adaptive,
+       read_bitmap_adaptive,
+       write_block_encoding,
+       read_block_encoding,
+       estimate_block_encoding_cost,
        write_small_count,
-       write_bitmap_rle_ones_deltas
+       estimate_encoded_value_cost,
+       estimate_interval_runlength_encoding_cost,
+       write_rl_compressed_graph_data,
+       read_rl_compressed_graph_data
 
 # Lightweight workspace types for reference building
 struct RefBuildWorkspace{T<:Unsigned}
@@ -2419,6 +2429,85 @@ function _consume_children_trailing_stop(r::BitReader, integer_encoding::Symbol,
 end
 
 """
+    estimate_bitmap_rle_cost(bitmap::Vector{Bool}, varint::Symbol) where {T<:Unsigned}
+
+Estimate the bit cost of encoding a bitmap using RLE ones-delta encoding.
+Returns the estimated number of bits required.
+
+@param bitmap::Vector{Bool}: the bitmap to encode
+@param varint::Symbol: the integer encoding used (:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta)
+
+@return::Int: the estimated cost in bits
+"""
+function estimate_bitmap_rle_cost(bitmap::Vector{Bool}, varint::Symbol)
+    cost = 0
+
+    # Handle empty bitmap
+    if isempty(bitmap)
+        # length = 0 (encoded as 1)
+        cost += estimate_encoded_value_cost(UInt32(1), varint)
+        return cost
+    end
+
+    # Bitmap length (add 1 to avoid zero)
+    cost += estimate_encoded_value_cost(UInt32(length(bitmap)) + UInt32(1), varint)
+
+    # Find positions of 1s
+    ones_positions = UInt32[]
+    for (i, bit) in enumerate(bitmap)
+        if bit
+            push!(ones_positions, UInt32(i))
+        end
+    end
+
+    # Handle all-zeros bitmap
+    if isempty(ones_positions)
+        # ones_count = 0 (encoded as 1)
+        cost += estimate_encoded_value_cost(UInt32(1), varint)
+        return cost
+    end
+
+    # Number of 1s (add 1 to avoid zero)
+    cost += estimate_encoded_value_cost(UInt32(length(ones_positions)) + UInt32(1), varint)
+
+    # Compute deltas
+    deltas = UInt32[]
+    push!(deltas, ones_positions[1])  # First position (absolute)
+    for i in 2:length(ones_positions)
+        push!(deltas, ones_positions[i] - ones_positions[i-1])
+    end
+
+    # Estimate RLE ones-deltas cost
+    # Count runs of 1s
+    token_count = 0
+    i = 1
+    while i <= length(deltas)
+        if deltas[i] == 1
+            # Count consecutive 1s
+            run_len = 0
+            while i <= length(deltas) && deltas[i] == 1
+                run_len += 1
+                i += 1
+            end
+            token_count += 1
+            # flag bit + run length
+            cost += 1 + estimate_encoded_value_cost(UInt32(run_len), varint)
+        else
+            # Literal delta
+            token_count += 1
+            # flag bit + delta value
+            cost += 1 + estimate_encoded_value_cost(deltas[i], varint)
+            i += 1
+        end
+    end
+
+    # Token count
+    cost += estimate_encoded_value_cost(UInt32(token_count), varint)
+
+    return cost
+end
+
+"""
     estimate_reference_encoding_cost(ref_id::T, copy_bitmap::Vector{Bool}, residuals::Vector{T}, encoding::Symbol, mode::Symbol) where {T<:Unsigned}
 
 Estimate the bit cost of encoding a vertex using reference encoding.
@@ -2434,29 +2523,28 @@ Returns the estimated number of bits required.
 """
 function estimate_reference_encoding_cost(ref_id::T, copy_bitmap::Vector{Bool}, residuals::Vector{T}, coding_scheme::Symbol, integer_encoding::Symbol) where {T<:Unsigned}
     cost = 0
-    
+
     # ref_id cost
     cost += estimate_encoded_value_cost(T(ref_id), integer_encoding)
-    
-    # bitmap_len cost  
-    cost += estimate_encoded_value_cost(T(length(copy_bitmap)), integer_encoding)
-    
-    # bitmap bits
-    cost += length(copy_bitmap)
-    
+
+    # bitmap cost (adaptive: 1 flag bit + min(raw, block))
+    raw_cost = estimate_encoded_value_cost(UInt32(length(copy_bitmap)) + UInt32(1), integer_encoding) + length(copy_bitmap)
+    block_cost = estimate_block_encoding_cost(copy_bitmap, integer_encoding)
+    cost += 1 + min(raw_cost, block_cost)
+
     # residuals_flag
     cost += 1
-    
+
     if !isempty(residuals)
         # residuals_len for index mode
         if coding_scheme == :index
             cost += estimate_encoded_value_cost(T(length(residuals)), integer_encoding)
         end
-        
+
         # residuals data (using traditional mix encoding)
         cost += estimate_mix_encoding_cost(residuals, integer_encoding)
     end
-    
+
     return cost
 end
 
@@ -2626,8 +2714,12 @@ function estimate_encoded_value_cost(value::T, integer_encoding::Symbol) where {
         log_val = max(1, log(2, max(1, value)))
         return ceil(Int, log_val + 2 * log(2, max(1, log_val)))
     elseif integer_encoding == :zeta
-        # Zeta coding with k=4: roughly log4(n) + k bits
-        return ceil(Int, log(4, max(1, value))) + 4
+        # Zeta coding with k=3: h in unary (h+1 bits) + remainder in truncated binary (~k bits)
+        # For k=3: values 1-7 → h=0, cost ≈ 1 + 3 = 4 bits; values 8-63 → h=1, cost ≈ 2 + 6 = 8 bits
+        k = ZETA_BASE
+        log2_v = max(0, floor(Int, log(2, max(1, value))))
+        h = div(log2_v, k)
+        return (h + 1) + k * (h + 1)  # unary(h) + truncated binary bits
     else
         # Default fallback
         return ceil(Int, log(2, max(1, value))) + 2
@@ -2843,33 +2935,25 @@ function write_compressed_graph_data(w::BitWriter, neighbor_lists::Dict{T,Vector
             
             if !isempty(potential_references)
                 reference_queries += 1
-                # try fast path when we have dense mappings
-                used_fast = false
-                best_ref = find_best_reference_fast(sorted_neighbors, ref_index, stream_id_to_vertex_vec, ref_workspace, available_mask)
-                @debug "find_best_reference_fast result" best_ref=best_ref fast_lookup_available=(ref_index !== nothing)
-                # If fast path fails (e.g., when ref_index is not yet available), fall back to Set-based filtering
-                # This fallback is necessary for the initial vertices before the reference index is built
-                if best_ref === nothing
-                    @debug "fast path failed, falling back to original Set-based filter"
-                    best_ref = find_best_reference(sorted_neighbors, ref_index, stream_id_to_vertex, ref_workspace, potential_references)
-                else
-                    used_fast = true
-                end
+                # WebGraph-style greedy cost-based selection
+                best_ref = find_best_reference_greedy_cost(
+                    sorted_neighbors,
+                    neighbor_lists,
+                    potential_references,
+                    ref_build_work,
+                    coding_scheme,
+                    integer_encoding
+                )
+                @debug "find_best_reference_greedy_cost result" best_ref=best_ref
+
                 if best_ref !== nothing
-                    # Record whether fast or slow hit (top-level)
-                    if used_fast
-                        fast_hit_count_ref[] += 1
-                    else
-                        slow_hit_count_ref[] += 1
-                    end
                     references_found += 1
-                    ref_neighbors = sort(neighbor_lists[best_ref])
-                    # build copy bitmap + residuals using reusable workspace
-                    create_reference_data!(ref_build_work, sorted_neighbors, ref_neighbors)
+                    # copy_bitmap and residuals are already computed in ref_build_work
+                    # by find_best_reference_greedy_cost
                     copy_bitmap = ref_build_work.copy_bitmap
                     residuals = ref_build_work.residuals
-                    # reference selection is now threshold-based in find_best_reference
                     use_reference = true
+                    fast_hit_count_ref[] += 1  # Count greedy selection as "fast"
                 end
             end
 
@@ -2916,10 +3000,7 @@ function write_compressed_graph_data(w::BitWriter, neighbor_lists::Dict{T,Vector
                 if use_reference_final
                     # write reference data
                     write_encoded_value(w, T(best_ref), integer_encoding)  # ref_id
-                    write_encoded_value(w, T(length(copy_bitmap)), integer_encoding)  # bitmap_len
-                    for bit in copy_bitmap
-                        write_bit(w, bit)
-                    end
+                    write_bitmap_adaptive(w, copy_bitmap, integer_encoding)  # bitmap (adaptive encoding)
                     
                     # write residuals
                     if !isempty(residuals)
@@ -3136,12 +3217,7 @@ function read_compressed_graph_data(r::BitReader, vs::T, coding_scheme::Symbol=:
                     if children_flag  # reference mode
                         # read reference data
                         ref_id = read_encoded_value(r, integer_encoding, T)
-                        bitmap_len = read_encoded_value(r, integer_encoding, T)
-                        
-                        copy_bitmap = Bool[]
-                        for _ in 1:Int(bitmap_len)
-                            push!(copy_bitmap, read_bit(r))
-                        end
+                        copy_bitmap = read_bitmap_adaptive(r, integer_encoding)
                         
                         residuals_flag = read_bit(r)
                         residuals = T[]
@@ -3193,13 +3269,8 @@ function read_compressed_graph_data(r::BitReader, vs::T, coding_scheme::Symbol=:
                         # read reference data
                         ref_id = read_encoded_value(r, integer_encoding, T)
                         @info "Vertex $v: Read ref_id=$ref_id"
-                        bitmap_len = read_encoded_value(r, integer_encoding, T)
-                        @info "Vertex $v: Read bitmap_len=$bitmap_len"
-
-                        copy_bitmap = Bool[]
-                        for _ in 1:Int(bitmap_len)
-                            push!(copy_bitmap, read_bit(r))
-                        end
+                        copy_bitmap = read_bitmap_adaptive(r, integer_encoding)
+                        @info "Vertex $v: Read bitmap with $(length(copy_bitmap)) bits"
 
                         residuals_flag = read_bit(r)
                         residuals = T[]
@@ -3330,6 +3401,636 @@ end
 ################################################################################
 # END: read / write compressed graph data
 ################################################################################
+
+################################################################################
+# START: RL policy-based compressed graph data
+################################################################################
+
+# 3-bit encoding tags for self-describing RL-compressed streams
+const RL_ENC_TAG_FIBONACCI = UInt8(0b000)
+const RL_ENC_TAG_ZETA = UInt8(0b001)
+const RL_ENC_TAG_ELIAS_GAMMA = UInt8(0b010)
+const RL_ENC_TAG_ELIAS_DELTA = UInt8(0b011)
+
+const RL_ENCODING_TAGS = Dict{Symbol,UInt8}(
+    :fibonacci => RL_ENC_TAG_FIBONACCI,
+    :zeta => RL_ENC_TAG_ZETA,
+    :elias_gamma => RL_ENC_TAG_ELIAS_GAMMA,
+    :elias_delta => RL_ENC_TAG_ELIAS_DELTA
+)
+
+const RL_TAG_ENCODINGS = Dict{UInt8,Symbol}(
+    RL_ENC_TAG_FIBONACCI => :fibonacci,
+    RL_ENC_TAG_ZETA => :zeta,
+    RL_ENC_TAG_ELIAS_GAMMA => :elias_gamma,
+    RL_ENC_TAG_ELIAS_DELTA => :elias_delta
+)
+
+# Reference mode tags (2 bits)
+const RL_REF_NONE = UInt8(0b00)
+const RL_REF_REFERENCE = UInt8(0b01)
+const RL_REF_RECURSIVE = UInt8(0b10)
+
+const RL_REF_MODE_TAGS = Dict{Symbol,UInt8}(
+    :none => RL_REF_NONE,
+    :reference => RL_REF_REFERENCE,
+    :recursive => RL_REF_RECURSIVE
+)
+
+const RL_TAG_REF_MODES = Dict{UInt8,Symbol}(
+    RL_REF_NONE => :none,
+    RL_REF_REFERENCE => :reference,
+    RL_REF_RECURSIVE => :recursive
+)
+
+function _write_encoding_tag(w, tag::UInt8)
+    write_bit(w, (tag >> 2) & 0x1 == 1)
+    write_bit(w, (tag >> 1) & 0x1 == 1)
+    write_bit(w, tag & 0x1 == 1)
+end
+
+function _read_encoding_tag(r)::UInt8
+    b2 = read_bit(r) ? UInt8(1) : UInt8(0)
+    b1 = read_bit(r) ? UInt8(1) : UInt8(0)
+    b0 = read_bit(r) ? UInt8(1) : UInt8(0)
+    return (b2 << 2) | (b1 << 1) | b0
+end
+
+function _write_ref_mode_tag(w, tag::UInt8)
+    write_bit(w, (tag >> 1) & 0x1 == 1)
+    write_bit(w, tag & 0x1 == 1)
+end
+
+function _read_ref_mode_tag(r)::UInt8
+    b1 = read_bit(r) ? UInt8(1) : UInt8(0)
+    b0 = read_bit(r) ? UInt8(1) : UInt8(0)
+    return (b1 << 1) | b0
+end
+
+# Min interval length tag: 2 bits encoding index into [2, 3, 4, 5]
+const RL_MIL_OPTIONS = [2, 3, 4, 5]
+
+function _write_mil_tag(w, mil::Int)
+    idx = findfirst(==(mil), RL_MIL_OPTIONS)
+    if idx === nothing; idx = 3; end  # default to 4
+    tag = UInt8(idx - 1)  # 0-based
+    write_bit(w, (tag >> 1) & 0x1 == 1)
+    write_bit(w, tag & 0x1 == 1)
+end
+
+function _read_mil_tag(r)::Int
+    b1 = read_bit(r) ? UInt8(1) : UInt8(0)
+    b0 = read_bit(r) ? UInt8(1) : UInt8(0)
+    idx = Int((b1 << 1) | b0) + 1  # 1-based
+    return RL_MIL_OPTIONS[idx]
+end
+
+"""
+    write_rl_compressed_graph_data(w, neighbor_lists, policy, coding_scheme, ref_window_size)
+
+Write compressed graph data with per-vertex encoding optimization.
+
+When `policy !== nothing`, uses the RL policy for per-vertex encoding decisions.
+When `policy === nothing`, uses greedy per-vertex search (tries all action combinations).
+
+Uses a two-pass approach for compact headers:
+- Pass 1: Decide encoding per vertex (policy or greedy)
+- Pass 2: Find most common action (default), write 1-bit flag per vertex:
+  - 0 = default action (1 bit overhead)
+  - 1 = custom action (1 + 4 bits overhead)
+"""
+function write_rl_compressed_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
+        policy, coding_scheme::Symbol=:children,
+        ref_window_size::Int=7;
+        integer_encoding::Symbol=_RL_FIXED_ENCODING,
+        vertex_actions::Union{Dict,Nothing}=nothing) where {T<:Unsigned}
+
+    vs = length(keys(neighbor_lists))
+    ie = integer_encoding
+
+    # =========================================================================
+    # Pass 1: Collect per-vertex decisions
+    # =========================================================================
+    # Ordered window for distance-based reference encoding
+    reference_window = T[]
+
+    function add_to_ref_window!(vertex::T)
+        push!(reference_window, vertex)
+        if length(reference_window) > ref_window_size
+            popfirst!(reference_window)
+        end
+    end
+
+    # Per-vertex decisions: (ie, actual_ref_mode, mil, ref_result_or_nothing)
+    # ref_result is now (distance, copy_bitmap, residuals) instead of (ref_v, ...)
+    vertex_decisions = Vector{Tuple{Symbol, Symbol, Int, Any}}(undef, vs)
+
+    for v_idx in 1:vs
+        v = T(v_idx)
+        current_neighbors = sort(get(neighbor_lists, v, T[]))
+
+        if vertex_actions !== nothing
+            # Pre-computed action from GNN policy
+            a_idx = vertex_actions[v]
+            _, ref_mode, mil = _rl_decode_action(a_idx)
+
+            actual_ref_mode = :none
+            ref_result = nothing
+            if !isempty(current_neighbors) && ref_mode != :none && !isempty(reference_window)
+                ref_result = _rl_try_find_reference(current_neighbors, neighbor_lists, reference_window, ie, mil)
+                if ref_result !== nothing
+                    actual_ref_mode = ref_mode
+                end
+            end
+            vertex_decisions[v_idx] = (ie, actual_ref_mode, mil, ref_result)
+        elseif policy !== nothing
+            # Policy-based decision (tabular Q-policy)
+            features = _rl_extract_features(current_neighbors, reference_window, neighbor_lists)
+            s_idx = _rl_feature_index(features)
+            a_idx = _rl_best_action(policy, s_idx)
+            _, ref_mode, mil = _rl_decode_action(a_idx)
+
+            actual_ref_mode = :none
+            ref_result = nothing
+            if !isempty(current_neighbors) && ref_mode != :none && !isempty(reference_window)
+                ref_result = _rl_try_find_reference(current_neighbors, neighbor_lists, reference_window, ie, mil)
+                if ref_result !== nothing
+                    actual_ref_mode = ref_mode
+                end
+            end
+            vertex_decisions[v_idx] = (ie, actual_ref_mode, mil, ref_result)
+        else
+            # Greedy per-vertex search: try all ref_mode × mil combinations
+            best_decision = _rl_greedy_vertex_search(current_neighbors, neighbor_lists, reference_window, ie)
+            vertex_decisions[v_idx] = best_decision
+        end
+
+        add_to_ref_window!(v)
+    end
+
+    # =========================================================================
+    # Find default action (most common ref_mode + mil combination)
+    # =========================================================================
+    header_counts = Dict{Tuple{UInt8, UInt8}, Int}()
+    for (_, actual_ref_mode, mil, _) in vertex_decisions
+        ref_tag = get(RL_REF_MODE_TAGS, actual_ref_mode, RL_REF_NONE)
+        mil_idx = findfirst(==(mil), RL_MIL_OPTIONS)
+        mil_tag = UInt8(something(mil_idx, 3) - 1)
+        key = (ref_tag, mil_tag)
+        header_counts[key] = get(header_counts, key, 0) + 1
+    end
+
+    default_header = argmax(header_counts)
+    default_count = header_counts[default_header]
+    default_ref_tag, default_mil_tag = default_header
+
+    @info "RL header stats: default action used by $default_count/$vs vertices ($(round(100.0*default_count/vs, digits=1))%)"
+
+    # =========================================================================
+    # Pass 2: Write the stream
+    # =========================================================================
+
+    # Write coding_scheme flag (1 bit)
+    write_bit(w, coding_scheme == :index)
+
+    # Write encoding tag (3 bits)
+    enc_tag = get(RL_ENCODING_TAGS, ie, RL_ENC_TAG_FIBONACCI)
+    _write_encoding_tag(w, enc_tag)
+
+    # Write default action header (4 bits): ref_mode (2) + mil (2)
+    _write_ref_mode_tag(w, default_ref_tag)
+    write_bit(w, (default_mil_tag >> 1) & 0x1 == 1)
+    write_bit(w, default_mil_tag & 0x1 == 1)
+
+    # Index section (if :index mode)
+    if coding_scheme == :index
+        for v in T(1):T(vs)
+            out_degree = T(length(get(neighbor_lists, v, T[])) + 1)
+            write_encoded_value(w, out_degree, ie)
+        end
+    end
+
+    # Data section — per-vertex header is ref_mode + mil
+    for v_idx in 1:vs
+        v = T(v_idx)
+        _, actual_ref_mode, mil, ref_result = vertex_decisions[v_idx]
+        current_neighbors = sort(get(neighbor_lists, v, T[]))
+
+        ref_tag = get(RL_REF_MODE_TAGS, actual_ref_mode, RL_REF_NONE)
+        mil_idx = findfirst(==(mil), RL_MIL_OPTIONS)
+        mil_tag = UInt8(something(mil_idx, 3) - 1)
+
+        # Write 1-bit flag: 0 = default action, 1 = custom 4-bit header
+        if (ref_tag, mil_tag) == default_header
+            write_bit(w, false)
+        else
+            write_bit(w, true)
+            _write_ref_mode_tag(w, ref_tag)
+            write_bit(w, (mil_tag >> 1) & 0x1 == 1)
+            write_bit(w, mil_tag & 0x1 == 1)
+        end
+
+        # Reference encoding path
+        if actual_ref_mode != :none && ref_result !== nothing
+            ref_distance, copy_bitmap, residuals = ref_result
+            write_encoded_value(w, T(ref_distance), ie)  # Distance within window (1-based)
+            write_bitmap_adaptive(w, copy_bitmap, ie)
+            write_intervals_and_residuals(w, residuals, ie, mil)
+            continue
+        end
+
+        # Interval + residual encoding
+        write_intervals_and_residuals(w, current_neighbors, ie, mil)
+    end
+end
+
+"""
+    read_rl_compressed_graph_data(r, vs, coding_scheme, ::Type{T}; integer_encoding)
+
+Read RL-compressed graph data with two-pass header encoding.
+Stream header: [1b coding_scheme] [3b encoding_tag] [4b default_action].
+Uses distance-based reference encoding: references are stored as window offsets (1-based),
+not vertex IDs. Per-vertex 1-bit flag: 0 = default action, 1 = custom 4-bit header.
+"""
+function read_rl_compressed_graph_data(r, vs::T, coding_scheme::Symbol=:children, ::Type{T}=UInt8;
+        integer_encoding::Symbol=_RL_FIXED_ENCODING) where {T<:Unsigned}
+    neighbor_lists = Dict{T,Vector{T}}()
+
+    # Read coding_scheme flag
+    is_index = read_bit(r)
+    actual_coding_scheme = is_index ? :index : :children
+
+    # Read encoding tag (3 bits)
+    enc_tag = _read_encoding_tag(r)
+    ie = get(RL_TAG_ENCODINGS, enc_tag, integer_encoding)
+
+    # Read default action header (4 bits): ref_mode (2) + mil (2)
+    default_ref_tag = _read_ref_mode_tag(r)
+    b1 = read_bit(r) ? UInt8(1) : UInt8(0)
+    b0 = read_bit(r) ? UInt8(1) : UInt8(0)
+    default_mil_tag = (b1 << 1) | b0
+    default_mil = RL_MIL_OPTIONS[Int(default_mil_tag) + 1]
+    default_ref_mode = get(RL_TAG_REF_MODES, default_ref_tag, :none)
+
+    # Sliding reference window (mirrors writer's window)
+    reference_window = T[]
+    ref_window_size = 7  # Must match writer's window size
+
+    # Index section
+    out_degrees = T[]
+    if actual_coding_scheme == :index
+        out_degrees = Vector{T}(undef, vs)
+        for v in T(1):T(vs)
+            encoded_degree = read_encoded_value(r, ie, T)
+            out_degrees[v] = encoded_degree - T(1)
+        end
+    end
+
+    for v in T(1):T(vs)
+        # Read 1-bit flag: 0 = default, 1 = custom 4-bit header
+        is_custom = read_bit(r)
+
+        if is_custom
+            ref_tag = _read_ref_mode_tag(r)
+            mb1 = read_bit(r) ? UInt8(1) : UInt8(0)
+            mb0 = read_bit(r) ? UInt8(1) : UInt8(0)
+            mil_tag = (mb1 << 1) | mb0
+            ref_mode = get(RL_TAG_REF_MODES, ref_tag, :none)
+            mil = RL_MIL_OPTIONS[Int(mil_tag) + 1]
+        else
+            ref_mode = default_ref_mode
+            mil = default_mil
+        end
+
+        if actual_coding_scheme == :index && out_degrees[v] == 0
+            neighbor_lists[v] = T[]
+            # Maintain window even for empty vertices
+            push!(reference_window, v)
+            if length(reference_window) > ref_window_size
+                popfirst!(reference_window)
+            end
+            continue
+        end
+
+        if ref_mode != :none
+            # Distance-based reference encoding
+            ref_distance = read_encoded_value(r, ie, T)
+            copy_bitmap = read_bitmap_adaptive(r, ie)
+            residuals = read_intervals_and_residuals(r, ie, mil, T)
+
+            # Resolve distance to vertex ID using the window
+            window_idx = length(reference_window) - Int(ref_distance) + 1
+            if window_idx < 1 || window_idx > length(reference_window)
+                error("Invalid reference distance: $ref_distance (window size=$(length(reference_window)), at vertex $v)")
+            end
+            ref_vertex = reference_window[window_idx]
+
+            if haskey(neighbor_lists, ref_vertex)
+                ref_neighbors = neighbor_lists[ref_vertex]
+                current_neighbors = reconstruct_from_reference(ref_neighbors, copy_bitmap, residuals)
+            else
+                error("Invalid reference vertex: $ref_vertex resolved from distance $ref_distance (at vertex $v)")
+            end
+            neighbor_lists[v] = current_neighbors
+        else
+            current_neighbors = read_intervals_and_residuals(r, ie, mil, T)
+            neighbor_lists[v] = current_neighbors
+        end
+
+        # Maintain sliding window
+        push!(reference_window, v)
+        if length(reference_window) > ref_window_size
+            popfirst!(reference_window)
+        end
+    end
+
+    return neighbor_lists
+end
+
+# Internal helpers for RL write that avoid direct dependency on RL module types
+# (These work with the QPolicy's Q-matrix directly)
+
+function _rl_extract_features(neighbors::Vector{T}, ref_candidates::Vector{T},
+                              neighbor_lists::Dict{T,Vector{T}}) where {T<:Unsigned}
+    degree = length(neighbors)
+    d_bin = degree == 0 ? 1 : degree <= 3 ? 2 : degree <= 10 ? 3 : degree <= 50 ? 4 : degree <= 200 ? 5 : 6
+
+    if degree <= 1
+        iv_density = 0.0
+        max_gap = 1
+    else
+        intervals, _ = compress_intervals(neighbors, 2)
+        interval_count = sum(len for (_, len) in intervals; init=0)
+        iv_density = interval_count / degree
+        deltas = delta_encode_vector(neighbors)
+        max_gap = length(deltas) > 1 ? Int(maximum(deltas[2:end])) : 1
+    end
+
+    iv_bin = iv_density <= 0.25 ? 1 : iv_density <= 0.50 ? 2 : iv_density <= 0.75 ? 3 : 4
+    gap_bin = max_gap <= 2 ? 1 : max_gap <= 10 ? 2 : max_gap <= 100 ? 3 : max_gap <= 1000 ? 4 : 5
+
+    best_overlap = 0.0
+    if degree >= 2 && !isempty(ref_candidates)
+        ns = Set(neighbors)
+        check_limit = min(length(ref_candidates), 20)
+        for i in 1:check_limit
+            ref_v = ref_candidates[i]
+            ref_nl = get(neighbor_lists, ref_v, T[])
+            if !isempty(ref_nl)
+                overlap = length(intersect(ns, Set(ref_nl)))
+                ratio = overlap / max(degree, length(ref_nl))
+                best_overlap = max(best_overlap, ratio)
+            end
+        end
+    end
+
+    ov_bin = best_overlap <= 0.0 ? 1 : best_overlap <= 0.25 ? 2 : best_overlap <= 0.50 ? 3 : best_overlap <= 0.75 ? 4 : 5
+
+    if isempty(ref_candidates)
+        rw_density = 0.0
+    else
+        high_deg = count(ref_candidates) do rv
+            length(get(neighbor_lists, rv, T[])) >= 4
+        end
+        rw_density = high_deg / length(ref_candidates)
+    end
+    rw_bin = rw_density <= 0.25 ? 1 : rw_density <= 0.50 ? 2 : rw_density <= 0.75 ? 3 : 4
+
+    return (d_bin, iv_bin, gap_bin, ov_bin, rw_bin)
+end
+
+function _rl_feature_index(features)::Int
+    d, iv, g, o, rw = features
+    return (d - 1) * (4 * 5 * 5 * 4) + (iv - 1) * (5 * 5 * 4) + (g - 1) * (5 * 4) + (o - 1) * 4 + rw
+end
+
+function _rl_best_action(policy, state_idx::Int)::Int
+    # Access Q-matrix directly
+    row = @view policy.Q[state_idx, :]
+    return argmax(row)
+end
+
+const _RL_FIXED_ENCODING = :fibonacci
+const _RL_REF_OPTIONS = [:none, :reference, :recursive]
+const _RL_MIL_OPTIONS = [2, 3, 4, 5]
+
+function _rl_decode_action(idx::Int, encoding::Symbol=_RL_FIXED_ENCODING)
+    idx -= 1
+    mil_idx = idx % 4 + 1
+    ref_idx = idx ÷ 4 + 1
+    return (encoding, _RL_REF_OPTIONS[ref_idx], _RL_MIL_OPTIONS[mil_idx])
+end
+
+function _estimate_adaptive_bitmap_cost(bitmap::Vector{Bool}, ie::Symbol)::Int
+    # Same logic as write_bitmap_adaptive: min of raw vs block encoding + 1-bit flag
+    raw_cost = estimate_encoded_value_cost(UInt32(length(bitmap)) + UInt32(1), ie) + length(bitmap)
+    block_cost = estimate_block_encoding_cost(bitmap, ie)
+    return 1 + min(raw_cost, block_cost)  # 1-bit format flag
+end
+
+function _rl_try_find_reference(neighbors::Vector{T}, neighbor_lists::Dict{T,Vector{T}},
+                                ref_window::Vector{T}, ie::Symbol, mil::Int=MIN_INTERVAL_LENGTH) where {T<:Unsigned}
+    ns = Set(neighbors)
+    best_cost = nothing
+    best_distance = nothing
+    best_bitmap = Bool[]
+    best_residuals = T[]
+
+    noref_cost = estimate_interval_runlength_encoding_cost(neighbors, ie, mil, 3)
+
+    for (i, ref_v) in enumerate(ref_window)
+        ref_nl = get(neighbor_lists, ref_v, T[])
+        isempty(ref_nl) && continue
+
+        ref_neighbors_set = Set(ref_nl)
+        overlap = length(intersect(ns, ref_neighbors_set))
+        overlap < 3 && continue
+
+        copy_bitmap = Bool[n in ns for n in ref_nl]
+        residuals = sort(T[n for n in neighbors if !(n in ref_neighbors_set)])
+
+        # Distance = position from end of window (1-based)
+        distance = T(length(ref_window) - i + 1)
+        ref_cost = estimate_encoded_value_cost(distance, ie)
+        ref_cost += _estimate_adaptive_bitmap_cost(copy_bitmap, ie)
+        if !isempty(residuals)
+            ref_cost += estimate_interval_runlength_encoding_cost(residuals, ie, mil, 3)
+        end
+
+        if ref_cost < noref_cost && (best_cost === nothing || ref_cost < best_cost)
+            best_cost = ref_cost
+            best_distance = distance
+            best_bitmap = copy_bitmap
+            best_residuals = residuals
+        end
+    end
+
+    if best_distance === nothing
+        return nothing
+    end
+    return (best_distance, best_bitmap, best_residuals)
+end
+
+"""
+Greedy per-vertex search: try all ref_mode × mil combinations and return the cheapest.
+Returns (ie, actual_ref_mode, mil, ref_result_or_nothing).
+ref_result is (distance, copy_bitmap, residuals) where distance is the window offset (1-based).
+"""
+function _rl_greedy_vertex_search(neighbors::Vector{T}, neighbor_lists::Dict{T,Vector{T}},
+                                   ref_window::Vector{T}, ie::Symbol) where {T<:Unsigned}
+    if isempty(neighbors)
+        # Empty vertex: cheapest mil is the one with smallest interval encoding overhead
+        return (ie, :none, _RL_MIL_OPTIONS[1], nothing)
+    end
+
+    best_cost = typemax(Int)
+    best_ref_mode = :none
+    best_mil = MIN_INTERVAL_LENGTH
+    best_ref_result = nothing
+
+    # Try each mil value for non-reference encoding
+    for mil in _RL_MIL_OPTIONS
+        noref_cost = estimate_interval_runlength_encoding_cost(neighbors, ie, mil, 3)
+        if noref_cost < best_cost
+            best_cost = noref_cost
+            best_ref_mode = :none
+            best_mil = mil
+            best_ref_result = nothing
+        end
+    end
+
+    # Try reference encoding with each mil value (if window available)
+    if !isempty(ref_window) && length(neighbors) >= 3
+        ns = Set(neighbors)
+
+        for (i, ref_v) in enumerate(ref_window)
+            ref_nl = get(neighbor_lists, ref_v, T[])
+            isempty(ref_nl) && continue
+
+            ref_neighbors_set = Set(ref_nl)
+            overlap = length(intersect(ns, ref_neighbors_set))
+            overlap < 3 && continue
+
+            copy_bitmap = Bool[n in ns for n in ref_nl]
+            residuals = sort(T[n for n in neighbors if !(n in ref_neighbors_set)])
+
+            # Distance = position from end of window (1-based)
+            distance = T(length(ref_window) - i + 1)
+            ref_base_cost = estimate_encoded_value_cost(distance, ie)
+            ref_base_cost += _estimate_adaptive_bitmap_cost(copy_bitmap, ie)
+
+            for mil in _RL_MIL_OPTIONS
+                ref_cost = ref_base_cost
+                if !isempty(residuals)
+                    ref_cost += estimate_interval_runlength_encoding_cost(residuals, ie, mil, 3)
+                end
+
+                if ref_cost < best_cost
+                    best_cost = ref_cost
+                    best_ref_mode = :reference
+                    best_mil = mil
+                    best_ref_result = (distance, copy_bitmap, residuals)
+                end
+            end
+        end
+    end
+
+    return (ie, best_ref_mode, best_mil, best_ref_result)
+end
+
+################################################################################
+# END: RL policy-based compressed graph data
+################################################################################
+
+"""
+    find_best_reference_greedy_cost(target::Vector{T}, neighbor_lists::Dict{T,Vector{T}},
+                                     available::Set{T}, ref_workspace::RefBuildWorkspace{T},
+                                     coding_scheme::Symbol, integer_encoding::Symbol) where {T<:Unsigned}
+
+WebGraph-style greedy cost-based reference selection.
+Evaluates all candidates in the reference window and selects the one that minimizes
+the total encoding cost (reference ID + copy bitmap + residuals).
+
+This is the key difference from overlap-based selection: instead of choosing the reference
+with maximum overlap, we choose the one with minimum encoding cost.
+
+@param target::Vector{T}: the target neighbor list to encode
+@param neighbor_lists::Dict{T,Vector{T}}: all neighbor lists (for looking up candidates)
+@param available::Set{T}: set of vertices available as references (in the window)
+@param ref_workspace::RefBuildWorkspace{T}: workspace for building reference data
+@param coding_scheme::Symbol: coding scheme (:children or :index)
+@param integer_encoding::Symbol: integer encoding to use for cost estimation
+
+@return best_ref::Union{T,Nothing}: the reference with minimum cost, or nothing if no good reference
+"""
+function find_best_reference_greedy_cost(target::Vector{T}, neighbor_lists::Dict{T,Vector{T}},
+                                        available::Set{T}, ref_workspace::RefBuildWorkspace{T},
+                                        coding_scheme::Symbol, integer_encoding::Symbol) where {T<:Unsigned}
+    # Skip if no candidates available or target too small
+    if isempty(available) || length(target) <= 2
+        return nothing
+    end
+
+    best_ref = nothing
+    best_cost = typemax(Int)  # Initialize to maximum possible cost
+    best_copy_bitmap = Bool[]
+    best_residuals = T[]
+
+    # Evaluate each candidate reference
+    for candidate_ref in available
+        # Skip if candidate has no neighbors (can't be a useful reference)
+        if !haskey(neighbor_lists, candidate_ref)
+            continue
+        end
+
+        ref_neighbors = neighbor_lists[candidate_ref]
+
+        # Skip empty references
+        if isempty(ref_neighbors)
+            continue
+        end
+
+        # Build reference encoding: compute copy bitmap and residuals
+        create_reference_data!(ref_workspace, target, ref_neighbors)
+
+        # Quick filter: skip if overlap is too low (< REF_ENCODING_TH)
+        overlap_count = count(ref_workspace.copy_bitmap)
+        if overlap_count < REF_ENCODING_TH
+            continue
+        end
+
+        # Note: Bandit analysis showed overlap_ratio >= 0.8 predicts reference utility
+        # with 83.3% accuracy, but using it as a hard threshold hurts compression.
+        # The cost-based selection already captures this pattern, so we rely on that.
+
+        # Calculate actual encoding cost using the cost estimation function
+        cost = estimate_reference_encoding_cost(
+            candidate_ref,
+            ref_workspace.copy_bitmap,
+            ref_workspace.residuals,
+            coding_scheme,
+            integer_encoding
+        )
+
+        # Greedy selection: choose minimum cost and save the bitmap/residuals
+        if cost < best_cost
+            best_cost = cost
+            best_ref = candidate_ref
+            best_copy_bitmap = copy(ref_workspace.copy_bitmap)
+            best_residuals = copy(ref_workspace.residuals)
+        end
+    end
+
+    # Copy the best result back to the workspace for the caller
+    if best_ref !== nothing
+        empty!(ref_workspace.copy_bitmap)
+        append!(ref_workspace.copy_bitmap, best_copy_bitmap)
+        empty!(ref_workspace.residuals)
+        append!(ref_workspace.residuals, best_residuals)
+    end
+
+    return best_ref
+end
 
 """
     find_best_reference_fast(target::Vector{T}, ref_index::Union{Index.StreamInvertedIndex{T}, Nothing},
@@ -3630,10 +4331,7 @@ function write_recursive_reference_residuals(w::BitWriter, residuals::Vector{T},
         recursive_residuals = ref_build_work.residuals
 
         write_encoded_value(w, T(best_ref), integer_encoding)  # recursive_ref_id
-        write_encoded_value(w, T(length(copy_bitmap)), integer_encoding)  # bitmap_len
-        for bit in copy_bitmap
-            write_bit(w, bit)
-        end
+        write_bitmap_adaptive(w, copy_bitmap, integer_encoding)  # bitmap (adaptive encoding)
         
         # Write recursive residuals
         if !isempty(recursive_residuals)
@@ -3693,12 +4391,7 @@ function read_recursive_reference_residuals(r::BitReader, coding_scheme::Symbol,
     if recursive_flag
         # Recursive reference encoding
         recursive_ref_id = read_encoded_value(r, integer_encoding, T)
-        bitmap_len = read_encoded_value(r, integer_encoding, T)
-        
-        copy_bitmap = Bool[]
-        for _ in 1:Int(bitmap_len)
-            push!(copy_bitmap, read_bit(r))
-        end
+        copy_bitmap = read_bitmap_adaptive(r, integer_encoding)
         
         recursive_residuals_flag = read_bit(r)
         recursive_residuals = T[]
@@ -3769,19 +4462,18 @@ Estimate the bit cost of recursive reference encoding.
 """
 function estimate_recursive_reference_cost(ref_id::T, copy_bitmap::Vector{Bool}, recursive_residuals::Vector{T}, coding_scheme::Symbol, integer_encoding::Symbol) where {T<:Unsigned}
     cost = 0
-    
+
     # Recursive flag (1 bit)
     cost += 1
-    
+
     # Reference ID cost
     cost += estimate_encoded_value_cost(ref_id, integer_encoding)
-    
-    # Bitmap length cost
-    cost += estimate_encoded_value_cost(T(length(copy_bitmap)), integer_encoding)
-    
-    # Bitmap cost
-    cost += length(copy_bitmap)
-    
+
+    # Bitmap cost (adaptive: 1 flag bit + min(raw, block))
+    raw_cost = estimate_encoded_value_cost(UInt32(length(copy_bitmap)) + UInt32(1), integer_encoding) + length(copy_bitmap)
+    block_cost = estimate_block_encoding_cost(copy_bitmap, integer_encoding)
+    cost += 1 + min(raw_cost, block_cost)
+
     # Recursive residuals flag (1 bit)
     cost += 1
     
@@ -3829,6 +4521,27 @@ function write_bitpacked_bitmap(w::BitWriter, bits::Vector{Bool})
         ptr += 1
     end
     write_bytes(w, out)
+end
+
+"""
+    read_bitpacked_bitmap(r::BitReader, n::Int)::Vector{Bool}
+
+Read a bitmap packed into bytes (MSB-first within each byte), inverse of `write_bitpacked_bitmap`.
+`n` is the number of bits (must be known from context).
+"""
+function read_bitpacked_bitmap(r::BitReader, n::Int)::Vector{Bool}
+    nbytes = (n + 7) >>> 3
+    bits = Vector{Bool}(undef, n)
+    for b in 1:nbytes
+        for j in 0:7
+            idx = (b - 1) * 8 + j + 1
+            bit = read_bit(r)
+            if idx <= n
+                bits[idx] = bit
+            end
+        end
+    end
+    return bits
 end
 
 """
@@ -3883,6 +4596,236 @@ function write_rle_ones_deltas(w::BitWriter, deltas::Vector{T}, varint::Symbol=:
 end
 
 """
+    read_rle_ones_deltas(r::BitReader, varint::Symbol=:fibonacci, ::Type{T}=UInt32) where {T<:Unsigned}
+
+Decode a sequence of deltas encoded with `write_rle_ones_deltas`.
+Reads token count, then for each token: 1-bit flag (1=run of ones, 0=literal delta).
+"""
+function read_rle_ones_deltas(r::BitReader, varint::Symbol=:fibonacci, ::Type{T}=UInt32) where {T<:Unsigned}
+    token_count = Int(read_encoded_value(r, varint, T))
+    deltas = T[]
+    for _ in 1:token_count
+        flag = read_bit(r)
+        if flag  # run of ones
+            runlen = Int(read_encoded_value(r, varint, T))
+            for _ in 1:runlen
+                push!(deltas, one(T))
+            end
+        else  # literal
+            push!(deltas, read_encoded_value(r, varint, T))
+        end
+    end
+    return deltas
+end
+
+"""
+    write_bitmap_rle_ones(w::BitWriter, bitmap::Vector{Bool}, varint::Symbol=:fibonacci)
+
+Encode a bitmap using RLE ones-delta encoding optimized for high-density bitmaps.
+
+This converts the bitmap to positions of 1s, computes deltas between positions,
+and uses the existing `write_rle_ones_deltas` to compress them efficiently.
+
+Perfect for copy bitmaps which typically have:
+- High density (80-90% of bits are 1)
+- Consecutive runs of 1s (positions differ by 1)
+
+@param w::BitWriter: the bitwriter
+@param bitmap::Vector{Bool}: the bitmap to encode
+@param varint::Symbol: encoding for deltas (default: :fibonacci)
+"""
+function write_bitmap_rle_ones(w::BitWriter, bitmap::Vector{Bool}, varint::Symbol=:fibonacci)
+    # Handle empty bitmap
+    if isempty(bitmap)
+        # Write length = 0 (encoded as 1 to avoid Fibonacci zero issue)
+        write_encoded_value(w, UInt32(1), varint)
+        return
+    end
+
+    # Write bitmap length (add 1 to avoid zero)
+    write_encoded_value(w, UInt32(length(bitmap)) + UInt32(1), varint)
+
+    # Find positions of 1s
+    ones_positions = UInt32[]
+    for (i, bit) in enumerate(bitmap)
+        if bit
+            push!(ones_positions, UInt32(i))
+        end
+    end
+
+    # Handle all-zeros bitmap
+    if isempty(ones_positions)
+        # Write ones_count = 0 (encoded as 1 to avoid zero)
+        write_encoded_value(w, UInt32(1), varint)
+        return
+    end
+
+    # Write number of 1s (add 1 to avoid zero)
+    write_encoded_value(w, UInt32(length(ones_positions)) + UInt32(1), varint)
+
+    # Compute deltas between positions (1-based indexing)
+    # First position is absolute, rest are deltas
+    deltas = UInt32[]
+    push!(deltas, ones_positions[1])  # First position (absolute)
+
+    for i in 2:length(ones_positions)
+        push!(deltas, ones_positions[i] - ones_positions[i-1])
+    end
+
+    # Use existing RLE ones-deltas encoder
+    write_rle_ones_deltas(w, deltas, varint)
+end
+
+"""
+    read_bitmap_rle_ones(r::BitReader, varint::Symbol=:fibonacci)::Vector{Bool}
+
+Decode a bitmap encoded with `write_bitmap_rle_ones`.
+
+@param r::BitReader: the bitreader
+@param varint::Symbol: encoding used for deltas (default: :fibonacci)
+@return::Vector{Bool}: the decoded bitmap
+"""
+function read_bitmap_rle_ones(r::BitReader, varint::Symbol=:fibonacci)::Vector{Bool}
+    # Read bitmap length (subtract 1)
+    length_raw = Int(read_encoded_value(r, varint, UInt32))
+    length_val = length_raw - 1
+
+    # Handle empty bitmap
+    if length_val == 0
+        return Bool[]
+    end
+
+    # Read number of 1s (subtract 1)
+    ones_count_raw = Int(read_encoded_value(r, varint, UInt32))
+    ones_count = ones_count_raw - 1
+
+    # Handle all-zeros bitmap
+    if ones_count == 0
+        return fill(false, length_val)
+    end
+
+    # Read token count for RLE ones-deltas
+    token_count = Int(read_encoded_value(r, varint, UInt32))
+
+    # Decode deltas
+    deltas = UInt32[]
+    for _ in 1:token_count
+        flag = read_bit(r)
+        if flag
+            # Run of ones
+            runlen = read_encoded_value(r, varint, UInt32)
+            for _ in 1:runlen
+                push!(deltas, UInt32(1))
+            end
+        else
+            # Literal delta
+            push!(deltas, read_encoded_value(r, varint, UInt32))
+        end
+    end
+
+    # Reconstruct positions from deltas
+    positions = UInt32[]
+    if !isempty(deltas)
+        current_pos = deltas[1]  # First is absolute position
+        push!(positions, current_pos)
+
+        for i in 2:length(deltas)
+            current_pos += deltas[i]
+            push!(positions, current_pos)
+        end
+    end
+
+    # Build bitmap from positions
+    bitmap = fill(false, length_val)
+    for pos in positions
+        if 1 <= pos <= length_val
+            bitmap[pos] = true
+        end
+    end
+
+    return bitmap
+end
+
+"""
+    write_bitmap_adaptive(w::BitWriter, bitmap::Vector{Bool}, varint::Symbol=:fibonacci)
+
+Adaptively encode a bitmap using the most efficient method between two options:
+- Block encoding (WebGraph style): best for sparse bitmaps with clustered 1s
+- Raw bit encoding: best for dense bitmaps
+
+Format:
+  - 1 bit: encoding flag (0=block, 1=raw)
+  - Followed by the encoded data in the chosen format
+
+@param w::BitWriter: the bitwriter
+@param bitmap::Vector{Bool}: the bitmap to encode
+@param varint::Symbol: encoding for length/deltas (default: :fibonacci)
+"""
+function write_bitmap_adaptive(w::BitWriter, bitmap::Vector{Bool}, varint::Symbol=:fibonacci)
+    # Cost-based selection between block and raw encoding
+    # Note: Bandit analysis showed density-based heuristics had only 55.8% accuracy,
+    # so we use pure cost-based selection which performs better in practice.
+    raw_cost = estimate_encoded_value_cost(UInt32(length(bitmap)) + UInt32(1), varint) + length(bitmap)
+    block_cost = estimate_block_encoding_cost(bitmap, varint)
+
+    # Choose the cheapest method (1-bit flag + data)
+    if block_cost < raw_cost
+        # Block encoding (0)
+        write_bit(w, false)
+        write_block_encoding(w, bitmap, varint)
+    else
+        # Raw bits (1)
+        write_bit(w, true)
+        # Write length (add 1 to avoid zero for Fibonacci)
+        write_encoded_value(w, UInt32(length(bitmap)) + UInt32(1), varint)
+        # Write raw bits
+        for bit in bitmap
+            write_bit(w, bit)
+        end
+    end
+end
+
+"""
+    read_bitmap_adaptive(r::BitReader, varint::Symbol=:fibonacci)::Vector{Bool}
+
+Decode an adaptively encoded bitmap written with `write_bitmap_adaptive`.
+Reads 1-bit format code and decodes accordingly:
+- 0 = block encoding
+- 1 = raw bits
+
+@param r::BitReader: the bitreader
+@param varint::Symbol: encoding used for length/deltas (default: :fibonacci)
+@return::Vector{Bool}: the decoded bitmap
+"""
+function read_bitmap_adaptive(r::BitReader, varint::Symbol=:fibonacci)::Vector{Bool}
+    # Read 1-bit encoding flag
+    use_raw = read_bit(r)
+
+    if !use_raw
+        # Block encoding (0)
+        return read_block_encoding(r, varint)
+    else
+        # Raw encoding (1)
+        # Read length (subtract 1)
+        length_raw = Int(read_encoded_value(r, varint, UInt32))
+        length_val = length_raw - 1
+
+        # Handle empty bitmap
+        if length_val == 0
+            return Bool[]
+        end
+
+        # Read raw bits
+        bitmap = Bool[]
+        for _ in 1:length_val
+            push!(bitmap, read_bit(r))
+        end
+
+        return bitmap
+    end
+end
+
+"""
     write_small_count(w::BitWriter, v::T, varint::Symbol=:fibonacci) where {T<:Unsigned}
 
 Write small nonnegative counts efficiently:
@@ -3899,6 +4842,26 @@ function write_small_count(w::BitWriter, v::T, varint::Symbol=:fibonacci) where 
     else
         write_bit(w, true); write_bit(w, true)
         write_encoded_value(w, v, varint)
+    end
+end
+
+"""
+    read_small_count(r::BitReader, varint::Symbol=:fibonacci, ::Type{T}=UInt32) where {T<:Unsigned}
+
+Read a small nonnegative count encoded with `write_small_count`.
+Two-bit codes: 00→0, 01→1, 10→2, 11→varint(v).
+"""
+function read_small_count(r::BitReader, varint::Symbol=:fibonacci, ::Type{T}=UInt32) where {T<:Unsigned}
+    b1 = read_bit(r)
+    b2 = read_bit(r)
+    if !b1 && !b2
+        return T(0)
+    elseif !b1 && b2
+        return T(1)
+    elseif b1 && !b2
+        return T(2)
+    else
+        return read_encoded_value(r, varint, T)
     end
 end
 
@@ -3941,4 +4904,217 @@ function write_bitmap_rle_ones_deltas(w::BitWriter, bits::Vector{Bool}, varint::
     end
 end
 
+"""
+    read_bitmap_rle_ones_deltas(r::BitReader, varint::Symbol=:fibonacci, ::Type{T}=UInt32) where {T<:Unsigned}
+
+Decode a dense bitmap encoded with `write_bitmap_rle_ones_deltas`.
+Reads token count, then (flag, length) tokens to reconstruct the bitmap.
+"""
+function read_bitmap_rle_ones_deltas(r::BitReader, varint::Symbol=:fibonacci, ::Type{T}=UInt32) where {T<:Unsigned}
+    token_count = Int(read_encoded_value(r, varint, T))
+    bits = Bool[]
+    for _ in 1:token_count
+        is_one = read_bit(r)
+        runlen = Int(read_encoded_value(r, varint, T))
+        for _ in 1:runlen
+            push!(bits, is_one)
+        end
+    end
+    return bits
+end
+
+"""
+    write_block_encoding(w::BitWriter, copy_bitmap::Vector{Bool}, varint::Symbol=:fibonacci)
+
+Encode a bitmap using WebGraph's block encoding approach.
+Alternates between copy blocks (1s) and skip blocks (0s):
+[copy B₁, skip B₂, copy B₃, skip B₄, ...]
+
+Format:
+- Number of blocks (encoded)
+- For each block: length (encoded)
+- If block count is even, remaining positions are implicitly copied
+
+This is more efficient than bitmap encoding for sparse reference patterns.
+"""
+function write_block_encoding(w::BitWriter, copy_bitmap::Vector{Bool}, varint::Symbol=:fibonacci)
+    if isempty(copy_bitmap)
+        # Empty bitmap: 0 blocks
+        write_encoded_value(w, UInt32(1), varint)  # 0+1 to avoid Fibonacci zero
+        return
+    end
+
+    # Extract blocks: alternating copy (1s) and skip (0s)
+    blocks = UInt32[]
+    i = 1
+    n = length(copy_bitmap)
+    expecting_copy = true  # First block is always a copy block
+
+    while i <= n
+        block_len = 0
+
+        if expecting_copy
+            # Copy block: count consecutive 1s
+            while i <= n && copy_bitmap[i]
+                block_len += 1
+                i += 1
+            end
+        else
+            # Skip block: count consecutive 0s
+            while i <= n && !copy_bitmap[i]
+                block_len += 1
+                i += 1
+            end
+        end
+
+        if block_len > 0
+            push!(blocks, UInt32(block_len))
+            expecting_copy = !expecting_copy
+        else
+            # Switching between copy/skip modes without consuming elements
+            # This happens when we start with 0s (skip block length 0)
+            if expecting_copy && i <= n && !copy_bitmap[i]
+                # Start with skip instead of copy
+                push!(blocks, UInt32(0))  # Zero-length copy block
+                expecting_copy = false
+            else
+                break
+            end
+        end
+    end
+
+    # Write number of blocks
+    write_encoded_value(w, UInt32(length(blocks)) + UInt32(1), varint)  # +1 to avoid zero
+
+    # Write block lengths
+    for block_len in blocks
+        write_encoded_value(w, block_len + UInt32(1), varint)  # +1 to avoid zero
+    end
+end
+
+"""
+    read_block_encoding(r::BitReader, varint::Symbol=:fibonacci)::Vector{Bool}
+
+Decode a bitmap from WebGraph's block encoding format.
+Reconstructs the bitmap from alternating copy/skip blocks.
+"""
+function read_block_encoding(r::BitReader, varint::Symbol=:fibonacci)::Vector{Bool}
+    # Read number of blocks
+    num_blocks_raw = read_encoded_value(r, varint, UInt32)
+    num_blocks = Int(num_blocks_raw - UInt32(1))
+
+    if num_blocks == 0
+        return Bool[]
+    end
+
+    # Read block lengths
+    block_lengths = UInt32[]
+    for _ in 1:num_blocks
+        len_raw = read_encoded_value(r, varint, UInt32)
+        push!(block_lengths, len_raw - UInt32(1))
+    end
+
+    # Reconstruct bitmap
+    bitmap = Bool[]
+    expecting_copy = true  # First block is always a copy block
+
+    for block_len in block_lengths
+        if expecting_copy
+            # Copy block: append 1s
+            for _ in 1:block_len
+                push!(bitmap, true)
+            end
+        else
+            # Skip block: append 0s
+            for _ in 1:block_len
+                push!(bitmap, false)
+            end
+        end
+        expecting_copy = !expecting_copy
+    end
+
+    return bitmap
+end
+
+"""
+    estimate_block_encoding_cost(copy_bitmap::Vector{Bool}, varint::Symbol)::Int
+
+Estimate the cost in bits of encoding a bitmap using block encoding.
+"""
+function estimate_block_encoding_cost(copy_bitmap::Vector{Bool}, varint::Symbol)::Int
+    if isempty(copy_bitmap)
+        return estimate_encoded_value_cost(UInt32(1), varint)
+    end
+
+    # Extract blocks to count them
+    blocks = UInt32[]
+    i = 1
+    n = length(copy_bitmap)
+    expecting_copy = true
+
+    while i <= n
+        block_len = 0
+
+        if expecting_copy
+            while i <= n && copy_bitmap[i]
+                block_len += 1
+                i += 1
+            end
+        else
+            while i <= n && !copy_bitmap[i]
+                block_len += 1
+                i += 1
+            end
+        end
+
+        if block_len > 0
+            push!(blocks, UInt32(block_len))
+            expecting_copy = !expecting_copy
+        else
+            if expecting_copy && i <= n && !copy_bitmap[i]
+                push!(blocks, UInt32(0))
+                expecting_copy = false
+            else
+                break
+            end
+        end
+    end
+
+    # Cost = block count + sum of block lengths
+    cost = estimate_encoded_value_cost(UInt32(length(blocks)) + UInt32(1), varint)
+
+    for block_len in blocks
+        cost += estimate_encoded_value_cost(block_len + UInt32(1), varint)
+    end
+
+    return cost
+end
+
+# -----------------------------------------------------------------------------
+# Submodules
+# -----------------------------------------------------------------------------
+
+# ASTRA (Adaptive Streaming Adjacency) Compression - Documentation Module
+# Note: ASTRA functions are defined above in this file and already exported
+# The ASTRA submodule serves as documentation and organization
+include("compression/astra.jl")
+using .ASTRA
+export ASTRA
+
+# ASTRA-L (Layered) Compression
+include("compression/astra_layered.jl")
+using .ASTRALayered
+export ASTRALayered
+
+# RCGE (Recursive Compression for Graph Edges)
+include("compression/rcge.jl")
+using .RCGE
+export RCGE
+
+# InterEncoding
+include("compression/rcge/inter_encoding.jl")
+using .InterEncoding
+export InterEncoding
+
+# -----------------------------------------------------------------------------
 end # module Compression

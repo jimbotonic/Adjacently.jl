@@ -1,6 +1,38 @@
-# Adjancently.jl 
+# Adjancently.jl
 
 Adjancently.jl is Julia library for the analysis of large complex directed networks.
+
+## ASTRA Compression
+
+**ASTRA** (**A**daptive **STR**eaming **A**djacency) is a graph compression method for large-scale directed networks, inspired by the [WebGraph framework](http://webgraph.di.unimi.it/).
+
+### Key Features
+
+- **Greedy Cost-Based Reference Selection**: Unlike WebGraph's overlap-based heuristics, ASTRA evaluates all candidate references in a sliding window and selects the one with minimum encoding cost
+- **Adaptive Bitmap Encoding**: Automatically chooses between block encoding (for sparse patterns) and raw encoding (for dense patterns) based on actual bit costs
+- **Recursive Reference Compression**: Supports multi-level reference chains for graphs with strong locality
+- **Variable-Length Integer Encoding**: Supports multiple schemes (Fibonacci, Elias-Gamma/Delta, Golomb, Zeta, FED)
+- **Mix Encoding**: Combines interval encoding and run-length encoding for residual neighbors
+
+### Performance
+
+On the CNR-2000 web graph (325,557 vertices, 3,216,152 edges):
+- **5.108 bits per edge**
+- **1.57 edges per byte** compression ratio
+- Perfect round-trip fidelity
+
+### Format
+
+ASTRA graphs are stored in the MGS (Modified Graph Structure) format with the `OPTION_ASTRA` flag, which enables:
+1. Delta encoding for sorted adjacency lists
+2. Mix encoding (intervals + run-length) for residuals
+3. Greedy reference selection with adaptive bitmap compression
+4. Recursive reference support
+
+### References
+
+- [WebGraph: A Framework for Graph Compression](http://webgraph.di.unimi.it/) - Paolo Boldi and Sebastiano Vigna
+- [The WebGraph Framework](https://dl.acm.org/doi/10.1145/988672.988752) - WWW 2004
 
 ## Tests
 

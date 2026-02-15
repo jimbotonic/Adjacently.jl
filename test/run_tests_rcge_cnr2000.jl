@@ -22,7 +22,7 @@ using Logging
 using Adjacently.RCGE: encode_level, RCGEParams
 using Adjacently.IO: load_adjacency_list_from_csv, BitWriter, flush_bitwriter
 using Adjacently.Clustering: louvain_partition, leiden_partition, aggregate_graph
-using Adjacently.Relabeling: relabel_vertices_rcm, relabel_vertices_llp, relabel_vertices_minhash
+using Adjacently.Relabeling: relabel_vertices_rcm, relabel_vertices_llp, relabel_vertices_minhash, relabel_graph
 using Adjacently.Graph: subgraph
 using LightGraphs
 using LightGraphs: nv, outneighbors
@@ -42,6 +42,47 @@ using LightGraphs: nv, outneighbors
         g = load_adjacency_list_from_csv(cnr_csv, ',', true)
         n = nv(g)
         @info "Graph loaded: n=$n"
+        # Optional: Cluster-aware global reorder (2-level). Disabled by default.
+        DO_CLUSTER_AWARE = get(ENV, "RCGE_CLUSTER_AWARE", "false") in ("1","true","TRUE")
+        if DO_CLUSTER_AWARE
+            # 1) Partition -> 2) cluster blocks -> 3) local MinHash inside blocks -> relabel
+            tca0 = time()
+            K1 = try parse(Int, get(ENV, "RCGE_K1", "8")) catch; 8 end
+            @info "Cluster-aware global reorder: computing initial partition (K1=$(K1))..."
+            part_ca = leiden_partition(g; max_passes=8, max_levels=5)
+            counts_ca = Dict{Int,Int}(); for c in part_ca; counts_ca[c] = get(counts_ca,c,0)+1; end
+            labels_sorted_ca = sort(collect(keys(counts_ca)), by = c -> -counts_ca[c])
+            topK = min(K1, length(labels_sorted_ca))
+            top = labels_sorted_ca[1:topK]
+            top_index = Dict{Int,Int}(c => i for (i,c) in enumerate(top))
+            Vcur = (typeof(g)).parameters[1]
+            blocks = Vector{Vector{Vcur}}(undef, topK + 1)
+            for i in 1:length(blocks); blocks[i] = Vcur[]; end
+            for i in 1:n
+                c = part_ca[i]
+                b = get(top_index, c, topK+1)
+                push!(blocks[b], Vcur(i))
+            end
+            new_order = Vcur[]
+            for b in 1:length(blocks)
+                C = blocks[b]
+                if length(C) <= 2
+                    append!(new_order, C)
+                    continue
+                end
+                sg, oni, noi = subgraph(g, C)
+                k_mh = try parse(Int, get(ENV, "RCGE_MINHASH_K", "64")) catch; 64 end
+                mloc = relabel_vertices_minhash(sg, :sym; k=k_mh)
+                sort!(C, by = v -> Int(mloc[oni[v]]))
+                append!(new_order, C)
+            end
+            mapping_global = Dict{Vcur,Vcur}()
+            for (i,v) in enumerate(new_order)
+                mapping_global[v] = Vcur(i)
+            end
+            g = relabel_graph(g, mapping_global)
+            @info "Cluster-aware reorder finished in $(round(time()-tca0,digits=3))s"
+        end
 
         # Relabeling flags (tune cluster-internal ordering)
         # Available methods: :none, :rcm, :llp, :minhash
@@ -101,10 +142,13 @@ using LightGraphs: nv, outneighbors
 
         # Parameters
         max_levels = 5
-        min_clusters = 32
+        # Multi-level stop threshold (env override RCGE_MIN_CLUSTERS, default 32)
+        min_clusters = try parse(Int, get(ENV, "RCGE_MIN_CLUSTERS", "32")) catch; 32 end
         # Use Fibonacci for positive-only fields and Elias-delta(+1) for zero-allowing fields
         INTER_STRATEGY = Symbol(get(ENV, "RCGE_INTER", "perm"))
-        params = RCGEParams(L=128, varint=:fibonacci, count_varint=:elias_delta, gap=:fibonacci, degree=:elias_delta, undirected_pairs=false, perm_strategy=:blockpos, membership=:elias_fano, inter_strategy=INTER_STRATEGY)
+        BLOCK_TRY = get(ENV, "RCGE_BLOCK_TRY", "false") in ("1","true","TRUE")
+        # Use best from sweep: positions=delta, additions=delta, RLE=false
+        params = RCGEParams(L=128, varint=:fibonacci, count_varint=:fibonacci, gap=:fibonacci, degree=:elias_delta, undirected_pairs=false, perm_strategy=:blockpos, membership=:elias_fano, inter_strategy=INTER_STRATEGY, intra_ref_enabled=true, intra_ref_window=32, intra_ref_min_overlap=0.3, intra_ref_rle=false, intra_block_try=false, positions_mode=:delta, additions_mode=:delta)
 
         # Helper: reorder vertices inside each cluster using RCM on the induced subgraph
         function reorder_clusters!(clusters, base_g)
@@ -137,61 +181,19 @@ using LightGraphs: nv, outneighbors
             return clusters
         end
 
-        # Quick sweeps: RLE enabled/disabled for intra ref_deltas (level-1 only)
-        INTER = Symbol(get(ENV, "RCGE_SWEEP_INTER", "perm"))
-        METHOD = :none
-        part1 = leiden_partition(g; max_passes=8, max_levels=5)
-        counts = Dict{Int,Int}(); for c in part1; counts[c] = get(counts,c,0)+1; end
-        labels_sorted = sort(collect(keys(counts)), by = c -> -counts[c])
-        K1 = 8
-        topK = min(K1, length(labels_sorted))
-        top = labels_sorted[1:topK]
-        top_index = Dict{Int,Int}(c => i for (i,c) in enumerate(top))
-        Vcur = (typeof(g)).parameters[1]
-        clusters1 = [Vcur[] for _ in 1:(topK + 1)]
-        other_label = topK + 1
-        capped_part = similar(part1)
-        for i in 1:n
-            c = part1[i]
-            bucket = get(top_index, c, other_label)
-            capped_part[i] = bucket
-            push!(clusters1[bucket], Vcur(i))
-        end
-        clusters1 = filter(!isempty, clusters1)
-        @info "RLE sweep base: K1=$(K1) inter=$(INTER) clusters after capping=$(length(clusters1))"
-        for rle in (false, true)
-            io = IOBuffer(); w = BitWriter(io)
-            params1 = RCGEParams(L=128, varint=:fibonacci, count_varint=:elias_delta, gap=:fibonacci, degree=:elias_delta, undirected_pairs=false, perm_strategy=:blockpos, membership=:elias_fano, inter_strategy=INTER, intra_ref_enabled=true, intra_ref_window=32, intra_ref_min_overlap=0.3, intra_ref_rle=rle)
-            stats1 = Adjacently.RCGE.RCGEStats()
-            tenc0 = time(); encode_level(w, g, clusters1; params=params1, stats=stats1); flush_bitwriter(w; flush_last_bits=true); bytes1 = take!(io); tenc1 = time()
-            bpe1 = 8.0 * length(bytes1) / max(count_edges(g), 1)
-            mb = ceil(Int, stats1.bits_membership / 8)
-            ib = ceil(Int, stats1.bits_intra / 8)
-            ihe = ceil(Int, stats1.bits_intra_headers / 8)
-            icp = ceil(Int, stats1.bits_intra_copy / 8)
-            iad = ceil(Int, stats1.bits_intra_add / 8)
-            irw = ceil(Int, stats1.bits_intra_raw / 8)
-            hb = ceil(Int, stats1.bits_inter_headers / 8)
-            db = ceil(Int, stats1.bits_inter_degrees / 8)
-            pb = ceil(Int, stats1.bits_inter_perms / 8)
-            @info "RLE=$(rle) inter=$(INTER): encode_time=$(round(tenc1-tenc0,digits=3))s size=$(length(bytes1)) bytes, bpe=$(round(bpe1,digits=4))"
-            @info "RLE=$(rle) inter=$(INTER): sections (bytes): membership=$(mb), intra=$(ib) [headers=$(ihe), copy=$(icp), add=$(iad), raw=$(irw)], inter_headers=$(hb), inter_degrees=$(db), inter_perms=$(pb)"
-            @info "RLE=$(rle) inter=$(INTER): intra refs used=$(stats1.intra_ref_used), no_ref=$(stats1.intra_no_ref)"
-        end
-
-        # Iterate levels until threshold
+        # (Sweeps removed) Single multi-level run only
+# Single multi-level run with fixed min_clusters
         cur_g = g
         m_original = count_edges(g)
         total_bytes = 0
         prev_coarse_n = -1
         level = 1
-        # Initial K1 can be overridden via env var RCGE_K1; defaults to 64
-        K = try parse(Int, get(ENV, "RCGE_K1", "8")) catch; 8 end  # initial cap on clusters for level 1 (then adaptive)
+        K = try parse(Int, get(ENV, "RCGE_K1", "8")) catch; 8 end
         @info "Initial K1 for multi-level: $(K)"
         while level <= max_levels
-            ncur = nv(cur_g)
-            mcur = count_edges(cur_g)
-            @info "Level $level: n=$ncur m=$mcur"
+                ncur = nv(cur_g)
+                mcur = count_edges(cur_g)
+                @info "Level $level: n=$ncur m=$mcur"
 
             # Partition current graph via Louvain
             t0 = time()
@@ -243,46 +245,47 @@ using LightGraphs: nv, outneighbors
             # Prepare next level's K adaptively (halve, but not below 16, and not above current K)
             K = max(16, min(K, ceil(Int, nclusters / 2)))
 
-            # Encode RCGE level and compute stats
-            io = IOBuffer(); w = BitWriter(io)
-            t2 = time()
-            stats = Adjacently.RCGE.RCGEStats()
-            encode_level(w, cur_g, clusters; params=params, stats=stats)
-            flush_bitwriter(w; flush_last_bits=true)
-            bytes = take!(io)
-            t3 = time()
-            @test length(bytes) > 0
-            level_bytes = length(bytes)
-            total_bytes += level_bytes
-            bpe = 8.0 * level_bytes / max(mcur, 1)
-            cum_bpe = 8.0 * total_bytes / max(m_original, 1)
-            # Sectional bytes
-            memb_b = ceil(Int, stats.bits_membership / 8)
-            intra_b = ceil(Int, stats.bits_intra / 8)
-            head_b = ceil(Int, stats.bits_inter_headers / 8)
-            deg_b  = ceil(Int, stats.bits_inter_degrees / 8)
-            perm_b = ceil(Int, stats.bits_inter_perms / 8)
-            @info "RCGE Level $(level): encode_time=$(round(t3-t2,digits=3))s size=$(level_bytes) bytes, bits/edge=$(round(bpe, digits=4)), cumulative_bits/edge=$(round(cum_bpe, digits=4))"
-            @info "  Sections (bytes): membership=$(memb_b), intra=$(intra_b), inter_headers=$(head_b), inter_degrees=$(deg_b), inter_perms=$(perm_b)"
+                # Encode RCGE level and compute stats
+                io = IOBuffer(); w = BitWriter(io)
+                t2 = time(); stats = Adjacently.RCGE.RCGEStats()
+                encode_level(w, cur_g, clusters; params=params, stats=stats)
+                flush_bitwriter(w; flush_last_bits=true); bytes = take!(io); t3 = time()
+                @test length(bytes) > 0
+                level_bytes = length(bytes); total_bytes += level_bytes
+                bpe = 8.0 * level_bytes / max(mcur, 1)
+                cum_bpe = 8.0 * total_bytes / max(m_original, 1)
+                # Sectional bytes
+                memb_b = ceil(Int, stats.bits_membership / 8)
+                intra_b = ceil(Int, stats.bits_intra / 8)
+                ihe = ceil(Int, stats.bits_intra_headers / 8)
+                irs = ceil(Int, stats.bits_intra_ref_small_headers / 8)
+                icp = ceil(Int, stats.bits_intra_copy / 8)
+                iad = ceil(Int, stats.bits_intra_add / 8)
+                irw = ceil(Int, stats.bits_intra_raw / 8)
+                head_b = ceil(Int, stats.bits_inter_headers / 8)
+                deg_b  = ceil(Int, stats.bits_inter_degrees / 8)
+                perm_b = ceil(Int, stats.bits_inter_perms / 8)
+                @info "RCGE Level $(level): encode_time=$(round(t3-t2,digits=3))s size=$(level_bytes) bytes, bits/edge=$(round(bpe, digits=4)), cumulative_bits/edge=$(round(cum_bpe, digits=4))"
+                @info "  Sections (bytes): membership=$(memb_b), intra=$(intra_b) [headers=$(ihe), ref_small_hdrs=$(irs), copy=$(icp), add=$(iad), raw=$(irw)], inter_headers=$(head_b), inter_degrees=$(deg_b), inter_perms=$(perm_b)"
 
             # Build coarse graph and check threshold
-            t4 = time(); Gc = aggregate_graph(cur_g, capped_part); t5 = time()
-            @info "Aggregated to coarse graph: n=$(Gc.n) in $(round(t5-t4,digits=3))s"
-            # Early stopping: no change in coarse size
-            if prev_coarse_n == Gc.n
-                @info "Stopping: coarse size unchanged ($(Gc.n)) from previous level"
-                break
+                t4 = time(); Gc = aggregate_graph(cur_g, capped_part); t5 = time()
+                @info "Aggregated to coarse graph: n=$(Gc.n) in $(round(t5-t4,digits=3))s"
+                # Early stopping: no change in coarse size
+                if prev_coarse_n == Gc.n
+                    @info "Stopping: coarse size unchanged ($(Gc.n)) from previous level"
+                    break
+                end
+                prev_coarse_n = Gc.n
+                if Gc.n <= min_clusters
+                    @info "Stopping: coarse communities $(Gc.n) <= min_clusters $(min_clusters)"
+                    break
+                end
+                # Convert coarse weighted graph to TestGraph for next iteration
+                t6 = time(); cur_g = coarse_to_testgraph(Gc); t7 = time()
+                @info "Converted coarse to TestGraph in $(round(t7-t6,digits=3))s"
+                level += 1
             end
-            prev_coarse_n = Gc.n
-            if Gc.n <= min_clusters
-                @info "Stopping: coarse communities $(Gc.n) <= min_clusters $(min_clusters)"
-                break
-            end
-            # Convert coarse weighted graph to TestGraph for next iteration
-            t6 = time(); cur_g = coarse_to_testgraph(Gc); t7 = time()
-            @info "Converted coarse to TestGraph in $(round(t7-t6,digits=3))s"
-            level += 1
-        end
     finally
         global_logger(prev_logger)
     end
