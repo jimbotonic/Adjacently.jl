@@ -9,13 +9,17 @@ Header has 12 bytes:
 	- coding scheme (2 bits): 0b00: children | 0b01: index
 	- integer encoding (4 bits): 0x1: Elias gamma | 0x2: Elias delta | 0x3: Golomb | 0x4: FED | 0x5: Zeta | 0x6: Fibonacci
   * Byte 2:
-	- option flags: 		
-    	- 0000 0000: no option
-    	- 0000 0001: complex [delta encoding only] - so called "delta"
-    	- 0000 0011: complex [delta + mix encoding (run-length + interval)] - so called "mix"
-    	- 0000 0111: complex [delta + mix + reference only] - so called "hybrid"
-    	- 0000 1111: complex [delta + mix + recursive reference] - so called "hybrid+"
-    	- 1000 0000: Huffman - so called "huffman"
+    - option flags:
+      - 0x00: no option
+      - 0x01: complex [delta only] (deprecated tag; prefer ASTRA)
+      - 0x03: complex [delta + mix (run-length + interval)] (deprecated tag)
+      - 0x07: complex [delta + mix + reference] (deprecated tag)
+      - 0x0F: ASTRA [delta + mix + recursive reference]
+      - 0x10–0x8F: RL policy-based compression (128 policy slots)
+        - 0x10: RL policy 1, 0x11: RL policy 2, … up to 0x8F: RL policy 128
+        - Per-vertex encoding decisions from the referenced policy
+        - Integer encoding in byte 1 is informational if policy varies per vertex
+      - 0xFF: Huffman (deprecated)
 - # vertices: 5 bytes position 
 
 The header format is thus:

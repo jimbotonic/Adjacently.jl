@@ -43,10 +43,6 @@ include("index.jl")
 using .Index
 export Index
 
-include("compression.jl")
-using .Compression
-export Compression
-
 include("algo.jl")
 using .Algo
 export Algo
@@ -59,17 +55,29 @@ include("pr.jl")  # Now PageRank will have access to both CustomTypes and Random
 using .PageRank
 export PageRank
 
-include("graph.jl")
+include("graph.jl")  # Load Graph before Compression (Compression.ASTRALayered depends on Graph)
 using .Graph
 export Graph
+
+include("compression.jl")
+using .Compression
+export Compression
 
 include("relabeling.jl")
 using .Relabeling
 export Relabeling
 
+include("gnn/GNN.jl")
+using .GNN
+export GNN
+
 include("cycles.jl")
 using .Cycles
 export Cycles
+
+include("rl/RL.jl")  # Load RL before MGS (MGS imports RL for policy-based compression)
+using .RL
+export RL
 
 include("mgs.jl")
 using .MGS
@@ -82,9 +90,5 @@ export Distribution
 include("clustering.jl")
 using .Clustering
 export Clustering
-
-include("rcge.jl")
-using .RCGE
-export RCGE
 
 end # module Adjacently
