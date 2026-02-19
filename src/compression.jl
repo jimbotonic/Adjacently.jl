@@ -27,6 +27,9 @@ using ..Constants: FIB_NUMBERS, BUFFER_SIZE, ZETA_H_BOUNDS, ZETA_POWER_BASES, ZE
 GOLOMB_BASE, REF_ENCODING_TH, REF_V_MIN_DEGREE, FED_BLOCK_SIZE, MIN_INTERVAL_LENGTH, MIN_RUN_LENGTH, REF_WINDOW_SIZE
 
 using ..Index
+using ..CompressionUtils
+using ..RL
+
 
 # Export the functions we want to make available
 export write_unary_coding,
@@ -45,6 +48,10 @@ export write_unary_coding,
        write_elias_gamma,
        read_elias_gamma,
        write_elias_coding,
+       write_hybrid_mix_encoded_list,
+       read_hybrid_mix_encoded_list,
+       analyze_delta_patterns_hybrid,
+       reconstruct_from_delta,
        read_elias_coding,
        write_elias_fano,
        read_elias_fano,
@@ -78,7 +85,8 @@ export write_unary_coding,
        estimate_encoded_value_cost,
        estimate_interval_runlength_encoding_cost,
        write_rl_compressed_graph_data,
-       read_rl_compressed_graph_data
+       read_rl_compressed_graph_data,
+       CommandStream
 
 # Lightweight workspace types for reference building
 struct RefBuildWorkspace{T<:Unsigned}
@@ -565,17 +573,7 @@ Delta encode a list of integers
 @param shifted::Bool: Whether to shift the list by 1 to avoid 0
 @return::Vector{T}: The delta encoded list
 """
-function delta_encode_vector(lst::Vector{T})::Vector{T} where {T<:Unsigned}
-    # if the list is empty, return an empty list
-    isempty(lst) && return T[]
-    # initialize the differences with the first element
-    diffs = [T(lst[firstindex(lst)])]
-    # for each element in the list, compute the difference with the previous element
-    for i in eachindex(lst)[2:end]
-        push!(diffs, T(lst[i] - lst[i-1]))
-    end
-    return diffs
-end
+
 
 """
     write_elias_gamma(w::BitWriter, v::T) where {T<:Unsigned}
@@ -1270,36 +1268,7 @@ Returns (intervals, residuals) where intervals are consecutive ranges ≥ min_in
 @param min_interval_length::Int: minimum length for interval compression (default: 4)
 @return: (intervals, residuals) - intervals as [(start,length)], residuals as remaining values
 """
-function compress_intervals(neighbors::Vector{T}, min_interval_length::Int=4) where {T<:Unsigned}
-    isempty(neighbors) && return (Tuple{T,T}[], T[])
-    
-    intervals = Tuple{T,T}[]  # (start, length)
-    residuals = T[]
-    i = 1
-    
-    while i <= length(neighbors)
-        # Check for consecutive sequence starting at i
-        consecutive_len = 1
-        while i + consecutive_len <= length(neighbors) && 
-              neighbors[i + consecutive_len] == neighbors[i] + T(consecutive_len)
-            consecutive_len += 1
-        end
-        
-        if consecutive_len >= min_interval_length
-            # Create interval: (start, length)
-            push!(intervals, (neighbors[i], T(consecutive_len)))
-            i += consecutive_len
-        else
-            # Add to residuals
-            for j in 0:(consecutive_len-1)
-                push!(residuals, neighbors[i + j])
-            end
-            i += consecutive_len
-        end
-    end
-    
-    return (intervals, residuals)
-end
+
 
 """
     compress_run_length(residuals::Vector{T}, min_run_length::Int=3) where {T<:Unsigned}
@@ -1892,153 +1861,7 @@ function write_hybrid_mix_encoded_list(w::BitWriter, delta_list::Vector{T}, enco
     end
 end
 
-"""
-    analyze_delta_patterns_hybrid(delta_values::Vector{T}, original_neighbors::Vector{T}, min_interval_length::Int=MIN_INTERVAL_LENGTH) where {T<:Unsigned}
 
-Analyze delta values (from position 2 onwards) to determine optimal hybrid encoding sections.
-Uses original neighbors to detect intervals, then creates appropriate sections.
-Returns a vector of encoding sections, each with a type (:delta, :run_length, :interval) and data.
-
-"""
-function analyze_delta_patterns_hybrid(delta_values::Vector{T}, original_neighbors::Vector{T}, min_interval_length::Int=MIN_INTERVAL_LENGTH) where {T<:Unsigned}
-    if isempty(delta_values)
-        return []
-    end
-    
-    sections = []
-    delta_i = 1  # index into delta_values
-    orig_i = 1   # index into original_neighbors
-    
-    while delta_i <= length(delta_values) && orig_i <= length(original_neighbors)
-        # Check for consecutive interval starting at current position in original neighbors
-        interval_len = find_consecutive_length(original_neighbors, orig_i)
-        
-        if interval_len >= min_interval_length
-            # Create interval section: start and length
-            @debug "  Found interval: start=$(original_neighbors[orig_i]), length=$interval_len at orig_pos=$orig_i"
-            push!(sections, (type=:interval, data=[original_neighbors[orig_i], T(interval_len)]))
-            delta_i += interval_len
-            orig_i += interval_len
-            continue
-        end
-        
-        # No interval found, create delta section for this region
-        delta_start = delta_i
-        delta_end = delta_i
-        orig_end = orig_i
-        
-        # Extend delta section until we find a good interval
-        while orig_end < length(original_neighbors)
-            next_interval_len = find_consecutive_length(original_neighbors, orig_end + 1)
-            if next_interval_len >= min_interval_length
-                break
-            end
-            delta_end += 1
-            orig_end += 1
-        end
-        
-        # Create delta section from the delta values
-        if delta_end >= delta_start && delta_end <= length(delta_values)
-            section_deltas = delta_values[delta_start:delta_end]
-            
-            # Check if delta values have run-length patterns worth encoding
-            run_length_sections = find_run_length_patterns(section_deltas)
-            append!(sections, run_length_sections)
-        end
-        
-        delta_i = delta_end + 1
-        orig_i = orig_end + 1
-    end
-    
-    return sections
-end
-
-"""
-    find_consecutive_length(neighbors::Vector{T}, start::Int) where {T<:Unsigned}
-
-Find the length of consecutive sequence starting at given position.
-Returns the length of the consecutive sequence (1 if no sequence).
-
-"""
-function find_consecutive_length(neighbors::Vector{T}, start::Int) where {T<:Unsigned}
-    if start > length(neighbors)
-        return 0
-    end
-    
-    len = 1
-    while start + len <= length(neighbors) && 
-          neighbors[start + len] == neighbors[start] + T(len)
-        len += 1
-    end
-    
-    return len
-end
-
-"""
-    find_run_length_patterns(delta_values::Vector{T}) where {T<:Unsigned}
-
-Find run-length patterns in delta values and create appropriate sections.
-Returns a vector of sections (delta or run_length).
-
-"""
-function find_run_length_patterns(delta_values::Vector{T}) where {T<:Unsigned}
-    sections = []
-    i = 1
-    
-    while i <= length(delta_values)
-        # Count consecutive occurrences
-        current_val = delta_values[i]
-        run_len = 1
-        while i + run_len <= length(delta_values) && 
-              delta_values[i + run_len] == current_val
-            run_len += 1
-        end
-        
-        if run_len >= 3  # Use run-length for 3+ consecutive values
-            @debug "  Found run-length: value=$current_val, length=$run_len at delta_pos=$i"
-            push!(sections, (type=:run_length, data=[current_val, T(run_len)]))
-            i += run_len
-        else
-            # Create delta section - collect individual values until next run
-            delta_start = i
-            delta_end = i
-            
-            # Extend until we find another run-length opportunity
-            while delta_end < length(delta_values)
-                next_run = count_consecutive(delta_values, delta_end + 1)
-                if next_run >= 3
-                    break
-                end
-                delta_end += 1
-            end
-            
-            push!(sections, (type=:delta, data=delta_values[delta_start:delta_end]))
-            i = delta_end + 1
-        end
-    end
-    
-    return sections
-end
-
-"""
-    count_consecutive(values::Vector{T}, start::Int) where {T<:Unsigned}
-
-Count consecutive occurrences of the same value starting at given position.
-
-"""
-function count_consecutive(values::Vector{T}, start::Int) where {T<:Unsigned}
-    if start > length(values)
-        return 0
-    end
-    
-    count = 1
-    val = values[start]
-    while start + count <= length(values) && values[start + count] == val
-        count += 1
-    end
-    
-    return count
-end
 
 """
     read_hybrid_mix_encoded_list(r::BitReader, encoding::Symbol, mode::Symbol, ::Type{T}=UInt8; max_elements::Union{Int,Nothing}=nothing, stop_value::Union{T,Nothing}=nothing) where {T<:Unsigned}
@@ -2231,27 +2054,7 @@ function read_hybrid_mix_encoded_list(r::BitReader, coding_scheme::Symbol, integ
     return original_list
 end
 
-"""
-    reconstruct_from_delta(delta_values::Vector{T}) where {T<:Unsigned}
 
-Reconstruct original values from delta-encoded values.
-
-@param delta_values::Vector{T}: the delta-encoded values
-@return Vector{T}: the original values
-
-"""
-function reconstruct_from_delta(delta_values::Vector{T}) where {T<:Unsigned}
-    if isempty(delta_values)
-        return T[]
-    end
-    
-    result = T[delta_values[1]]
-    for i in 2:length(delta_values)
-        push!(result, result[end] + delta_values[i])
-    end
-    
-    return result
-end
 
 """
     read_mix_encoded_list(r::BitReader, encoding::Symbol, mode::Symbol, ::Type{T}=UInt8; stop_value::Union{T,Nothing}=nothing, max_elements::Union{Int,Nothing}=nothing) where {T<:Unsigned}
@@ -2686,45 +2489,6 @@ function estimate_mix_encoding_cost(values::Vector{T}, integer_encoding::Symbol)
     return cost
 end
 
-"""
-    estimate_encoded_value_cost(value::T, encoding::Symbol) where {T<:Unsigned}
-
-Estimate the bit cost of encoding a single value with the given encoding scheme.
-This is a simplified estimation - actual cost depends on bit-level details.
-
-@param value::T: the value to encode
-@param integer_encoding::Symbol: the integer encoding used (:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta)
-@return::Int: the estimated cost in bits
-
-"""
-function estimate_encoded_value_cost(value::T, integer_encoding::Symbol) where {T<:Unsigned}
-    if value == 0
-        return 1  # Special case
-    end
-    
-    # Rough bit cost estimates for different encodings
-    if integer_encoding == :fibonacci
-        # Fibonacci encoding roughly log_phi(n) + log_phi(n)/phi bits
-        return ceil(Int, log(2, max(1, value)) * 1.44) + 2
-    elseif integer_encoding == :elias_gamma
-        # Elias gamma: 2⌊log2(n)⌋ + 1 bits  
-        return 2 * floor(Int, log(2, max(1, value))) + 1
-    elseif integer_encoding == :elias_delta
-        # Elias delta: roughly log2(n) + 2log2(log2(n)) bits
-        log_val = max(1, log(2, max(1, value)))
-        return ceil(Int, log_val + 2 * log(2, max(1, log_val)))
-    elseif integer_encoding == :zeta
-        # Zeta coding with k=3: h in unary (h+1 bits) + remainder in truncated binary (~k bits)
-        # For k=3: values 1-7 → h=0, cost ≈ 1 + 3 = 4 bits; values 8-63 → h=1, cost ≈ 2 + 6 = 8 bits
-        k = ZETA_BASE
-        log2_v = max(0, floor(Int, log(2, max(1, value))))
-        h = div(log2_v, k)
-        return (h + 1) + k * (h + 1)  # unary(h) + truncated binary bits
-    else
-        # Default fallback
-        return ceil(Int, log(2, max(1, value))) + 2
-    end
-end
 
 ################################################################################
 # START: read / write compressed graph data
@@ -3469,6 +3233,44 @@ end
 
 # Min interval length tag: 2 bits encoding index into [2, 3, 4, 5]
 const RL_MIL_OPTIONS = [2, 3, 4, 5]
+const RL_REF_OPTIONS = [:none, :reference, :recursive]  # Must match REFERENCE_OPTIONS in RL module
+
+# Default encoding for RL-compressed streams
+const _RL_FIXED_ENCODING = :fibonacci
+
+# Flattened Encoding Options (Type, MIL)
+const RL_ENCODING_OPTIONS = vcat(
+    [(:interval, mil) for mil in RL_MIL_OPTIONS],
+    [(:rle, mil) for mil in RL_MIL_OPTIONS],
+    [(:delta, 0)]
+)
+
+"""
+    _rl_decode_action(a_idx) -> (encoding, ref_mode, mil)
+
+Decode an action index into encoding, reference mode, and min interval length.
+Action index is 1-based, encoding matches RL module's action space.
+"""
+function _rl_decode_action(a_idx::Int)
+    idx = a_idx - 1
+    enc_idx = idx % length(RL_ENCODING_OPTIONS) + 1
+    ref_idx = idx ÷ length(RL_ENCODING_OPTIONS) + 1
+    enc_type, mil = RL_ENCODING_OPTIONS[enc_idx]
+    return (_RL_FIXED_ENCODING, RL_REF_OPTIONS[ref_idx], mil, enc_type)
+end
+
+function _write_enc_opt_tag(w, enc_type::Symbol, mil::Int)
+    tuple = (enc_type, mil)
+    if enc_type == :delta; tuple = (:delta, 0); end
+    idx = findfirst(==(tuple), RL_ENCODING_OPTIONS)
+    if idx === nothing; idx = 3; end # Default to (:interval, 4)
+    write_value(w, UInt8(idx - 1), 4) # 4 bits for 9 options
+end
+
+function _read_enc_opt_tag(r)
+    idx = Int(read_value(r, 4, UInt8)) + 1
+    return RL_ENCODING_OPTIONS[idx]
+end
 
 function _write_mil_tag(w, mil::Int)
     idx = findfirst(==(mil), RL_MIL_OPTIONS)
@@ -3485,35 +3287,99 @@ function _read_mil_tag(r)::Int
     return RL_MIL_OPTIONS[idx]
 end
 
+# ===========================================================================
+# Variable-Length Coded (VLC) vertex headers
+#
+# The top 4 action combos cover ~97% of vertices in well-ordered web graphs.
+# We assign short prefix codes to them, with an escape for the remaining ~3%.
+#
+#   Code   Bits  Meaning
+#   ----   ----  -------
+#   00      2    none      + delta
+#   01      2    none      + interval (mil=2)
+#   10      2    reference + delta
+#   110     3    reference + interval (mil=2)
+#   111     3+6  escape → full 6-bit header (ref_mode 2b + enc_opt 4b)
+#
+# Expected average: ~2.3 bits/vertex (vs 6.0 fixed), a ~62% reduction.
+# ===========================================================================
+
+function _write_vertex_header_vlc(w, ref_mode::Symbol, enc_type::Symbol, mil::Int)
+    if ref_mode == :none && enc_type == :delta
+        write_bit(w, false); write_bit(w, false)                              # 00
+    elseif ref_mode == :none && enc_type == :interval && mil == 2
+        write_bit(w, false); write_bit(w, true)                               # 01
+    elseif ref_mode == :reference && enc_type == :delta
+        write_bit(w, true); write_bit(w, false)                               # 10
+    elseif ref_mode == :reference && enc_type == :interval && mil == 2
+        write_bit(w, true); write_bit(w, true); write_bit(w, false)           # 110
+    else
+        write_bit(w, true); write_bit(w, true); write_bit(w, true)            # 111 escape
+        _write_ref_mode_tag(w, get(RL_REF_MODE_TAGS, ref_mode, RL_REF_NONE))
+        _write_enc_opt_tag(w, enc_type, mil)
+    end
+end
+
+function _read_vertex_header_vlc(r)
+    b0 = read_bit(r)
+    if !b0
+        b1 = read_bit(r)
+        if !b1
+            return (:none, :delta, 0)            # 00
+        else
+            return (:none, :interval, 2)          # 01
+        end
+    else
+        b1 = read_bit(r)
+        if !b1
+            return (:reference, :delta, 0)        # 10
+        else
+            b2 = read_bit(r)
+            if !b2
+                return (:reference, :interval, 2) # 110
+            else
+                # 111 escape → read full 6-bit header
+                ref_mode = get(RL_TAG_REF_MODES, _read_ref_mode_tag(r), :none)
+                enc_type, mil = _read_enc_opt_tag(r)
+                return (ref_mode, enc_type, mil)
+            end
+        end
+    end
+end
+
 """
-    write_rl_compressed_graph_data(w, neighbor_lists, policy, coding_scheme, ref_window_size)
+    read_rl_compressed_graph_data(r, vs, coding_scheme, T; integer_encoding)
 
-Write compressed graph data with per-vertex encoding optimization.
+Read RL-compressed graph data. The stream is self-describing with per-vertex headers.
 
-When `policy !== nothing`, uses the RL policy for per-vertex encoding decisions.
-When `policy === nothing`, uses greedy per-vertex search (tries all action combinations).
+Format:
+- 1 bit: coding_scheme flag (true = :index, false = :children)
+- 3 bits: encoding tag
+- 2 bits: default ref_mode tag
+- 2 bits: default mil tag
+- Index section (if :index mode)
+- Data section: per-vertex encoding with optional reference
 
-Uses a two-pass approach for compact headers:
-- Pass 1: Decide encoding per vertex (policy or greedy)
-- Pass 2: Find most common action (default), write 1-bit flag per vertex:
-  - 0 = default action (1 bit overhead)
-  - 1 = custom action (1 + 4 bits overhead)
+Parameters:
+- r: BitReader
+- vs: number of vertices
+- coding_scheme: :children or :index (used for fallback/verification)
+- T: vertex type
+- integer_encoding: default encoding (overridden by stream header)
+
+Returns: Dict{T, Vector{T}} of neighbor lists
 """
 function write_rl_compressed_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
-        policy, coding_scheme::Symbol=:children,
+        coding_scheme::Symbol=:children,
         ref_window_size::Int=7;
         integer_encoding::Symbol=_RL_FIXED_ENCODING,
-        vertex_actions::Union{Dict,Nothing}=nothing) where {T<:Unsigned}
+        vertex_actions::Union{Dict,Nothing}=nothing,
+        stats::Union{Dict,Nothing}=nothing) where {T<:Unsigned}
 
     vs = length(keys(neighbor_lists))
     ie = integer_encoding
 
-    # =========================================================================
-    # Pass 1: Collect per-vertex decisions
-    # =========================================================================
-    # Ordered window for distance-based reference encoding
     reference_window = T[]
-
     function add_to_ref_window!(vertex::T)
         push!(reference_window, vertex)
         if length(reference_window) > ref_window_size
@@ -3521,305 +3387,164 @@ function write_rl_compressed_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         end
     end
 
-    # Per-vertex decisions: (ie, actual_ref_mode, mil, ref_result_or_nothing)
-    # ref_result is now (distance, copy_bitmap, residuals) instead of (ref_v, ...)
-    vertex_decisions = Vector{Tuple{Symbol, Symbol, Int, Any}}(undef, vs)
+    # Header: Coding scheme (1) + Encoding (3)
+    write_bit(w, coding_scheme == :index)
+    _write_encoding_tag(w, get(RL_ENCODING_TAGS, ie, RL_ENC_TAG_FIBONACCI))
 
+    if coding_scheme == :index
+        for v_idx in 1:vs
+            write_encoded_value(w, T(length(get(neighbor_lists, T(v_idx), T[])) + 1), ie)
+        end
+    end
+
+    # Unified Data section
     for v_idx in 1:vs
         v = T(v_idx)
+
         current_neighbors = sort(get(neighbor_lists, v, T[]))
+
+        actual_ref_mode = :none
+        ref_result = nothing
+        mil = MIN_INTERVAL_LENGTH
+        enc_type = :interval
 
         if vertex_actions !== nothing
-            # Pre-computed action from GNN policy
-            a_idx = vertex_actions[v]
-            _, ref_mode, mil = _rl_decode_action(a_idx)
-
-            actual_ref_mode = :none
-            ref_result = nothing
+            _, ref_mode, action_mil, action_enc_type = _rl_decode_action(vertex_actions[v])
+            mil = action_mil
+            enc_type = action_enc_type
+            
             if !isempty(current_neighbors) && ref_mode != :none && !isempty(reference_window)
                 ref_result = _rl_try_find_reference(current_neighbors, neighbor_lists, reference_window, ie, mil)
                 if ref_result !== nothing
                     actual_ref_mode = ref_mode
                 end
             end
-            vertex_decisions[v_idx] = (ie, actual_ref_mode, mil, ref_result)
-        elseif policy !== nothing
-            # Policy-based decision (tabular Q-policy)
-            features = _rl_extract_features(current_neighbors, reference_window, neighbor_lists)
-            s_idx = _rl_feature_index(features)
-            a_idx = _rl_best_action(policy, s_idx)
-            _, ref_mode, mil = _rl_decode_action(a_idx)
-
-            actual_ref_mode = :none
-            ref_result = nothing
-            if !isempty(current_neighbors) && ref_mode != :none && !isempty(reference_window)
-                ref_result = _rl_try_find_reference(current_neighbors, neighbor_lists, reference_window, ie, mil)
-                if ref_result !== nothing
-                    actual_ref_mode = ref_mode
-                end
-            end
-            vertex_decisions[v_idx] = (ie, actual_ref_mode, mil, ref_result)
         else
-            # Greedy per-vertex search: try all ref_mode × mil combinations
-            best_decision = _rl_greedy_vertex_search(current_neighbors, neighbor_lists, reference_window, ie)
-            vertex_decisions[v_idx] = best_decision
+            # Greedy search
+            _, actual_ref_mode, mil, ref_result, enc_type = _rl_greedy_vertex_search(current_neighbors, neighbor_lists, reference_window, ie)
         end
 
-        add_to_ref_window!(v)
-    end
+        # Write VLC vertex header
+        _write_vertex_header_vlc(w, actual_ref_mode, enc_type, mil)
 
-    # =========================================================================
-    # Find default action (most common ref_mode + mil combination)
-    # =========================================================================
-    header_counts = Dict{Tuple{UInt8, UInt8}, Int}()
-    for (_, actual_ref_mode, mil, _) in vertex_decisions
-        ref_tag = get(RL_REF_MODE_TAGS, actual_ref_mode, RL_REF_NONE)
-        mil_idx = findfirst(==(mil), RL_MIL_OPTIONS)
-        mil_tag = UInt8(something(mil_idx, 3) - 1)
-        key = (ref_tag, mil_tag)
-        header_counts[key] = get(header_counts, key, 0) + 1
-    end
-
-    default_header = argmax(header_counts)
-    default_count = header_counts[default_header]
-    default_ref_tag, default_mil_tag = default_header
-
-    @info "RL header stats: default action used by $default_count/$vs vertices ($(round(100.0*default_count/vs, digits=1))%)"
-
-    # =========================================================================
-    # Pass 2: Write the stream
-    # =========================================================================
-
-    # Write coding_scheme flag (1 bit)
-    write_bit(w, coding_scheme == :index)
-
-    # Write encoding tag (3 bits)
-    enc_tag = get(RL_ENCODING_TAGS, ie, RL_ENC_TAG_FIBONACCI)
-    _write_encoding_tag(w, enc_tag)
-
-    # Write default action header (4 bits): ref_mode (2) + mil (2)
-    _write_ref_mode_tag(w, default_ref_tag)
-    write_bit(w, (default_mil_tag >> 1) & 0x1 == 1)
-    write_bit(w, default_mil_tag & 0x1 == 1)
-
-    # Index section (if :index mode)
-    if coding_scheme == :index
-        for v in T(1):T(vs)
-            out_degree = T(length(get(neighbor_lists, v, T[])) + 1)
-            write_encoded_value(w, out_degree, ie)
-        end
-    end
-
-    # Data section — per-vertex header is ref_mode + mil
-    for v_idx in 1:vs
-        v = T(v_idx)
-        _, actual_ref_mode, mil, ref_result = vertex_decisions[v_idx]
-        current_neighbors = sort(get(neighbor_lists, v, T[]))
-
-        ref_tag = get(RL_REF_MODE_TAGS, actual_ref_mode, RL_REF_NONE)
-        mil_idx = findfirst(==(mil), RL_MIL_OPTIONS)
-        mil_tag = UInt8(something(mil_idx, 3) - 1)
-
-        # Write 1-bit flag: 0 = default action, 1 = custom 4-bit header
-        if (ref_tag, mil_tag) == default_header
-            write_bit(w, false)
-        else
-            write_bit(w, true)
-            _write_ref_mode_tag(w, ref_tag)
-            write_bit(w, (mil_tag >> 1) & 0x1 == 1)
-            write_bit(w, mil_tag & 0x1 == 1)
+        # Collect action statistics if requested
+        if stats !== nothing
+            key = (actual_ref_mode, enc_type, mil)
+            stats[key] = get(stats, key, 0) + 1
         end
 
-        # Reference encoding path
+        target_list = current_neighbors
         if actual_ref_mode != :none && ref_result !== nothing
             ref_distance, copy_bitmap, residuals = ref_result
-            write_encoded_value(w, T(ref_distance), ie)  # Distance within window (1-based)
+            write_encoded_value(w, T(ref_distance), ie)
             write_bitmap_adaptive(w, copy_bitmap, ie)
-            write_intervals_and_residuals(w, residuals, ie, mil)
-            continue
+            target_list = residuals
         end
-
-        # Interval + residual encoding
-        write_intervals_and_residuals(w, current_neighbors, ie, mil)
+        
+        # Encode target_list
+        if enc_type == :interval
+            write_intervals_and_residuals(w, target_list, ie, mil)
+        elseif enc_type == :delta
+            # Self-delimiting delta: count + values
+            write_encoded_value(w, T(length(target_list) + 1), ie)
+            if !isempty(target_list)
+                write_delta(w, target_list, ie)
+            end
+        elseif enc_type == :rle
+            # Self-delimiting RLE: count + hybrid
+            write_encoded_value(w, T(length(target_list) + 1), ie)
+            if !isempty(target_list)
+                deltas = delta_encode_vector(target_list)
+                write_hybrid_mix_encoded_list(w, deltas, ie, true, mil, false)
+            end
+        end
+        
+        add_to_ref_window!(v)
     end
 end
 
-"""
-    read_rl_compressed_graph_data(r, vs, coding_scheme, ::Type{T}; integer_encoding)
+function read_rl_compressed_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Type{T};
+        integer_encoding::Symbol=:fibonacci) where {T<:Unsigned}
 
-Read RL-compressed graph data with two-pass header encoding.
-Stream header: [1b coding_scheme] [3b encoding_tag] [4b default_action].
-Uses distance-based reference encoding: references are stored as window offsets (1-based),
-not vertex IDs. Per-vertex 1-bit flag: 0 = default action, 1 = custom 4-bit header.
-"""
-function read_rl_compressed_graph_data(r, vs::T, coding_scheme::Symbol=:children, ::Type{T}=UInt8;
-        integer_encoding::Symbol=_RL_FIXED_ENCODING) where {T<:Unsigned}
     neighbor_lists = Dict{T,Vector{T}}()
 
-    # Read coding_scheme flag
-    is_index = read_bit(r)
-    actual_coding_scheme = is_index ? :index : :children
-
-    # Read encoding tag (3 bits)
+    # Read stream metadata
+    is_index_mode = read_bit(r)
     enc_tag = _read_encoding_tag(r)
-    ie = get(RL_TAG_ENCODINGS, enc_tag, integer_encoding)
+    ie = get(RL_TAG_ENCODINGS, enc_tag, :fibonacci)
 
-    # Read default action header (4 bits): ref_mode (2) + mil (2)
-    default_ref_tag = _read_ref_mode_tag(r)
-    b1 = read_bit(r) ? UInt8(1) : UInt8(0)
-    b0 = read_bit(r) ? UInt8(1) : UInt8(0)
-    default_mil_tag = (b1 << 1) | b0
-    default_mil = RL_MIL_OPTIONS[Int(default_mil_tag) + 1]
-    default_ref_mode = get(RL_TAG_REF_MODES, default_ref_tag, :none)
-
-    # Sliding reference window (mirrors writer's window)
-    reference_window = T[]
-    ref_window_size = 7  # Must match writer's window size
-
-    # Index section
     out_degrees = T[]
-    if actual_coding_scheme == :index
-        out_degrees = Vector{T}(undef, vs)
-        for v in T(1):T(vs)
-            encoded_degree = read_encoded_value(r, ie, T)
-            out_degrees[v] = encoded_degree - T(1)
+    if is_index_mode
+        out_degrees = Vector{T}(undef, Int(vs))
+        for v in 1:Int(vs)
+            out_degrees[v] = read_encoded_value(r, ie, T) - T(1)
         end
     end
 
-    for v in T(1):T(vs)
-        # Read 1-bit flag: 0 = default, 1 = custom 4-bit header
-        is_custom = read_bit(r)
-
-        if is_custom
-            ref_tag = _read_ref_mode_tag(r)
-            mb1 = read_bit(r) ? UInt8(1) : UInt8(0)
-            mb0 = read_bit(r) ? UInt8(1) : UInt8(0)
-            mil_tag = (mb1 << 1) | mb0
-            ref_mode = get(RL_TAG_REF_MODES, ref_tag, :none)
-            mil = RL_MIL_OPTIONS[Int(mil_tag) + 1]
-        else
-            ref_mode = default_ref_mode
-            mil = default_mil
-        end
-
-        if actual_coding_scheme == :index && out_degrees[v] == 0
-            neighbor_lists[v] = T[]
-            # Maintain window even for empty vertices
-            push!(reference_window, v)
-            if length(reference_window) > ref_window_size
-                popfirst!(reference_window)
-            end
-            continue
-        end
-
-        if ref_mode != :none
-            # Distance-based reference encoding
-            ref_distance = read_encoded_value(r, ie, T)
-            copy_bitmap = read_bitmap_adaptive(r, ie)
-            residuals = read_intervals_and_residuals(r, ie, mil, T)
-
-            # Resolve distance to vertex ID using the window
-            window_idx = length(reference_window) - Int(ref_distance) + 1
-            if window_idx < 1 || window_idx > length(reference_window)
-                error("Invalid reference distance: $ref_distance (window size=$(length(reference_window)), at vertex $v)")
-            end
-            ref_vertex = reference_window[window_idx]
-
-            if haskey(neighbor_lists, ref_vertex)
-                ref_neighbors = neighbor_lists[ref_vertex]
-                current_neighbors = reconstruct_from_reference(ref_neighbors, copy_bitmap, residuals)
-            else
-                error("Invalid reference vertex: $ref_vertex resolved from distance $ref_distance (at vertex $v)")
-            end
-            neighbor_lists[v] = current_neighbors
-        else
-            current_neighbors = read_intervals_and_residuals(r, ie, mil, T)
-            neighbor_lists[v] = current_neighbors
-        end
-
-        # Maintain sliding window
-        push!(reference_window, v)
+    reference_window = T[]
+    ref_window_size = 7
+    function add_to_ref_window!(vertex::T)
+        push!(reference_window, vertex)
         if length(reference_window) > ref_window_size
             popfirst!(reference_window)
         end
     end
 
+    # Unified Data loop
+    for v_idx in 1:Int(vs)
+        v = T(v_idx)
+        
+        
+        # Read VLC vertex header
+        ref_mode, enc_type, mil = _read_vertex_header_vlc(r)
+
+        current_neighbors = T[]
+        is_ref = ref_mode != :none
+        
+        # Helper to read encoded list based on type
+        function read_encoded_list_body()
+            if enc_type == :interval
+                return read_intervals_and_residuals(r, ie, mil, T)
+            elseif enc_type == :delta
+                count = read_encoded_value(r, ie, T) - T(1)
+                if count > 0
+                    return read_delta(r, ie, T; max_elements=Int(count))
+                end
+                return T[]
+            elseif enc_type == :rle
+                count = read_encoded_value(r, ie, T) - T(1)
+                if count > 0
+                    return read_hybrid_mix_encoded_list(r, :index, ie, T; max_elements=Int(count))
+                end
+                return T[]
+            end
+            return T[]
+        end
+
+        if is_ref
+            distance = read_encoded_value(r, ie, T)
+            copy_bitmap = read_bitmap_adaptive(r, ie)
+            residuals = read_encoded_list_body()
+
+            ref_idx = length(reference_window) - Int(distance) + 1
+            if 1 <= ref_idx <= length(reference_window)
+                ref_v = reference_window[ref_idx]
+                ref_nbs = get(neighbor_lists, ref_v, T[])
+                current_neighbors = reconstruct_from_reference(ref_nbs, copy_bitmap, residuals)
+            else
+                current_neighbors = residuals
+            end
+        else
+            current_neighbors = read_encoded_list_body()
+        end
+
+        neighbor_lists[v] = current_neighbors
+        add_to_ref_window!(v)
+    end
+
     return neighbor_lists
 end
 
-# Internal helpers for RL write that avoid direct dependency on RL module types
-# (These work with the QPolicy's Q-matrix directly)
-
-function _rl_extract_features(neighbors::Vector{T}, ref_candidates::Vector{T},
-                              neighbor_lists::Dict{T,Vector{T}}) where {T<:Unsigned}
-    degree = length(neighbors)
-    d_bin = degree == 0 ? 1 : degree <= 3 ? 2 : degree <= 10 ? 3 : degree <= 50 ? 4 : degree <= 200 ? 5 : 6
-
-    if degree <= 1
-        iv_density = 0.0
-        max_gap = 1
-    else
-        intervals, _ = compress_intervals(neighbors, 2)
-        interval_count = sum(len for (_, len) in intervals; init=0)
-        iv_density = interval_count / degree
-        deltas = delta_encode_vector(neighbors)
-        max_gap = length(deltas) > 1 ? Int(maximum(deltas[2:end])) : 1
-    end
-
-    iv_bin = iv_density <= 0.25 ? 1 : iv_density <= 0.50 ? 2 : iv_density <= 0.75 ? 3 : 4
-    gap_bin = max_gap <= 2 ? 1 : max_gap <= 10 ? 2 : max_gap <= 100 ? 3 : max_gap <= 1000 ? 4 : 5
-
-    best_overlap = 0.0
-    if degree >= 2 && !isempty(ref_candidates)
-        ns = Set(neighbors)
-        check_limit = min(length(ref_candidates), 20)
-        for i in 1:check_limit
-            ref_v = ref_candidates[i]
-            ref_nl = get(neighbor_lists, ref_v, T[])
-            if !isempty(ref_nl)
-                overlap = length(intersect(ns, Set(ref_nl)))
-                ratio = overlap / max(degree, length(ref_nl))
-                best_overlap = max(best_overlap, ratio)
-            end
-        end
-    end
-
-    ov_bin = best_overlap <= 0.0 ? 1 : best_overlap <= 0.25 ? 2 : best_overlap <= 0.50 ? 3 : best_overlap <= 0.75 ? 4 : 5
-
-    if isempty(ref_candidates)
-        rw_density = 0.0
-    else
-        high_deg = count(ref_candidates) do rv
-            length(get(neighbor_lists, rv, T[])) >= 4
-        end
-        rw_density = high_deg / length(ref_candidates)
-    end
-    rw_bin = rw_density <= 0.25 ? 1 : rw_density <= 0.50 ? 2 : rw_density <= 0.75 ? 3 : 4
-
-    return (d_bin, iv_bin, gap_bin, ov_bin, rw_bin)
-end
-
-function _rl_feature_index(features)::Int
-    d, iv, g, o, rw = features
-    return (d - 1) * (4 * 5 * 5 * 4) + (iv - 1) * (5 * 5 * 4) + (g - 1) * (5 * 4) + (o - 1) * 4 + rw
-end
-
-function _rl_best_action(policy, state_idx::Int)::Int
-    # Access Q-matrix directly
-    row = @view policy.Q[state_idx, :]
-    return argmax(row)
-end
-
-const _RL_FIXED_ENCODING = :fibonacci
-const _RL_REF_OPTIONS = [:none, :reference, :recursive]
-const _RL_MIL_OPTIONS = [2, 3, 4, 5]
-
-function _rl_decode_action(idx::Int, encoding::Symbol=_RL_FIXED_ENCODING)
-    idx -= 1
-    mil_idx = idx % 4 + 1
-    ref_idx = idx ÷ 4 + 1
-    return (encoding, _RL_REF_OPTIONS[ref_idx], _RL_MIL_OPTIONS[mil_idx])
-end
 
 function _estimate_adaptive_bitmap_cost(bitmap::Vector{Bool}, ie::Symbol)::Int
     # Same logic as write_bitmap_adaptive: min of raw vs block encoding + 1-bit flag
@@ -3828,16 +3553,70 @@ function _estimate_adaptive_bitmap_cost(bitmap::Vector{Bool}, ie::Symbol)::Int
     return 1 + min(raw_cost, block_cost)  # 1-bit format flag
 end
 
+function _estimate_delta_cost(neighbors::Vector{T}, ie::Symbol) where {T<:Unsigned}
+    isempty(neighbors) && return 0
+    deltas = delta_encode_vector(neighbors)
+    cost = 0
+    cost += estimate_encoded_value_cost(deltas[1], ie)
+    for i in 2:length(deltas)
+        cost += estimate_encoded_value_cost(deltas[i] + T(1), ie)
+    end
+    return cost
+end
+
+function _estimate_rle_cost(neighbors::Vector{T}, ie::Symbol, mil::Int) where {T<:Unsigned}
+    isempty(neighbors) && return 0
+    deltas = delta_encode_vector(neighbors)
+    cost = 1 # hybrid flag
+    cost += estimate_encoded_value_cost(deltas[1], ie)
+    
+    if length(deltas) > 1
+        rem_deltas = deltas[2:end]
+        sections = analyze_delta_patterns_hybrid(rem_deltas, neighbors[2:end], mil)
+        cost += estimate_encoded_value_cost(T(length(sections)), ie)
+        for s in sections
+            if s.type == :delta
+                cost += 1
+                cost += estimate_encoded_value_cost(T(length(s.data)), ie)
+                for val in s.data; cost += estimate_encoded_value_cost(val, ie); end
+            elseif s.type == :run_length
+                cost += 2
+                cost += estimate_encoded_value_cost(T(length(s.data)÷2), ie)
+                for val in s.data; cost += estimate_encoded_value_cost(val, ie); end
+            elseif s.type == :interval
+                cost += 2
+                cost += estimate_encoded_value_cost(T(length(s.data)÷2), ie)
+                for val in s.data; cost += estimate_encoded_value_cost(val, ie); end
+            end
+        end
+    end
+    return cost
+end
+
+function _estimate_base_cost(target::Vector{T}, ie::Symbol, mil::Int, enc_type::Symbol) where {T<:Unsigned}
+    if enc_type == :interval
+        return estimate_interval_runlength_encoding_cost(target, ie, mil, 3)
+    elseif enc_type == :delta
+        # Add length cost
+        cost = estimate_encoded_value_cost(T(length(target) + 1), ie)
+        return cost + _estimate_delta_cost(target, ie)
+    elseif enc_type == :rle
+        cost = estimate_encoded_value_cost(T(length(target) + 1), ie)
+        return cost + _estimate_rle_cost(target, ie, mil)
+    end
+    return 0
+end
+
 function _rl_try_find_reference(neighbors::Vector{T}, neighbor_lists::Dict{T,Vector{T}},
-                                ref_window::Vector{T}, ie::Symbol, mil::Int=MIN_INTERVAL_LENGTH) where {T<:Unsigned}
+                                ref_window::Vector{T}, ie::Symbol, mil::Int, enc_type::Symbol= :interval) where {T<:Unsigned}
     ns = Set(neighbors)
     best_cost = nothing
     best_distance = nothing
     best_bitmap = Bool[]
     best_residuals = T[]
 
-    noref_cost = estimate_interval_runlength_encoding_cost(neighbors, ie, mil, 3)
-
+    # We don't need noref_cost here, we just need to return the best reference cost
+    
     for (i, ref_v) in enumerate(ref_window)
         ref_nl = get(neighbor_lists, ref_v, T[])
         isempty(ref_nl) && continue
@@ -3849,15 +3628,15 @@ function _rl_try_find_reference(neighbors::Vector{T}, neighbor_lists::Dict{T,Vec
         copy_bitmap = Bool[n in ns for n in ref_nl]
         residuals = sort(T[n for n in neighbors if !(n in ref_neighbors_set)])
 
-        # Distance = position from end of window (1-based)
         distance = T(length(ref_window) - i + 1)
         ref_cost = estimate_encoded_value_cost(distance, ie)
         ref_cost += _estimate_adaptive_bitmap_cost(copy_bitmap, ie)
+        
         if !isempty(residuals)
-            ref_cost += estimate_interval_runlength_encoding_cost(residuals, ie, mil, 3)
+            ref_cost += _estimate_base_cost(residuals, ie, mil, enc_type)
         end
 
-        if ref_cost < noref_cost && (best_cost === nothing || ref_cost < best_cost)
+        if best_cost === nothing || ref_cost < best_cost
             best_cost = ref_cost
             best_distance = distance
             best_bitmap = copy_bitmap
@@ -3871,71 +3650,53 @@ function _rl_try_find_reference(neighbors::Vector{T}, neighbor_lists::Dict{T,Vec
     return (best_distance, best_bitmap, best_residuals)
 end
 
-"""
-Greedy per-vertex search: try all ref_mode × mil combinations and return the cheapest.
-Returns (ie, actual_ref_mode, mil, ref_result_or_nothing).
-ref_result is (distance, copy_bitmap, residuals) where distance is the window offset (1-based).
-"""
 function _rl_greedy_vertex_search(neighbors::Vector{T}, neighbor_lists::Dict{T,Vector{T}},
                                    ref_window::Vector{T}, ie::Symbol) where {T<:Unsigned}
     if isempty(neighbors)
-        # Empty vertex: cheapest mil is the one with smallest interval encoding overhead
-        return (ie, :none, _RL_MIL_OPTIONS[1], nothing)
+        return (ie, :none, RL_MIL_OPTIONS[1], nothing, :interval)
     end
 
     best_cost = typemax(Int)
     best_ref_mode = :none
     best_mil = MIN_INTERVAL_LENGTH
+    best_enc_type = :interval
     best_ref_result = nothing
 
-    # Try each mil value for non-reference encoding
-    for mil in _RL_MIL_OPTIONS
-        noref_cost = estimate_interval_runlength_encoding_cost(neighbors, ie, mil, 3)
-        if noref_cost < best_cost
-            best_cost = noref_cost
+    for (enc_type, mil) in RL_ENCODING_OPTIONS
+        # Base cost
+        base_cost = _estimate_base_cost(neighbors, ie, mil, enc_type)
+        
+        if base_cost < best_cost
+            best_cost = base_cost
             best_ref_mode = :none
             best_mil = mil
+            best_enc_type = enc_type
             best_ref_result = nothing
         end
-    end
-
-    # Try reference encoding with each mil value (if window available)
-    if !isempty(ref_window) && length(neighbors) >= 3
-        ns = Set(neighbors)
-
-        for (i, ref_v) in enumerate(ref_window)
-            ref_nl = get(neighbor_lists, ref_v, T[])
-            isempty(ref_nl) && continue
-
-            ref_neighbors_set = Set(ref_nl)
-            overlap = length(intersect(ns, ref_neighbors_set))
-            overlap < 3 && continue
-
-            copy_bitmap = Bool[n in ns for n in ref_nl]
-            residuals = sort(T[n for n in neighbors if !(n in ref_neighbors_set)])
-
-            # Distance = position from end of window (1-based)
-            distance = T(length(ref_window) - i + 1)
-            ref_base_cost = estimate_encoded_value_cost(distance, ie)
-            ref_base_cost += _estimate_adaptive_bitmap_cost(copy_bitmap, ie)
-
-            for mil in _RL_MIL_OPTIONS
-                ref_cost = ref_base_cost
-                if !isempty(residuals)
-                    ref_cost += estimate_interval_runlength_encoding_cost(residuals, ie, mil, 3)
+        
+        # Reference cost
+        if !isempty(ref_window) && length(neighbors) >= 3
+            ref_res = _rl_try_find_reference(neighbors, neighbor_lists, ref_window, ie, mil, enc_type)
+            if ref_res !== nothing
+                # Recalculate cost since _rl_try_find_reference calculates it but returns result
+                dist, bmp, res = ref_res
+                ref_c = estimate_encoded_value_cost(dist, ie) + _estimate_adaptive_bitmap_cost(bmp, ie)
+                if !isempty(res)
+                    ref_c += _estimate_base_cost(res, ie, mil, enc_type)
                 end
-
-                if ref_cost < best_cost
-                    best_cost = ref_cost
+                
+                if ref_c < best_cost
+                    best_cost = ref_c
                     best_ref_mode = :reference
                     best_mil = mil
-                    best_ref_result = (distance, copy_bitmap, residuals)
+                    best_enc_type = enc_type
+                    best_ref_result = ref_res
                 end
             end
         end
     end
 
-    return (ie, best_ref_mode, best_mil, best_ref_result)
+    return (ie, best_ref_mode, best_mil, best_ref_result, best_enc_type)
 end
 
 ################################################################################
@@ -4762,23 +4523,22 @@ Format:
 @param varint::Symbol: encoding for length/deltas (default: :fibonacci)
 """
 function write_bitmap_adaptive(w::BitWriter, bitmap::Vector{Bool}, varint::Symbol=:fibonacci)
-    # Cost-based selection between block and raw encoding
-    # Note: Bandit analysis showed density-based heuristics had only 55.8% accuracy,
-    # so we use pure cost-based selection which performs better in practice.
-    raw_cost = estimate_encoded_value_cost(UInt32(length(bitmap)) + UInt32(1), varint) + length(bitmap)
-    block_cost = estimate_block_encoding_cost(bitmap, varint)
+    # ALWAYS write the length first to ensure the stream is self-delimiting
+    write_small_count(w, UInt32(length(bitmap)), varint)
+    
+    if isempty(bitmap)
+        return
+    end
 
-    # Choose the cheapest method (1-bit flag + data)
+    # Cost comparison for adaptive choice
+    raw_cost = length(bitmap) + 1
+    block_cost = estimate_block_encoding_cost(bitmap, varint) + 1
+
     if block_cost < raw_cost
-        # Block encoding (0)
-        write_bit(w, false)
+        write_bit(w, false) # Block flag
         write_block_encoding(w, bitmap, varint)
     else
-        # Raw bits (1)
-        write_bit(w, true)
-        # Write length (add 1 to avoid zero for Fibonacci)
-        write_encoded_value(w, UInt32(length(bitmap)) + UInt32(1), varint)
-        # Write raw bits
+        write_bit(w, true)  # Raw flag
         for bit in bitmap
             write_bit(w, bit)
         end
@@ -4788,39 +4548,36 @@ end
 """
     read_bitmap_adaptive(r::BitReader, varint::Symbol=:fibonacci)::Vector{Bool}
 
-Decode an adaptively encoded bitmap written with `write_bitmap_adaptive`.
-Reads 1-bit format code and decodes accordingly:
-- 0 = block encoding
-- 1 = raw bits
-
-@param r::BitReader: the bitreader
-@param varint::Symbol: encoding used for length/deltas (default: :fibonacci)
-@return::Vector{Bool}: the decoded bitmap
+Decode a self-delimiting adaptive bitmap.
 """
 function read_bitmap_adaptive(r::BitReader, varint::Symbol=:fibonacci)::Vector{Bool}
-    # Read 1-bit encoding flag
+    # Read explicit length
+    length_val = Int(read_small_count(r, varint, UInt32))
+
+    if length_val == 0
+        return Bool[]
+    end
+
+    # Read encoding flag
     use_raw = read_bit(r)
 
     if !use_raw
-        # Block encoding (0)
-        return read_block_encoding(r, varint)
-    else
-        # Raw encoding (1)
-        # Read length (subtract 1)
-        length_raw = Int(read_encoded_value(r, varint, UInt32))
-        length_val = length_raw - 1
-
-        # Handle empty bitmap
-        if length_val == 0
-            return Bool[]
+        # Block encoding
+        bitmap = read_block_encoding(r, varint)
+        # Force length to match length_val
+        if length(bitmap) < length_val
+            append!(bitmap, fill(false, length_val - length(bitmap)))
+        elseif length(bitmap) > length_val
+            bitmap = bitmap[1:length_val]
         end
-
-        # Read raw bits
+        return bitmap
+    else
+        # Raw encoding
         bitmap = Bool[]
+        sizehint!(bitmap, length_val)
         for _ in 1:length_val
             push!(bitmap, read_bit(r))
         end
-
         return bitmap
     end
 end
@@ -5036,59 +4793,6 @@ function read_block_encoding(r::BitReader, varint::Symbol=:fibonacci)::Vector{Bo
     return bitmap
 end
 
-"""
-    estimate_block_encoding_cost(copy_bitmap::Vector{Bool}, varint::Symbol)::Int
-
-Estimate the cost in bits of encoding a bitmap using block encoding.
-"""
-function estimate_block_encoding_cost(copy_bitmap::Vector{Bool}, varint::Symbol)::Int
-    if isempty(copy_bitmap)
-        return estimate_encoded_value_cost(UInt32(1), varint)
-    end
-
-    # Extract blocks to count them
-    blocks = UInt32[]
-    i = 1
-    n = length(copy_bitmap)
-    expecting_copy = true
-
-    while i <= n
-        block_len = 0
-
-        if expecting_copy
-            while i <= n && copy_bitmap[i]
-                block_len += 1
-                i += 1
-            end
-        else
-            while i <= n && !copy_bitmap[i]
-                block_len += 1
-                i += 1
-            end
-        end
-
-        if block_len > 0
-            push!(blocks, UInt32(block_len))
-            expecting_copy = !expecting_copy
-        else
-            if expecting_copy && i <= n && !copy_bitmap[i]
-                push!(blocks, UInt32(0))
-                expecting_copy = false
-            else
-                break
-            end
-        end
-    end
-
-    # Cost = block count + sum of block lengths
-    cost = estimate_encoded_value_cost(UInt32(length(blocks)) + UInt32(1), varint)
-
-    for block_len in blocks
-        cost += estimate_encoded_value_cost(block_len + UInt32(1), varint)
-    end
-
-    return cost
-end
 
 # -----------------------------------------------------------------------------
 # Submodules
@@ -5115,6 +4819,11 @@ export RCGE
 include("compression/rcge/inter_encoding.jl")
 using .InterEncoding
 export InterEncoding
+
+# Command-Driven Bitstream Compression
+include("compression/command_stream.jl")
+using .CommandStream
+export CommandStream
 
 # -----------------------------------------------------------------------------
 end # module Compression

@@ -1,3 +1,5 @@
+using LinearAlgebra: norm
+
 """
     TrainConfig
 
@@ -10,6 +12,7 @@ struct TrainConfig
     reinforce_lr::Float64
     sigma::Float64          # Exploration noise std for REINFORCE
     baseline_ema::Float64   # EMA decay for baseline (0.9 typical)
+    grad_clip_norm::Float64 # Max norm for gradient clipping
 end
 
 function TrainConfig(;
@@ -18,8 +21,9 @@ function TrainConfig(;
         reinforce_epochs::Int=50,
         reinforce_lr::Float64=0.0001,
         sigma::Float64=0.1,
-        baseline_ema::Float64=0.9)
-    return TrainConfig(proxy_epochs, proxy_lr, reinforce_epochs, reinforce_lr, sigma, baseline_ema)
+        baseline_ema::Float64=0.9,
+        grad_clip_norm::Float64=1.0)
+    return TrainConfig(proxy_epochs, proxy_lr, reinforce_epochs, reinforce_lr, sigma, baseline_ema, grad_clip_norm)
 end
 
 """
@@ -33,43 +37,46 @@ function train_gnn_proxy!(model::GNNModel, g::AbstractGraph{T}, config::TrainCon
     n = model.n
 
     for epoch in 1:config.proxy_epochs
-        raw_scores = gnn_forward(model)
+        raw_scores = gnn_forward(model; training=false)
 
-        # Normalize to zero mean, unit variance
+        # Raw score statistics
         mu = sum(raw_scores) / n
         centered = raw_scores .- mu
         sigma_sq = sum(centered .^ 2) / n
-        if sigma_sq < 1e-12
-            raw_scores .+= randn(n) .* 0.01
-            mu = sum(raw_scores) / n
-            centered = raw_scores .- mu
-            sigma_sq = sum(centered .^ 2) / n
-        end
-        sigma_val = sqrt(sigma_sq)
-        scores = centered ./ sigma_val
+        sigma_val = sqrt(max(sigma_sq, 1e-12))
 
-        # Proxy loss and gradient
-        loss = 0.0
-        dL_ds = zeros(n)
+        # Symmetric Laplacian action on raw scores and bandwidth
+        bandwidth = 0.0
+        Ls = zeros(n)
         for v in vertices(g)
             vi = Int(v)
-            sv = scores[vi]
             for u in outneighbors(g, v)
                 ui = Int(u)
-                diff = sv - scores[ui]
-                loss += diff^2
-                dL_ds[vi] += 2.0 * diff
-                dL_ds[ui] -= 2.0 * diff
+                diff = raw_scores[vi] - raw_scores[ui]
+                bandwidth += diff^2
+                Ls[vi] += diff
+                Ls[ui] -= diff
             end
         end
 
-        mean_dL = sum(dL_ds) / n
-        score_grad_dot = sum(scores .* dL_ds) / n
-        dL_dZ2 = (dL_ds .- mean_dL) ./ sigma_val .- scores .* score_grad_dot ./ sigma_val
+        # Rayleigh quotient: R = bandwidth / (n · σ²)
+        # Minimizing R converges to the Fiedler vector.
+        # Gradient dR ∝ Ls - R·centered: bandwidth pulls neighbors together,
+        # R·centered pushes scores apart. At the Fiedler eigenvector these
+        # balance and the gradient is zero. Variance is preserved (first order)
+        # because dot(centered, Ls - R·centered) = bandwidth - R·n·σ² = 0.
+        rayleigh = bandwidth / (n * max(sigma_sq, 1e-12))
+        dL_dZ2 = Ls .- rayleigh .* centered
 
-        push!(losses, loss)
-        if epoch == 1 || epoch % 10 == 0
-            @info "Proxy epoch $epoch/$(config.proxy_epochs): loss = $(round(loss, digits=4)), score_std = $(round(sigma_val, digits=6))"
+        # Gradient clipping
+        grad_norm = norm(dL_dZ2)
+        if grad_norm > config.grad_clip_norm
+            dL_dZ2 .*= (config.grad_clip_norm / grad_norm)
+        end
+
+        push!(losses, rayleigh)
+        if epoch <= 5 || epoch % 10 == 0
+            @info "Proxy epoch $epoch/$(config.proxy_epochs): loss = $(round(rayleigh, digits=4)), score_std = $(round(sigma_val, digits=6))"
         end
 
         gnn_backward!(model, dL_dZ2; lr=config.proxy_lr)

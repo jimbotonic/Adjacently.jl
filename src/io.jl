@@ -55,6 +55,7 @@ mutable struct BitWriter
     io::Base.IO
     buffer::Vector{Bool}
     index::Int  # next bit to write in buffer
+    bit_count::Int64 # total bits written
 end
 
 """
@@ -66,7 +67,7 @@ constructor for BitWriter
 @param capacity::Int: The capacity of the buffer
 """
 function BitWriter(io::Base.IO; capacity=BUFFER_SIZE*8)
-    BitWriter(io, Vector{Bool}(undef, capacity), 1)
+    BitWriter(io, Vector{Bool}(undef, capacity), 1, 0)
 end
 
 """
@@ -80,6 +81,7 @@ write a bit to the writer
 function write_bit(writer::BitWriter, bit::Bool)
     writer.buffer[writer.index] = bit
     writer.index += 1
+    writer.bit_count += 1
     if writer.index > length(writer.buffer)
         flush_bitwriter(writer)
     end
@@ -173,6 +175,7 @@ mutable struct BitReader
     buffer::Vector{Bool}
     index::Int
     length::Int
+    bit_count::Int64 # total bits read
 end
 
 """
@@ -193,7 +196,7 @@ function BitReader(io::Base.IO; capacity=BUFFER_SIZE*8)
             k += 1
         end
     end
-    BitReader(io, bits, 1, k - 1)
+    BitReader(io, bits, 1, k - 1, 0)
 end
 
 """
@@ -210,6 +213,7 @@ function read_bit(reader::BitReader)::Bool
     end
     bit = reader.buffer[reader.index]
     reader.index += 1
+    reader.bit_count += 1
     return bit
 end
 

@@ -113,7 +113,7 @@ function get_policy_summary(policy::QPolicy)::String
             total_counts[idx] == 0 && continue
             a = action_from_index(idx)
             pct = round(100.0 * total_counts[idx] / total_visits, digits=1)
-            push!(top_strs, "$(a.integer_encoding)/$(a.reference_mode)/mil=$(a.min_interval_length) ($(pct)%)")
+            push!(top_strs, "$(a.reference_mode)/$(a.encoding_type)/mil=$(a.min_interval_length) ($(pct)%)")
         end
 
         push!(lines, "  $(degree_labels[d]) [$(total_visits) visits]: $(join(top_strs, ", "))")
