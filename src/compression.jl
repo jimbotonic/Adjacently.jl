@@ -1340,7 +1340,7 @@ This is an enhanced WebGraph-style encoding that:
 @param min_interval_length::Int: minimum interval length
 @param min_run_length::Int: minimum repetitions for run-length encoding
 """
-function write_intervals_and_residuals(w::BitWriter, neighbors::Vector{T}, encoding::Symbol, min_interval_length::Int=MIN_INTERVAL_LENGTH) where {T<:Unsigned}
+function write_intervals_and_residuals(w::BitWriter, neighbors::Vector{T}, encoding::Symbol, min_interval_length::Int=MIN_INTERVAL_LENGTH; vertex_id=nothing) where {T<:Unsigned}
     # Handle empty neighbor lists by writing zero counts
     if isempty(neighbors)
         @debug "WRITE intervals: empty neighbor list, writing two 1s"
@@ -1364,9 +1364,16 @@ function write_intervals_and_residuals(w::BitWriter, neighbors::Vector{T}, encod
     # Write intervals: (start, length) pairs with delta encoding
     if !isempty(intervals)
         prev_start = T(0)
-        for (start, length) in intervals
-            # Delta encode start positions
-            write_encoded_value(w, start - prev_start, encoding)
+        for (idx, (start, length)) in enumerate(intervals)
+            if idx == 1 && vertex_id !== nothing
+                # First interval start: zigzag offset from vertex_id
+                offset = Int64(start) - Int64(vertex_id)
+                encoded_start = T(_rl_zigzag_encode(offset) + 1)
+                write_encoded_value(w, encoded_start, encoding)
+            else
+                # Delta encode start positions
+                write_encoded_value(w, start - prev_start, encoding)
+            end
             # Encode interval length (already >= min_interval_length, increment by 1 to avoid 0)
             write_encoded_value(w, length - T(min_interval_length) + T(1), encoding)
             prev_start = start
@@ -1379,7 +1386,7 @@ function write_intervals_and_residuals(w::BitWriter, neighbors::Vector{T}, encod
     # Write residuals with delta encoding
     if !isempty(residuals)
         @debug "WRITE residuals: residuals=$residuals"
-        write_delta(w, residuals, encoding)
+        write_delta(w, residuals, encoding; vertex_id=vertex_id)
     end
 end
 
@@ -1396,7 +1403,7 @@ Reads the format: intervals, then run-length pairs, then final residuals.
 @param T::Type: the type to return
 @return::Vector{T}: reconstructed neighbor list
 """
-function read_intervals_and_residuals(r::BitReader, encoding::Symbol, min_interval_length::Int=MIN_INTERVAL_LENGTH, ::Type{T}=UInt8) where {T<:Unsigned}
+function read_intervals_and_residuals(r::BitReader, encoding::Symbol, min_interval_length::Int=MIN_INTERVAL_LENGTH, ::Type{T}=UInt8; vertex_id=nothing) where {T<:Unsigned}
     # Read number of intervals (subtract 1)
     num_intervals_raw = read_encoded_value(r, encoding, T)
     num_intervals = num_intervals_raw - T(1)
@@ -1408,10 +1415,16 @@ function read_intervals_and_residuals(r::BitReader, encoding::Symbol, min_interv
     # Read intervals
     if num_intervals > 0
         prev_start = T(0)
-        for _ in 1:num_intervals
-            # Read delta-encoded start
-            start_delta = read_encoded_value(r, encoding, T)
-            start = prev_start + start_delta
+        for idx in 1:num_intervals
+            if idx == 1 && vertex_id !== nothing
+                # First interval start: zigzag decode from vertex_id
+                raw_start = read_encoded_value(r, encoding, T)
+                start = T(Int64(vertex_id) + _rl_zigzag_decode(UInt64(raw_start - 1)))
+            else
+                # Read delta-encoded start
+                start_delta = read_encoded_value(r, encoding, T)
+                start = prev_start + start_delta
+            end
             # Read length (subtract 1 and add back min_interval_length)
             length = read_encoded_value(r, encoding, T) - T(1) + T(min_interval_length)
 
@@ -1431,7 +1444,7 @@ function read_intervals_and_residuals(r::BitReader, encoding::Symbol, min_interv
 
     # Read residuals
     if num_residuals > 0
-        residuals = read_delta(r, encoding, T; max_elements=Int(num_residuals))
+        residuals = read_delta(r, encoding, T; max_elements=Int(num_residuals), vertex_id=vertex_id)
         @debug "READ residuals: got residuals=$residuals"
         append!(neighbors, residuals)
         @debug "READ residuals: neighbors after append=$neighbors"
@@ -1458,7 +1471,7 @@ Write a list of values to the bitwriter, using delta encoding.
 @param lst::Vector{T}: the list of values to write
 @param encoding::Symbol: the compression coding to use (:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta)
 """
-function write_delta(w::BitWriter, lst::Vector{T}, encoding::Symbol) where {T<:Unsigned}
+function write_delta(w::BitWriter, lst::Vector{T}, encoding::Symbol; vertex_id=nothing) where {T<:Unsigned}
     # if the list is empty, return
     isempty(lst) && return
 
@@ -1467,9 +1480,17 @@ function write_delta(w::BitWriter, lst::Vector{T}, encoding::Symbol) where {T<:U
     @debug "WRITE delta: lst=$lst, delta_lst=$delta_lst"
 
     # write the first value (not delta encoded)
-    # NB: we assume that the first value is not 0
-    write_encoded_value(w, delta_lst[1], encoding)
-    @debug "WRITE delta: wrote first value delta_lst[1]=$(delta_lst[1])"
+    if vertex_id !== nothing
+        # Relative first-value: zigzag(v₁ - vertex_id) + 1
+        offset = Int64(lst[1]) - Int64(vertex_id)
+        encoded_first = T(_rl_zigzag_encode(offset) + 1)
+        write_encoded_value(w, encoded_first, encoding)
+        @debug "WRITE delta: wrote zigzag first value offset=$offset encoded=$encoded_first"
+    else
+        # NB: we assume that the first value is not 0
+        write_encoded_value(w, delta_lst[1], encoding)
+        @debug "WRITE delta: wrote first value delta_lst[1]=$(delta_lst[1])"
+    end
 
     # write the rest of the values
     for i in 2:length(delta_lst)
@@ -1490,15 +1511,22 @@ Read a list of values from the bit reader, using delta encoding.
 
 @return::Vector{T}: the decoded list
 """
-function read_delta(r::BitReader, encoding::Symbol, ::Type{T}=UInt8; max_elements::Union{Nothing,Int}=nothing, stop_value::Union{Nothing,T}=nothing) where {T<:Unsigned}
+function read_delta(r::BitReader, encoding::Symbol, ::Type{T}=UInt8; max_elements::Union{Nothing,Int}=nothing, stop_value::Union{Nothing,T}=nothing, vertex_id=nothing) where {T<:Unsigned}
     lst = T[]
     @debug "READ delta: starting, max_elements=$max_elements, stop_value=$stop_value"
 
     # read the first value (not delta encoded)
     # NB: we assume that the first value is not 0
     try
-        first_value = read_encoded_value(r, encoding, T)
-        @debug "READ delta: read first_value=$first_value"
+        raw_first = read_encoded_value(r, encoding, T)
+        if vertex_id !== nothing
+            # Relative first-value: vertex_id + zigzag_decode(raw - 1)
+            first_value = T(Int64(vertex_id) + _rl_zigzag_decode(UInt64(raw_first - 1)))
+            @debug "READ delta: read zigzag first raw=$raw_first decoded=$first_value"
+        else
+            first_value = raw_first
+            @debug "READ delta: read first_value=$first_value"
+        end
         push!(lst, first_value)
     catch e
         # Empty list case: if we can't even read the first value
@@ -1773,21 +1801,29 @@ The encoding format uses bit flags to indicate section types:
 @param min_interval_length::Int: minimum length for interval compression (default: MIN_INTERVAL_LENGTH)
 
 """
-function write_hybrid_mix_encoded_list(w::BitWriter, delta_list::Vector{T}, encoding::Symbol, use_run_length_and_interval::Bool=true, min_interval_length::Int=MIN_INTERVAL_LENGTH, is_children_mode::Bool=false) where {T<:Unsigned}
+function write_hybrid_mix_encoded_list(w::BitWriter, delta_list::Vector{T}, encoding::Symbol, use_run_length_and_interval::Bool=true, min_interval_length::Int=MIN_INTERVAL_LENGTH, is_children_mode::Bool=false; vertex_id=nothing) where {T<:Unsigned}
     if isempty(delta_list)
         error("write_hybrid_mix_encoded_list should not be called with empty lists")
     end
-    
+
     # Decide whether to use hybrid mode for this list
     hybrid_active = use_run_length_and_interval && length(delta_list) > 1
-    
+
     @debug "write_hybrid_mix_encoded_list: list_length=$(length(delta_list)), use_run_length_and_interval=$use_run_length_and_interval, hybrid_active=$hybrid_active"
 
     # Write hybrid mode flag
     write_bit(w, hybrid_active)
-    
+
     # Write the first value (same as write_mix_encoded_list)
-    write_encoded_value(w, delta_list[1], encoding)
+    if vertex_id !== nothing
+        # Relative first-value: zigzag(v₁ - vertex_id) + 1
+        # delta_list[1] is the first absolute value from delta_encode_vector
+        offset = Int64(delta_list[1]) - Int64(vertex_id)
+        encoded_first = T(_rl_zigzag_encode(offset) + 1)
+        write_encoded_value(w, encoded_first, encoding)
+    else
+        write_encoded_value(w, delta_list[1], encoding)
+    end
     
     if !hybrid_active
         # Simple delta mode - write remaining values directly like write_mix_encoded_list
@@ -1878,18 +1914,25 @@ Returns the reconstructed delta-encoded values (like read_mix_encoded_list).
 @return Vector{T}: the reconstructed delta-encoded list
 
 """
-function read_hybrid_mix_encoded_list(r::BitReader, coding_scheme::Symbol, integer_encoding::Symbol, ::Type{T}=UInt8; max_elements::Union{Int,Nothing}=nothing, stop_value::Union{T,Nothing}=nothing) where {T<:Unsigned}
+function read_hybrid_mix_encoded_list(r::BitReader, coding_scheme::Symbol, integer_encoding::Symbol, ::Type{T}=UInt8; max_elements::Union{Int,Nothing}=nothing, stop_value::Union{T,Nothing}=nothing, vertex_id=nothing) where {T<:Unsigned}
     # Read hybrid mode flag
     use_run_length_and_interval = read_bit(r)
-    
+
     # Read the first value (same as read_mix_encoded_list)
-    first_value = read_encoded_value(r, integer_encoding, T)
-    
+    raw_first = read_encoded_value(r, integer_encoding, T)
+
+    if vertex_id !== nothing
+        # Relative first-value: vertex_id + zigzag_decode(raw - 1)
+        first_value = T(Int64(vertex_id) + _rl_zigzag_decode(UInt64(raw_first - 1)))
+    else
+        first_value = raw_first
+    end
+
     # Check if first value is the stop value for children mode
     if stop_value !== nothing && first_value == stop_value
         return T[]  # Empty list
     end
-    
+
     result = T[first_value]
     elements_read = 1
     stop_consumed = false
@@ -2416,7 +2459,7 @@ Returns the estimated number of bits required.
 @param min_run_length::Int: minimum run-length (default: 3)
 @return::Int: the estimated cost in bits
 """
-function estimate_interval_runlength_encoding_cost(neighbors::Vector{T}, integer_encoding::Symbol, min_interval_length::Int, min_run_length::Int) where {T<:Unsigned}
+function estimate_interval_runlength_encoding_cost(neighbors::Vector{T}, integer_encoding::Symbol, min_interval_length::Int, min_run_length::Int; vertex_id=nothing) where {T<:Unsigned}
     if isempty(neighbors)
         # Empty list: just the count (0+1=1)
         return estimate_encoded_value_cost(T(1), integer_encoding)
@@ -2434,8 +2477,13 @@ function estimate_interval_runlength_encoding_cost(neighbors::Vector{T}, integer
     cost += estimate_encoded_value_cost(T(length(intervals)), integer_encoding)
 
     # 2. Interval data: (start, length) pairs
-    for (start, len) in intervals
-        cost += estimate_encoded_value_cost(start, integer_encoding)
+    for (idx, (start, len)) in enumerate(intervals)
+        if idx == 1 && vertex_id !== nothing
+            encoded_start = T(_rl_zigzag_encode(Int64(start) - Int64(vertex_id)) + 1)
+            cost += estimate_encoded_value_cost(encoded_start, integer_encoding)
+        else
+            cost += estimate_encoded_value_cost(start, integer_encoding)
+        end
         cost += estimate_encoded_value_cost(T(len - min_interval_length + 1), integer_encoding)
     end
 
@@ -2454,8 +2502,14 @@ function estimate_interval_runlength_encoding_cost(neighbors::Vector{T}, integer
     # 6. Final residuals (delta-encoded)
     if !isempty(final_residuals)
         residual_deltas = delta_encode_vector(final_residuals)
-        for delta in residual_deltas
-            cost += estimate_encoded_value_cost(delta, integer_encoding)
+        if vertex_id !== nothing
+            encoded_first = T(_rl_zigzag_encode(Int64(final_residuals[1]) - Int64(vertex_id)) + 1)
+            cost += estimate_encoded_value_cost(encoded_first, integer_encoding)
+        else
+            cost += estimate_encoded_value_cost(residual_deltas[1], integer_encoding)
+        end
+        for i in 2:length(residual_deltas)
+            cost += estimate_encoded_value_cost(residual_deltas[i], integer_encoding)
         end
     end
 
@@ -3287,6 +3341,11 @@ function _read_mil_tag(r)::Int
     return RL_MIL_OPTIONS[idx]
 end
 
+# Zigzag encoding for relative first-value encoding in RL path.
+# Maps signed offsets to positive integers: 0→0, -1→1, +1→2, -2→3, +2→4, ...
+_rl_zigzag_encode(n::Int64)::UInt64 = n >= 0 ? UInt64(2n) : UInt64(2*(-n) - 1)
+_rl_zigzag_decode(v::UInt64)::Int64 = iseven(v) ? Int64(v >> 1) : -Int64((v >> 1) + 1)
+
 # ===========================================================================
 # Variable-Length Coded (VLC) vertex headers
 #
@@ -3412,16 +3471,16 @@ function write_rl_compressed_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
             _, ref_mode, action_mil, action_enc_type = _rl_decode_action(vertex_actions[v])
             mil = action_mil
             enc_type = action_enc_type
-            
+
             if !isempty(current_neighbors) && ref_mode != :none && !isempty(reference_window)
-                ref_result = _rl_try_find_reference(current_neighbors, neighbor_lists, reference_window, ie, mil)
+                ref_result = _rl_try_find_reference(current_neighbors, neighbor_lists, reference_window, ie, mil; vertex_id=v)
                 if ref_result !== nothing
                     actual_ref_mode = ref_mode
                 end
             end
         else
             # Greedy search
-            _, actual_ref_mode, mil, ref_result, enc_type = _rl_greedy_vertex_search(current_neighbors, neighbor_lists, reference_window, ie)
+            _, actual_ref_mode, mil, ref_result, enc_type = _rl_greedy_vertex_search(current_neighbors, neighbor_lists, reference_window, ie; vertex_id=v)
         end
 
         # Write VLC vertex header
@@ -3440,22 +3499,22 @@ function write_rl_compressed_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
             write_bitmap_adaptive(w, copy_bitmap, ie)
             target_list = residuals
         end
-        
+
         # Encode target_list
         if enc_type == :interval
-            write_intervals_and_residuals(w, target_list, ie, mil)
+            write_intervals_and_residuals(w, target_list, ie, mil; vertex_id=v)
         elseif enc_type == :delta
             # Self-delimiting delta: count + values
             write_encoded_value(w, T(length(target_list) + 1), ie)
             if !isempty(target_list)
-                write_delta(w, target_list, ie)
+                write_delta(w, target_list, ie; vertex_id=v)
             end
         elseif enc_type == :rle
             # Self-delimiting RLE: count + hybrid
             write_encoded_value(w, T(length(target_list) + 1), ie)
             if !isempty(target_list)
                 deltas = delta_encode_vector(target_list)
-                write_hybrid_mix_encoded_list(w, deltas, ie, true, mil, false)
+                write_hybrid_mix_encoded_list(w, deltas, ie, true, mil, false; vertex_id=v)
             end
         end
         
@@ -3504,17 +3563,17 @@ function read_rl_compressed_graph_data(r::BitReader, vs::T, coding_scheme::Symbo
         # Helper to read encoded list based on type
         function read_encoded_list_body()
             if enc_type == :interval
-                return read_intervals_and_residuals(r, ie, mil, T)
+                return read_intervals_and_residuals(r, ie, mil, T; vertex_id=v)
             elseif enc_type == :delta
                 count = read_encoded_value(r, ie, T) - T(1)
                 if count > 0
-                    return read_delta(r, ie, T; max_elements=Int(count))
+                    return read_delta(r, ie, T; max_elements=Int(count), vertex_id=v)
                 end
                 return T[]
             elseif enc_type == :rle
                 count = read_encoded_value(r, ie, T) - T(1)
                 if count > 0
-                    return read_hybrid_mix_encoded_list(r, :index, ie, T; max_elements=Int(count))
+                    return read_hybrid_mix_encoded_list(r, :index, ie, T; max_elements=Int(count), vertex_id=v)
                 end
                 return T[]
             end
@@ -3553,22 +3612,32 @@ function _estimate_adaptive_bitmap_cost(bitmap::Vector{Bool}, ie::Symbol)::Int
     return 1 + min(raw_cost, block_cost)  # 1-bit format flag
 end
 
-function _estimate_delta_cost(neighbors::Vector{T}, ie::Symbol) where {T<:Unsigned}
+function _estimate_delta_cost(neighbors::Vector{T}, ie::Symbol; vertex_id=nothing) where {T<:Unsigned}
     isempty(neighbors) && return 0
     deltas = delta_encode_vector(neighbors)
     cost = 0
-    cost += estimate_encoded_value_cost(deltas[1], ie)
+    if vertex_id !== nothing
+        encoded_first = T(_rl_zigzag_encode(Int64(neighbors[1]) - Int64(vertex_id)) + 1)
+        cost += estimate_encoded_value_cost(encoded_first, ie)
+    else
+        cost += estimate_encoded_value_cost(deltas[1], ie)
+    end
     for i in 2:length(deltas)
         cost += estimate_encoded_value_cost(deltas[i] + T(1), ie)
     end
     return cost
 end
 
-function _estimate_rle_cost(neighbors::Vector{T}, ie::Symbol, mil::Int) where {T<:Unsigned}
+function _estimate_rle_cost(neighbors::Vector{T}, ie::Symbol, mil::Int; vertex_id=nothing) where {T<:Unsigned}
     isempty(neighbors) && return 0
     deltas = delta_encode_vector(neighbors)
     cost = 1 # hybrid flag
-    cost += estimate_encoded_value_cost(deltas[1], ie)
+    if vertex_id !== nothing
+        encoded_first = T(_rl_zigzag_encode(Int64(neighbors[1]) - Int64(vertex_id)) + 1)
+        cost += estimate_encoded_value_cost(encoded_first, ie)
+    else
+        cost += estimate_encoded_value_cost(deltas[1], ie)
+    end
     
     if length(deltas) > 1
         rem_deltas = deltas[2:end]
@@ -3593,22 +3662,22 @@ function _estimate_rle_cost(neighbors::Vector{T}, ie::Symbol, mil::Int) where {T
     return cost
 end
 
-function _estimate_base_cost(target::Vector{T}, ie::Symbol, mil::Int, enc_type::Symbol) where {T<:Unsigned}
+function _estimate_base_cost(target::Vector{T}, ie::Symbol, mil::Int, enc_type::Symbol; vertex_id=nothing) where {T<:Unsigned}
     if enc_type == :interval
-        return estimate_interval_runlength_encoding_cost(target, ie, mil, 3)
+        return estimate_interval_runlength_encoding_cost(target, ie, mil, 3; vertex_id=vertex_id)
     elseif enc_type == :delta
         # Add length cost
         cost = estimate_encoded_value_cost(T(length(target) + 1), ie)
-        return cost + _estimate_delta_cost(target, ie)
+        return cost + _estimate_delta_cost(target, ie; vertex_id=vertex_id)
     elseif enc_type == :rle
         cost = estimate_encoded_value_cost(T(length(target) + 1), ie)
-        return cost + _estimate_rle_cost(target, ie, mil)
+        return cost + _estimate_rle_cost(target, ie, mil; vertex_id=vertex_id)
     end
     return 0
 end
 
 function _rl_try_find_reference(neighbors::Vector{T}, neighbor_lists::Dict{T,Vector{T}},
-                                ref_window::Vector{T}, ie::Symbol, mil::Int, enc_type::Symbol= :interval) where {T<:Unsigned}
+                                ref_window::Vector{T}, ie::Symbol, mil::Int, enc_type::Symbol= :interval; vertex_id=nothing) where {T<:Unsigned}
     ns = Set(neighbors)
     best_cost = nothing
     best_distance = nothing
@@ -3616,7 +3685,7 @@ function _rl_try_find_reference(neighbors::Vector{T}, neighbor_lists::Dict{T,Vec
     best_residuals = T[]
 
     # We don't need noref_cost here, we just need to return the best reference cost
-    
+
     for (i, ref_v) in enumerate(ref_window)
         ref_nl = get(neighbor_lists, ref_v, T[])
         isempty(ref_nl) && continue
@@ -3631,9 +3700,9 @@ function _rl_try_find_reference(neighbors::Vector{T}, neighbor_lists::Dict{T,Vec
         distance = T(length(ref_window) - i + 1)
         ref_cost = estimate_encoded_value_cost(distance, ie)
         ref_cost += _estimate_adaptive_bitmap_cost(copy_bitmap, ie)
-        
+
         if !isempty(residuals)
-            ref_cost += _estimate_base_cost(residuals, ie, mil, enc_type)
+            ref_cost += _estimate_base_cost(residuals, ie, mil, enc_type; vertex_id=vertex_id)
         end
 
         if best_cost === nothing || ref_cost < best_cost
@@ -3651,7 +3720,7 @@ function _rl_try_find_reference(neighbors::Vector{T}, neighbor_lists::Dict{T,Vec
 end
 
 function _rl_greedy_vertex_search(neighbors::Vector{T}, neighbor_lists::Dict{T,Vector{T}},
-                                   ref_window::Vector{T}, ie::Symbol) where {T<:Unsigned}
+                                   ref_window::Vector{T}, ie::Symbol; vertex_id=nothing) where {T<:Unsigned}
     if isempty(neighbors)
         return (ie, :none, RL_MIL_OPTIONS[1], nothing, :interval)
     end
@@ -3664,8 +3733,8 @@ function _rl_greedy_vertex_search(neighbors::Vector{T}, neighbor_lists::Dict{T,V
 
     for (enc_type, mil) in RL_ENCODING_OPTIONS
         # Base cost
-        base_cost = _estimate_base_cost(neighbors, ie, mil, enc_type)
-        
+        base_cost = _estimate_base_cost(neighbors, ie, mil, enc_type; vertex_id=vertex_id)
+
         if base_cost < best_cost
             best_cost = base_cost
             best_ref_mode = :none
@@ -3673,18 +3742,18 @@ function _rl_greedy_vertex_search(neighbors::Vector{T}, neighbor_lists::Dict{T,V
             best_enc_type = enc_type
             best_ref_result = nothing
         end
-        
+
         # Reference cost
         if !isempty(ref_window) && length(neighbors) >= 3
-            ref_res = _rl_try_find_reference(neighbors, neighbor_lists, ref_window, ie, mil, enc_type)
+            ref_res = _rl_try_find_reference(neighbors, neighbor_lists, ref_window, ie, mil, enc_type; vertex_id=vertex_id)
             if ref_res !== nothing
                 # Recalculate cost since _rl_try_find_reference calculates it but returns result
                 dist, bmp, res = ref_res
                 ref_c = estimate_encoded_value_cost(dist, ie) + _estimate_adaptive_bitmap_cost(bmp, ie)
                 if !isempty(res)
-                    ref_c += _estimate_base_cost(res, ie, mil, enc_type)
+                    ref_c += _estimate_base_cost(res, ie, mil, enc_type; vertex_id=vertex_id)
                 end
-                
+
                 if ref_c < best_cost
                     best_cost = ref_c
                     best_ref_mode = :reference

@@ -97,6 +97,7 @@ Base.@kwdef struct RCGEParams
     intra_mil::Int = 4                # Min interval length for interval detection
     intra_greedy_mil::Bool = false    # Per-vertex greedy mil search over {2,3,4,5}
     intra_mgs::Bool = false           # Use full MGS encoder (reference+interval+recursive) per cluster
+    intra_zigzag::Bool = false        # Zigzag relative first-value encoding (offset from local vertex index)
 end
 
 # --------------------------
@@ -546,9 +547,10 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                         best_ref_add = Int[]
 
                         # Try raw encoding with each mil
+                        _zz_vid = params.intra_zigzag ? T(idx_local) : nothing
                         for mil in _mil_options
                             io_raw = IOBuffer(); w_raw = BitWriter(io_raw)
-                            Compression.write_intervals_and_residuals(w_raw, T.(nl), :fibonacci, mil)
+                            Compression.write_intervals_and_residuals(w_raw, T.(nl), :fibonacci, mil; vertex_id=_zz_vid)
                             flush_bitwriter(w_raw; flush_last_bits=true)
                             raw_bits = length(take!(io_raw)) * 8
                             if raw_bits < best_bits
@@ -589,7 +591,7 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                                 # Try each mil for additions
                                 for mil in _mil_options
                                     io_add = IOBuffer(); w_add = BitWriter(io_add)
-                                    Compression.write_intervals_and_residuals(w_add, T.(adds), :fibonacci, mil)
+                                    Compression.write_intervals_and_residuals(w_add, T.(adds), :fibonacci, mil; vertex_id=_zz_vid)
                                     flush_bitwriter(w_add; flush_last_bits=true)
                                     add_bits = length(take!(io_add)) * 8
 
@@ -617,13 +619,14 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                 elseif params.intra_ref_enabled && !isempty(prev_lists)
                     # Original reference decision (with or without intervals)
                     let
+                        _zz_vid = params.intra_zigzag ? T(idx_local) : nothing
                         io_raw = IOBuffer(); w_raw = BitWriter(io_raw)
                         if params.intra_intervals
-                            Compression.write_intervals_and_residuals(w_raw, T.(nl), :fibonacci, params.intra_mil)
+                            Compression.write_intervals_and_residuals(w_raw, T.(nl), :fibonacci, params.intra_mil; vertex_id=_zz_vid)
                         else
                             Compression.write_small_count(w_raw, T(length(nl)), params.count_varint)
                             if !isempty(nl)
-                                write_delta(w_raw, T.(nl), :fibonacci)
+                                write_delta(w_raw, T.(nl), :fibonacci; vertex_id=_zz_vid)
                             end
                         end
                         flush_bitwriter(w_raw; flush_last_bits=true)
@@ -650,18 +653,18 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                             while i <= length(nl); push!(adds, nl[i]); i += 1; end
                             # estimate ref bits
                             io_ref = IOBuffer(); w_ref = BitWriter(io_ref)
-                            # positions small-count + delta
+                            # positions small-count + delta (NO zigzag — positions are indices into ref list)
                             Compression.write_small_count(w_ref, T(length(positions)), params.count_varint)
                             if !isempty(positions)
                                 write_delta(w_ref, UInt32.(positions), :fibonacci)
                             end
                             # additions: interval-aware or plain delta
                             if params.intra_intervals
-                                Compression.write_intervals_and_residuals(w_ref, T.(adds), :fibonacci, params.intra_mil)
+                                Compression.write_intervals_and_residuals(w_ref, T.(adds), :fibonacci, params.intra_mil; vertex_id=_zz_vid)
                             else
                                 Compression.write_small_count(w_ref, T(length(adds)), params.count_varint)
                                 if !isempty(adds)
-                                    write_delta(w_ref, T.(adds), :fibonacci)
+                                    write_delta(w_ref, T.(adds), :fibonacci; vertex_id=_zz_vid)
                                 end
                             end
                             flush_bitwriter(w_ref; flush_last_bits=true)
@@ -762,6 +765,7 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
 
             # Now write per-vertex payloads without flags or ref_deltas
             for idx_local in 1:s
+                _zz_vid = params.intra_zigzag ? T(idx_local) : nothing
 
                 if use_ref_vec[idx_local]
                     # write copied positions as dense bitmap over reference list, using RLE Ones-Deltas
@@ -784,7 +788,7 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                     # additions: MGS intervals, custom intervals, or plain delta
                     local ah0 = _total_bits(w)
                     if params.intra_intervals || params.intra_greedy_mil
-                        Compression.write_intervals_and_residuals(w, T.(additions), :fibonacci, mil_vec[idx_local])
+                        Compression.write_intervals_and_residuals(w, T.(additions), :fibonacci, mil_vec[idx_local]; vertex_id=_zz_vid)
                     elseif params.additions_mode == :intervals
                         # detect runs and write intervals + singles
                         runs = Vector{Tuple{Int,Int}}(); singles = Int[]
@@ -811,12 +815,12 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                         end
                         Compression.write_small_count(w, T(length(singles)), params.count_varint)
                         if !isempty(singles)
-                            write_delta(w, T.(singles), :fibonacci)
+                            write_delta(w, T.(singles), :fibonacci; vertex_id=_zz_vid)
                         end
                     else
                         Compression.write_small_count(w, T(length(additions)), params.count_varint)
                         if !isempty(additions)
-                            write_delta(w, T.(additions), :fibonacci)
+                            write_delta(w, T.(additions), :fibonacci; vertex_id=_zz_vid)
                         end
                     end
                     local b3 = _total_bits(w)
@@ -831,12 +835,12 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                     nl = raw_lists[idx_local]
                     local rb0 = _total_bits(w)
                     if params.intra_intervals || params.intra_greedy_mil
-                        Compression.write_intervals_and_residuals(w, T.(nl), :fibonacci, mil_vec[idx_local])
+                        Compression.write_intervals_and_residuals(w, T.(nl), :fibonacci, mil_vec[idx_local]; vertex_id=_zz_vid)
                     else
                         # raw count: use small-count which escapes to varint for large values and handles zero
                         Compression.write_small_count(w, T(length(nl)), params.count_varint)
                         if !isempty(nl)
-                            write_delta(w, T.(nl), :fibonacci)
+                            write_delta(w, T.(nl), :fibonacci; vertex_id=_zz_vid)
                         end
                     end
                     if stats !== nothing
@@ -1104,6 +1108,7 @@ function decode_level(r::BitReader, params::RCGEParams; T::Type{<:Unsigned}=UInt
             prev_lists = Vector{Vector{Int}}()  # local neighbor lists for reference lookups
             for idx_local in 1:s
                 local nl_local::Vector{Int}
+                _zz_vid = params.intra_zigzag ? T(idx_local) : nothing
 
                 if use_ref_vec[idx_local]
                     # Reference mode: read positions bitmap then additions
@@ -1130,7 +1135,7 @@ function decode_level(r::BitReader, params::RCGEParams; T::Type{<:Unsigned}=UInt
                     # Read additions
                     local additions::Vector{Int}
                     if params.intra_intervals || params.intra_greedy_mil
-                        additions = Int.(read_intervals_and_residuals(r, :fibonacci, mil_vec[idx_local], T))
+                        additions = Int.(read_intervals_and_residuals(r, :fibonacci, mil_vec[idx_local], T; vertex_id=_zz_vid))
                     elseif params.additions_mode == :intervals
                         # intervals: runs + singles
                         n_runs = Int(read_small_count(r, params.count_varint, T))
@@ -1144,14 +1149,14 @@ function decode_level(r::BitReader, params::RCGEParams; T::Type{<:Unsigned}=UInt
                         end
                         n_singles = Int(read_small_count(r, params.count_varint, T))
                         if n_singles > 0
-                            singles = Int.(read_delta(r, :fibonacci, T; max_elements=n_singles))
+                            singles = Int.(read_delta(r, :fibonacci, T; max_elements=n_singles, vertex_id=_zz_vid))
                             append!(add_vals, singles)
                         end
                         additions = add_vals
                     else
                         n_add = Int(read_small_count(r, params.count_varint, T))
                         if n_add > 0
-                            additions = Int.(read_delta(r, :fibonacci, T; max_elements=n_add))
+                            additions = Int.(read_delta(r, :fibonacci, T; max_elements=n_add, vertex_id=_zz_vid))
                         else
                             additions = Int[]
                         end
@@ -1162,11 +1167,11 @@ function decode_level(r::BitReader, params::RCGEParams; T::Type{<:Unsigned}=UInt
                 else
                     # Raw mode
                     if params.intra_intervals || params.intra_greedy_mil
-                        nl_local = Int.(read_intervals_and_residuals(r, :fibonacci, mil_vec[idx_local], T))
+                        nl_local = Int.(read_intervals_and_residuals(r, :fibonacci, mil_vec[idx_local], T; vertex_id=_zz_vid))
                     else
                         cnt = Int(read_small_count(r, params.count_varint, T))
                         if cnt > 0
-                            nl_local = Int.(read_delta(r, :fibonacci, T; max_elements=cnt))
+                            nl_local = Int.(read_delta(r, :fibonacci, T; max_elements=cnt, vertex_id=_zz_vid))
                         else
                             nl_local = Int[]
                         end

@@ -226,7 +226,7 @@ function make_params(; kwargs...)
         :intra_ref_window=>32, :intra_ref_min_overlap=>0.3, :intra_ref_rle=>false,
         :intra_block_try=>false, :positions_mode=>:delta, :additions_mode=>:delta,
         :min_cluster_density=>0.0, :intra_intervals=>false, :intra_mil=>4,
-        :intra_greedy_mil=>false,
+        :intra_greedy_mil=>false, :intra_zigzag=>false,
     )
     for (k, v) in kwargs
         d[k] = v
@@ -237,7 +237,9 @@ end
 # Test configurations: (name, params, output_suffix, K_override, llp_passes)
 configs = [
     ("Baseline RW32", base_params, "rcge", 8, 5),
-    ("Best: RW128", make_params(intra_ref_window=128), "rcge_rw128", 8, 5),
+    ("Zigzag", make_params(intra_zigzag=true), "rcge_zz", 8, 5),
+    ("GreedyMIL", make_params(intra_greedy_mil=true), "rcge_gmil", 8, 5),
+    ("GreedyMIL+Zigzag", make_params(intra_greedy_mil=true, intra_zigzag=true), "rcge_gmil_zz", 8, 5),
 ]
 
 results = []
