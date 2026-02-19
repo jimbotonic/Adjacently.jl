@@ -59,6 +59,18 @@ include("graph.jl")  # Load Graph before Compression (Compression.ASTRALayered d
 using .Graph
 export Graph
 
+include("compression/utils.jl")
+using .CompressionUtils
+export CompressionUtils
+
+include("gnn/GNN.jl")
+using .GNN
+export GNN
+
+include("rl/RL.jl")
+using .RL
+export RL
+
 include("compression.jl")
 using .Compression
 export Compression
@@ -67,17 +79,9 @@ include("relabeling.jl")
 using .Relabeling
 export Relabeling
 
-include("gnn/GNN.jl")
-using .GNN
-export GNN
-
 include("cycles.jl")
 using .Cycles
 export Cycles
-
-include("rl/RL.jl")  # Load RL before MGS (MGS imports RL for policy-based compression)
-using .RL
-export RL
 
 include("mgs.jl")
 using .MGS

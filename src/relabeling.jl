@@ -22,7 +22,7 @@ using ..Graph: get_in_degrees, get_out_degrees, get_in_out_degrees, get_reverse_
 using ..PageRank: PR
 
 export relabel_graph, relabel_vertices, relabel_vertices_score, relabel_vertices_lexicographic, relabel_vertices_rcm, relabel_vertices_webgraph_lex,
-       relabel_vertices_llp, relabel_vertices_minhash
+       relabel_vertices_llp, relabel_vertices_minhash, relabel_vertices_bisection
 
 """
     relabel_graph(g::AbstractGraph{T}, vertex_mapping::Vector{T}) where {T<:Unsigned}
@@ -89,6 +89,8 @@ function relabel_vertices(g::AbstractGraph{T}, mode::Symbol=:lexicographic, crit
 	elseif mode == :llp
 		# criterion selects neighbor type: :out or :sym
 		return relabel_vertices_llp(g, criterion)
+	elseif mode == :bisection
+		return relabel_vertices_bisection(g)
 	elseif mode == :minhash
 		# criterion selects neighbor type: :out or :sym
 		return relabel_vertices_minhash(g, criterion)
@@ -150,73 +152,141 @@ function relabel_vertices_score(g::AbstractGraph{T}, criterion::Symbol=:in_degre
 end
 
 """
-    relabel_vertices_llp(g::AbstractGraph{T}, neighbor_mode::Symbol=:sym; passes::Int=5) where {T<:Unsigned}
+    _apm_label_propagation(g, neighbor_mode, gamma, passes)
 
-Layered Label Propagation (LLP) style relabeling. It clusters vertices by
-iteratively propagating the most frequent neighbor label, then orders clusters
-and vertices to group similar neighborhoods and improve compression locality.
+Absolute Potts Model label propagation with resolution parameter gamma.
+Update rule: score(l) = k_l - gamma * (size[l] - k_l) where k_l is the number
+of neighbors with label l, and size[l] is the total number of vertices with label l.
+
+Returns a label vector (Int array indexed by vertex Int id).
+"""
+function _apm_label_propagation(g::AbstractGraph{T}, neighbor_mode::Symbol,
+                                  gamma::Float64, passes::Int) where {T<:Unsigned}
+    n = Int(nv(g))
+    vs = collect(vertices(g))
+
+    # Initialize: each vertex gets its own label
+    labels = collect(1:n)
+
+    # Track label sizes
+    label_size = Dict{Int,Int}()
+    for i in 1:n
+        label_size[i] = 1
+    end
+
+    neigh_iter(v) = neighbor_mode == :out ? outneighbors(g, v) :
+                    union(outneighbors(g, v), inneighbors(g, v))
+
+    perm = collect(1:n)
+    for pass in 1:max(passes, 1)
+        # Process vertices in random order
+        Random.shuffle!(perm)
+        changed = false
+        for idx in perm
+            v = vs[idx]
+            vi = Int(v)
+            nbs = neigh_iter(v)
+            isempty(nbs) && continue
+
+            # Count neighbor labels
+            neigh_label_count = Dict{Int,Int}()
+            for u in nbs
+                lu = labels[Int(u)]
+                neigh_label_count[lu] = get(neigh_label_count, lu, 0) + 1
+            end
+
+            # Evaluate score for each candidate label
+            old_label = labels[vi]
+            best_label = old_label
+            # Score for current label
+            k_old = get(neigh_label_count, old_label, 0)
+            best_score = k_old - gamma * (get(label_size, old_label, 0) - k_old)
+
+            for (lab, k_l) in neigh_label_count
+                sz = get(label_size, lab, 0)
+                # If we move to this label, its size grows by 1 (but we left old, so old shrinks)
+                # For scoring: score(l) = k_l - gamma * (size[l] - k_l)
+                score = k_l - gamma * (sz - k_l)
+                if score > best_score || (score == best_score && lab < best_label)
+                    best_score = score
+                    best_label = lab
+                end
+            end
+
+            if best_label != old_label
+                # Update label sizes
+                label_size[old_label] = get(label_size, old_label, 1) - 1
+                if label_size[old_label] <= 0
+                    delete!(label_size, old_label)
+                end
+                label_size[best_label] = get(label_size, best_label, 0) + 1
+                labels[vi] = best_label
+                changed = true
+            end
+        end
+        !changed && break
+    end
+
+    return labels
+end
+
+"""
+    relabel_vertices_llp(g::AbstractGraph{T}, neighbor_mode::Symbol=:sym; passes::Int=5, K::Int=10) where {T<:Unsigned}
+
+Multi-resolution Layered Label Propagation (Boldi et al.). Runs Absolute Potts Model
+label propagation at multiple resolution parameters gamma in {0} ∪ {2^(-i) : i=0,...,K},
+then composes the orderings to build a final vertex mapping.
 
 @param g: the graph
 @param neighbor_mode: :out (directed out-neighbors) or :sym (union of in/out)
-@param passes: number of label-propagation passes
+@param passes: number of label-propagation passes per resolution
+@param K: number of resolution levels (gamma = 2^(-i) for i=0,...,K)
 @returns Dict{T,T}: mapping old_id -> new_id
 """
-function relabel_vertices_llp(g::AbstractGraph{T}, neighbor_mode::Symbol=:sym; passes::Int=5) where {T<:Unsigned}
-    n = nv(g)
+function relabel_vertices_llp(g::AbstractGraph{T}, neighbor_mode::Symbol=:sym;
+                               passes::Int=5, K::Int=10) where {T<:Unsigned}
+    n = Int(nv(g))
     vs = collect(vertices(g))
-    # initialize labels to unique ids
-    labels = Dict{T,T}(v => v for v in vs)
 
-    # utility to iterate neighbors according to mode
-    neigh_iter(v) = neighbor_mode == :out ? outneighbors(g, v) : union(outneighbors(g, v), inneighbors(g, v))
+    # Generate gamma values: {0} ∪ {2^(-i) : i=0,...,K}
+    gammas = Float64[0.0]
+    for i in 0:K
+        push!(gammas, 2.0^(-i))
+    end
+    @info "LLP: running APM at $(length(gammas)) resolution levels (K=$K, passes=$passes)"
 
-    # label propagation passes
-    for _ in 1:max(passes, 1)
-        # process vertices in simple order (could randomize for variety)
-        for v in vs
-            counts = Dict{T,Int}()
-            for u in neigh_iter(v)
-                lu = labels[u]
-                counts[lu] = get(counts, lu, 0) + 1
-            end
-            if !isempty(counts)
-                # pick most frequent label, tie-break by smallest label id
-                best_label = nothing
-                best_count = -1
-                for (lab, c) in counts
-                    if c > best_count || (c == best_count && (best_label === nothing || lab < best_label))
-                        best_label = lab; best_count = c
-                    end
-                end
-                labels[v] = best_label::T
-            end
+    # Start with identity ordering
+    current_order = collect(1:n)  # current_order[position] = vertex_int_id
+
+    for (gi, gamma) in enumerate(gammas)
+        # Run APM label propagation at this gamma
+        labels = _apm_label_propagation(g, neighbor_mode, gamma, passes)
+
+        # Group vertices by label, preserving current order
+        groups = Dict{Int, Vector{Int}}()
+        for pos in 1:n
+            vid = current_order[pos]
+            lab = labels[vid]
+            push!(get!(groups, lab, Int[]), vid)
         end
+
+        # Sort group keys by size descending, tie-break by smallest member position
+        group_keys = collect(keys(groups))
+        sort!(group_keys, by = k -> (-length(groups[k]), k))
+
+        # Compose: within each group, vertices keep their prior relative order
+        new_order = Int[]
+        sizehint!(new_order, n)
+        for k in group_keys
+            append!(new_order, groups[k])
+        end
+        current_order = new_order
     end
 
-    # group vertices by label
-    groups = Dict{T, Vector{T}}()
-    for v in vs
-        lab = labels[v]
-        push!(get!(groups, lab, T[]), v)
-    end
-
-    # order groups by size descending, tie-break by label id
-    group_keys = collect(keys(groups))
-    sort!(group_keys, by = k -> (-length(groups[k]), k))
-
-    # within each group: sort by out-degree (ascending) then lexicographic neighbors
-    outdeg = get_out_degrees(g)
-    ordered_vertices = T[]
-    for k in group_keys
-        verts = groups[k]
-        sort!(verts, by = v -> (get(outdeg, v, zero(T)), length(outneighbors(g, v)), v))
-        append!(ordered_vertices, verts)
-    end
-
-    # build mapping
+    # Build final mapping: old_id -> new_id
     mapping = Dict{T,T}()
-    for (i, v) in enumerate(ordered_vertices)
-        mapping[v] = T(i)
+    for (new_id, old_vid) in enumerate(current_order)
+        mapping[T(old_vid)] = T(new_id)
     end
     return mapping
 end
@@ -276,6 +346,199 @@ function relabel_vertices_minhash(g::AbstractGraph{T}, neighbor_mode::Symbol=:ou
         mapping[v] = T(i)
     end
     return mapping
+end
+
+"""
+    relabel_vertices_bisection(g::AbstractGraph{T}; max_iters::Int=20, leaf_size::Int=32) where {T<:Unsigned}
+
+Recursive bisection relabeling (Dhulipala et al., KDD 2016). Recursively splits the
+vertex set into two halves and refines each split via move-gain optimization using
+a BiMLogA cost function. Produces a vertex ordering that groups structurally similar
+vertices together for better compression.
+
+@param g: the graph
+@param max_iters: max refinement iterations per bisection level
+@param leaf_size: stop recursion when partition size <= leaf_size
+@returns Dict{T,T}: mapping old_id -> new_id
+"""
+function relabel_vertices_bisection(g::AbstractGraph{T}; max_iters::Int=20, leaf_size::Int=32) where {T<:Unsigned}
+    n = Int(nv(g))
+    vs = collect(vertices(g))
+
+    # Pre-build adjacency as Vector{Vector{Int}} for O(1) lookups
+    adj = Vector{Vector{Int}}(undef, n)
+    for v in vs
+        adj[Int(v)] = Int.(collect(outneighbors(g, v)))
+    end
+    # Also build reverse adjacency for symmetric neighbors
+    radj = [Int[] for _ in 1:n]
+    for v in vs
+        vi = Int(v)
+        for u in adj[vi]
+            push!(radj[u], vi)
+        end
+    end
+    # Symmetric adjacency: union of out and in neighbors
+    sym_adj = Vector{Vector{Int}}(undef, n)
+    for i in 1:n
+        sym_adj[i] = sort(unique(vcat(adj[i], radj[i])))
+    end
+
+    @info "Bisection: starting recursive bisection on $n vertices (max_iters=$max_iters, leaf_size=$leaf_size)"
+
+    # Run recursive bisection to get ordering
+    verts = collect(1:n)
+    order = _recursive_bisect(verts, sym_adj, max_iters, leaf_size)
+
+    # Build mapping: old_id -> new_id
+    mapping = Dict{T,T}()
+    for (new_id, old_vid) in enumerate(order)
+        mapping[T(old_vid)] = T(new_id)
+    end
+    return mapping
+end
+
+"""
+    _move_gain(v, partition, deg1, deg2, size1, size2, adj)
+
+Compute the BiMLogA gain of moving vertex v from its current partition to the other.
+Cost for v in partition p: deg_p(v) * log(n_p / (deg_p(v)+1)) + deg_q(v) * log(n_q / (deg_q(v)+1))
+Gain = cost_before - cost_after (positive = beneficial move).
+"""
+function _move_gain(v::Int, partition::Vector{Int}, deg1::Vector{Int}, deg2::Vector{Int},
+                    size1::Int, size2::Int)
+    from = partition[v]
+    d1 = deg1[v]
+    d2 = deg2[v]
+
+    if from == 1
+        n_from, n_to = size1, size2
+        d_from, d_to = d1, d2
+    else
+        n_from, n_to = size2, size1
+        d_from, d_to = d2, d1
+    end
+
+    # Cost before move
+    cost_before = d_from * log(max(n_from, 1) / (d_from + 1)) +
+                  d_to * log(max(n_to, 1) / (d_to + 1))
+    # Cost after move (v moves from -> to, so sizes change by 1)
+    cost_after = d_from * log(max(n_to + 1, 1) / (d_from + 1)) +
+                 d_to * log(max(n_from - 1, 1) / (d_to + 1))
+
+    return cost_before - cost_after
+end
+
+"""
+    _apply_move!(v, partition, deg1, deg2, adj)
+
+Move vertex v to the other partition and update neighbor degree counts.
+"""
+function _apply_move!(v::Int, partition::Vector{Int}, deg1::Vector{Int}, deg2::Vector{Int}, adj::Vector{Vector{Int}})
+    old_part = partition[v]
+    new_part = old_part == 1 ? 2 : 1
+    partition[v] = new_part
+
+    # Update neighbor degree counts
+    for u in adj[v]
+        if old_part == 1
+            # v left partition 1: neighbors lose a partition-1 neighbor, gain a partition-2 neighbor
+            deg1[u] -= 1
+            deg2[u] += 1
+        else
+            deg2[u] -= 1
+            deg1[u] += 1
+        end
+    end
+end
+
+"""
+    _recursive_bisect(verts, adj, max_iters, leaf_size)
+
+Recursively bisect the vertex set and return the ordering.
+"""
+function _recursive_bisect(verts::Vector{Int}, adj::Vector{Vector{Int}}, max_iters::Int, leaf_size::Int)
+    n = length(verts)
+    if n <= leaf_size
+        return verts
+    end
+
+    # Initial partition: first half = 1, second half = 2
+    half = div(n, 2)
+    vert_set = Set(verts)
+
+    # Map global vertex IDs to local partition assignment
+    partition = zeros(Int, length(adj))  # 0 = not in this subproblem
+    for (i, v) in enumerate(verts)
+        partition[v] = i <= half ? 1 : 2
+    end
+
+    # Compute initial degree counts within each partition
+    deg1 = zeros(Int, length(adj))  # number of neighbors in partition 1
+    deg2 = zeros(Int, length(adj))  # number of neighbors in partition 2
+    for v in verts
+        for u in adj[v]
+            if partition[u] == 1
+                deg1[v] += 1
+            elseif partition[u] == 2
+                deg2[v] += 1
+            end
+        end
+    end
+
+    size1 = half
+    size2 = n - half
+
+    # Refinement iterations
+    for iter in 1:max_iters
+        # Compute gains for all vertices in the subproblem
+        gains = [(v, _move_gain(v, partition, deg1, deg2, size1, size2)) for v in verts]
+        sort!(gains, by = x -> -x[2])  # descending by gain
+
+        moved = false
+        # Greedily swap pairs while net gain > 0
+        # Process vertices one by one
+        for (v, g) in gains
+            if g <= 0.0
+                break
+            end
+            # Check balance constraint: don't let either partition become too small
+            from = partition[v]
+            if from == 1 && size1 <= div(n, 4)
+                continue
+            end
+            if from == 2 && size2 <= div(n, 4)
+                continue
+            end
+
+            _apply_move!(v, partition, deg1, deg2, adj)
+            if from == 1
+                size1 -= 1; size2 += 1
+            else
+                size2 -= 1; size1 += 1
+            end
+            moved = true
+        end
+
+        !moved && break
+    end
+
+    # Collect vertices in each partition preserving input order
+    part1 = Int[]
+    part2 = Int[]
+    for v in verts
+        if partition[v] == 1
+            push!(part1, v)
+        else
+            push!(part2, v)
+        end
+    end
+
+    # Recurse on each half
+    left_order = _recursive_bisect(part1, adj, max_iters, leaf_size)
+    right_order = _recursive_bisect(part2, adj, max_iters, leaf_size)
+
+    return vcat(left_order, right_order)
 end
 
 """

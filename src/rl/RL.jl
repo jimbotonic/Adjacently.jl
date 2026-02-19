@@ -35,8 +35,7 @@ State features are extracted per-vertex:
 module RL
 
 using Random
-using ..Compression: compress_intervals, delta_encode_vector, estimate_encoded_value_cost, estimate_block_encoding_cost
-using ..GNN: gnn_backward_rl!, gnn_forward
+using ..GNN: gnn_backward_rl!, gnn_forward, GNNModel
 
 include("features.jl")
 include("environment.jl")
@@ -44,6 +43,8 @@ include("policy.jl")
 include("agent.jl")
 include("actor_critic.jl")
 include("gnn_head.jl")
+include("policy_network.jl")
+include("actor_critic_pn.jl")
 
 export VertexFeatures, extract_features, feature_index,
        Action, action_to_index, action_from_index,
@@ -54,6 +55,10 @@ export VertexFeatures, extract_features, feature_index,
        NUM_STATES, NUM_ACTIONS,
        ACPolicy, select_action_ac, best_action_ac, train_actor_critic!, evaluate_actor_critic,
        GnnACPolicy, select_action_gnn, best_action_gnn, train_gnn_actor_critic!, evaluate_gnn_actor_critic,
-       train_gnn_ac_e2e!, save_gnn_ac_policy, load_gnn_ac_policy
+       train_gnn_ac_e2e!, save_gnn_ac_policy, load_gnn_ac_policy,
+       PolicyNetwork, select_action_pn, train_pn!, save_pn_policy, load_pn_policy,
+       ActorCriticPN, train_ac_pn!
+
+
 
 end # module RL

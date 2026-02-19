@@ -33,7 +33,8 @@ using ..Relabeling: relabel_vertices, relabel_graph
 using ..Constants: GOLOMB_BASE, ZETA_BASE
 
 using ..RL: QPolicy, load_policy, best_action, action_from_index, feature_index,
-	extract_features, VertexFeatures, Action, NUM_ACTIONS
+	extract_features, VertexFeatures, Action, NUM_ACTIONS, GnnACPolicy, best_action_gnn
+using ..GNN: GNNModel, gnn_forward
 
 # constants for new header format
 # Header structure: 'MGS' (3 bytes) + major/minor version (2 bytes) + flags (2 bytes) + vertices (5 bytes)
@@ -975,97 +976,6 @@ end
 ################################################################################
 
 """
-    write_rl_compressed_mgs3_graph(g, filename, policy_filepath, policy_id; coding_scheme, ref_window_size)
-
-Write graph in compressed MGS v3 format using an RL-learned policy for per-vertex encoding decisions.
-
-The policy determines per-vertex choices of integer encoding, reference mode, and min interval length.
-The compressed stream is self-describing: each vertex's data includes a compact encoding tag so the
-decoder doesn't need the policy.
-
-Parameters:
-- g: Input graph
-- filename: Output filename (without .mgz extension)
-- policy_filepath: Path to .qpolicy file
-- policy_id: Policy ID (1-16) stored in header byte 2
-- coding_scheme: Coding scheme (:children or :index)
-- ref_window_size: Reference window size
-"""
-function write_rl_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString,
-		policy_filepath::Union{AbstractString,Nothing}=nothing, policy_id::Int=1;
-		coding_scheme::Symbol=:children, ref_window_size::Int=7,
-		integer_encoding::Symbol=:fibonacci,
-		vertex_actions::Union{Dict,Nothing}=nothing) where {T<:Unsigned}
-
-	if !(1 <= policy_id <= 16)
-		error("Policy ID must be between 1 and 16, got: $policy_id")
-	end
-
-	# Load the trained policy (or use greedy mode if no policy / vertex_actions)
-	policy = nothing
-	if vertex_actions !== nothing
-		@info("Using pre-computed vertex actions ($(length(vertex_actions)) vertices)")
-	elseif policy_filepath !== nothing && isfile(policy_filepath)
-		@info("Loading RL policy from $policy_filepath")
-		policy = load_policy(policy_filepath)
-		@info("Policy loaded: $(policy.num_states) states, $(policy.num_actions) actions")
-	else
-		@info("Using greedy per-vertex optimization (no policy)")
-	end
-
-	vs = vertices(g)
-	gs = convert(UInt64, length(vs))
-
-	if gs > MGS_MAX_SIZE
-		error("Input graph cannot have more than 2^40-1 vertices")
-	end
-
-	n_bits_v = convert(UInt8, ceil(log(2, gs)))
-	V = infer_uint_custom_type(n_bits_v)
-
-	# Write integer encoding in header (matches stream encoding tag)
-	option_flags = UInt8(OPTION_RL_POLICY_BASE + policy_id - 1)
-	flag_byte1, flag_byte2 = create_header_flags(:directed, coding_scheme, integer_encoding, option_flags)
-
-	# Construct 12-byte header
-	header_bytes = UInt8[
-		0x4d, 0x47, 0x53,  # 'MGS'
-		0x03, 0x00,         # Version 3.0
-		flag_byte1, flag_byte2,
-		(gs & 0xff), ((gs >> 8) & 0xff), ((gs >> 16) & 0xff), ((gs >> 24) & 0xff), ((gs >> 32) & 0xff)
-	]
-
-	f = open(filename * ".mgz", "w")
-	bw = BitWriter(f)
-
-	@info("writing header section (RL policy mode, policy_id=$policy_id)")
-	write_bytes(bw, header_bytes)
-
-	# Build neighbor lists (convert to compact type V)
-	neighbor_lists = Dict{V,Vector{V}}()
-	for v in vs
-		ovs = outneighbors(g, v)
-		neighbor_lists[convert(V, v)] = [convert(V, o) for o in ovs]
-	end
-
-	# Convert vertex_actions keys to compact type V if provided
-	va_compact = nothing
-	if vertex_actions !== nothing
-		va_compact = Dict{V,Int}()
-		for (k, v) in vertex_actions
-			va_compact[convert(V, k)] = v
-		end
-	end
-
-	@info("writing RL-compressed graph data")
-	write_rl_compressed_graph_data(bw, neighbor_lists, policy, coding_scheme, ref_window_size;
-		integer_encoding=integer_encoding, vertex_actions=va_compact)
-
-	flush_bitwriter(bw; flush_last_bits=true)
-	close(f)
-end
-
-"""
     load_rl_compressed_mgs3_graph(io, graph_type, coding_scheme, gs, policy_id)
 
 Load graph from RL-compressed MGS v3 format. The data stream is self-describing,
@@ -1098,5 +1008,118 @@ function load_rl_compressed_mgs3_graph(io::IO, graph_type::Symbol, coding_scheme
 	@info("graph construction completed: $(nv(g)) vertices, $(ne(g)) edges")
 	return g
 end
+function write_rl_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString,
+        policy::GnnACPolicy, gnn::GNNModel;
+        coding_scheme::Symbol=:children, ref_window_size::Int=7,
+        integer_encoding::Symbol=:fibonacci) where {T<:Unsigned}
 
+    vs = vertices(g)
+    gs = convert(UInt64, length(vs))
+
+    if gs > MGS_MAX_SIZE
+        error("Input graph cannot have more than 2^40-1 vertices")
+    end
+
+    n_bits_v = convert(UInt8, ceil(log(2, gs)))
+    V = infer_uint_custom_type(n_bits_v)
+
+    # GNN policy is identified by a high policy_id
+    option_flags = UInt8(OPTION_RL_POLICY_BASE + 16)
+    flag_byte1, flag_byte2 = create_header_flags(:directed, coding_scheme, integer_encoding, option_flags)
+
+    # Construct 12-byte header
+    header_bytes = UInt8[
+        0x4d, 0x47, 0x53,  # 'MGS'
+        0x03, 0x00,         # Version 3.0
+        flag_byte1, flag_byte2,
+        (gs & 0xff), ((gs >> 8) & 0xff), ((gs >> 16) & 0xff), ((gs >> 24) & 0xff), ((gs >> 32) & 0xff)
+    ]
+
+    f = open(filename * ".mgz", "w")
+    bw = BitWriter(f)
+
+    @info("writing header section (GNN policy mode)")
+    write_bytes(bw, header_bytes)
+    
+    gnn_forward(gnn) # Make sure features are computed
+    
+    hidden_dim = size(gnn.H1, 2)
+    feature_fn(v) = [gnn.H1[v,:]; gnn.Z2[v]]
+
+    vertex_actions = Dict{V, Int}()
+    for v_idx in 1:gs
+        v = V(v_idx)
+        features = feature_fn(v)
+        a_idx = best_action_gnn(policy, features)
+        vertex_actions[v] = a_idx
+    end
+
+    neighbor_lists = Dict{V,Vector{V}}()
+    for v in vs
+        ovs = outneighbors(g, v)
+        neighbor_lists[convert(V, v)] = sort([convert(V, o) for o in ovs])
+    end
+
+    @info("writing RL-compressed graph data using GNN policy")
+    write_rl_compressed_graph_data(bw, neighbor_lists, coding_scheme, ref_window_size;
+        integer_encoding=integer_encoding, vertex_actions=vertex_actions)
+
+    flush_bitwriter(bw; flush_last_bits=true)
+    close(f)
 end
+
+"""
+    write_rl_compressed_mgs3_graph(g, filename, vertex_actions; ...)
+
+Save a graph in RL-compressed MGS v3 format using pre-computed vertex actions.
+"""
+function write_rl_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString,
+        vertex_actions::Dict{V, Int};
+        coding_scheme::Symbol=:children, ref_window_size::Int=7,
+        integer_encoding::Symbol=:fibonacci) where {T<:Unsigned, V<:Unsigned}
+
+    vs = vertices(g)
+    gs = convert(UInt64, length(vs))
+
+    if gs > MGS_MAX_SIZE
+        error("Input graph cannot have more than 2^40-1 vertices")
+    end
+
+    n_bits_v = convert(UInt8, ceil(log(2, gs)))
+    V_type = infer_uint_custom_type(n_bits_v)
+
+    # RL policy mode
+    option_flags = UInt8(OPTION_RL_POLICY_BASE)
+    flag_byte1, flag_byte2 = create_header_flags(:directed, coding_scheme, integer_encoding, option_flags)
+
+    header_bytes = UInt8[
+        0x4d, 0x47, 0x53,  # 'MGS'
+        0x03, 0x00,
+        flag_byte1, flag_byte2,
+        (gs & 0xff), ((gs >> 8) & 0xff), ((gs >> 16) & 0xff), ((gs >> 24) & 0xff), ((gs >> 32) & 0xff)
+    ]
+
+    f = open(filename * ".mgz", "w")
+    bw = BitWriter(f)
+
+    write_bytes(bw, header_bytes)
+
+    neighbor_lists = Dict{V_type,Vector{V_type}}()
+    for v in vs
+        ovs = outneighbors(g, v)
+        neighbor_lists[convert(V_type, v)] = sort([convert(V_type, o) for o in ovs])
+    end
+
+    # Ensure vertex_actions keys match V_type
+    va_converted = Dict{V_type, Int}()
+    for (v, a) in vertex_actions
+        va_converted[convert(V_type, v)] = a
+    end
+
+    write_rl_compressed_graph_data(bw, neighbor_lists, coding_scheme, ref_window_size;
+        integer_encoding=integer_encoding, vertex_actions=va_converted)
+
+    flush_bitwriter(bw; flush_last_bits=true)
+    close(f)
+end
+end # module MGS
