@@ -208,7 +208,7 @@ function make_params(; kwargs...)
         :intra_block_try=>false, :positions_mode=>:delta, :additions_mode=>:delta,
         :min_cluster_density=>0.0, :intra_intervals=>false, :intra_mil=>4,
         :intra_greedy_mil=>false, :intra_zigzag=>false, :intra_stop_deltas=>false,
-        :intra_copy_blocks=>false,
+        :intra_copy_blocks=>false, :intra_ref_fixwidth=>false,
     )
     for (k, v) in kwargs
         d[k] = v
@@ -218,12 +218,30 @@ end
 
 # Test configurations: (name, params, output_suffix, K_override, llp_passes, graph)
 configs = [
-    ("Zigzag + STOP (baseline)",
-        make_params(intra_zigzag=true, intra_stop_deltas=true),
-        "rcge_zz_stop", 8, 5, g),
-    ("ZZ+STOP+CopyBlocks",
+    # Current best baseline
+    ("ZZ+STOP+CB (best)",
         make_params(intra_zigzag=true, intra_stop_deltas=true, intra_copy_blocks=true),
-        "rcge_zz_stop_cb", 8, 5, g),
+        "rcge_best", 8, 5, g),
+    # Fixed-width ref deltas (W32)
+    ("ZZ+STOP+CB+FW32",
+        make_params(intra_zigzag=true, intra_stop_deltas=true, intra_copy_blocks=true,
+                    intra_ref_fixwidth=true),
+        "rcge_fw32", 8, 5, g),
+    # Larger window (W64) + fixed-width
+    ("ZZ+STOP+CB+FW64",
+        make_params(intra_zigzag=true, intra_stop_deltas=true, intra_copy_blocks=true,
+                    intra_ref_window=64, intra_ref_fixwidth=true),
+        "rcge_fw64", 8, 5, g),
+    # W64 without fixed-width (for comparison)
+    ("ZZ+STOP+CB+W64",
+        make_params(intra_zigzag=true, intra_stop_deltas=true, intra_copy_blocks=true,
+                    intra_ref_window=64),
+        "rcge_w64", 8, 5, g),
+    # W128 + fixed-width
+    ("ZZ+STOP+CB+FW128",
+        make_params(intra_zigzag=true, intra_stop_deltas=true, intra_copy_blocks=true,
+                    intra_ref_window=128, intra_ref_fixwidth=true),
+        "rcge_fw128", 8, 5, g),
 ]
 
 results = []

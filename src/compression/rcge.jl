@@ -100,6 +100,7 @@ Base.@kwdef struct RCGEParams
     intra_zigzag::Bool = false        # Zigzag relative first-value encoding (offset from local vertex index)
     intra_stop_deltas::Bool = false   # Use STOP-terminated delta lists (eliminates per-vertex count prefix)
     intra_copy_blocks::Bool = false   # WebGraph-style copy-blocks for reference positions (vs RLE bitmap)
+    intra_ref_fixwidth::Bool = false  # Fixed-width ref delta encoding (1-bit flag + ceil(log2(window)) bits per ref)
 end
 
 # --------------------------
@@ -267,6 +268,53 @@ function _read_copy_blocks(r::BitReader, encoding::Symbol, ::Type{T}) where {T<:
         prev_end = start + len
     end
     return positions
+end
+
+"""
+    _write_fixwidth_ref_deltas(w, use_ref_vec, ref_delta_vec, window)
+
+Per-vertex fixed-width ref delta encoding. For each vertex in order:
+  - 1 bit: has_ref flag
+  - If has_ref: (delta - 1) in ceil(log2(window)) bits (fixed width)
+This avoids byte-padded bitmap + varint delta list, saving overhead.
+"""
+function _write_fixwidth_ref_deltas(w::BitWriter, use_ref_vec::Vector{Bool},
+                                    ref_delta_vec::Vector{UInt32}, window::Int)
+    nbits = max(1, ceil(Int, log2(window)))
+    for idx in 1:length(use_ref_vec)
+        if use_ref_vec[idx]
+            write_bit(w, true)
+            d = Int(ref_delta_vec[idx]) - 1  # delta ∈ [1, window] → [0, window-1]
+            for b in (nbits-1):-1:0
+                write_bit(w, ((d >> b) & 1) == 1)
+            end
+        else
+            write_bit(w, false)
+        end
+    end
+end
+
+"""
+    _read_fixwidth_ref_deltas(r, s, window) → (use_ref_vec, ref_delta_vec)
+
+Read per-vertex fixed-width ref delta encoding written by `_write_fixwidth_ref_deltas`.
+"""
+function _read_fixwidth_ref_deltas(r::BitReader, s::Int, window::Int)
+    nbits = max(1, ceil(Int, log2(window)))
+    use_ref_vec = Vector{Bool}(undef, s)
+    ref_delta_vec = zeros(UInt32, s)
+    for idx in 1:s
+        has_ref = read_bit(r)
+        use_ref_vec[idx] = has_ref
+        if has_ref
+            d = 0
+            for _ in 1:nbits
+                d = (d << 1) | Int(read_bit(r))
+            end
+            ref_delta_vec[idx] = UInt32(d + 1)  # restore delta ∈ [1, window]
+        end
+    end
+    return use_ref_vec, ref_delta_vec
 end
 
 """
@@ -844,27 +892,29 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                 push!(prev_lists, nl)
             end
 
-            # Write per-cluster ref bitmap and ref_delta RLE
-            # Always write bitmap when intra_ref_enabled so the format is self-decodable;
-            # only write ref deltas if there are any refs (decoder checks bitmap)
+            # Write per-cluster ref bitmap and ref deltas
             if params.intra_ref_enabled
                 local hb0 = _total_bits(w)
-                Compression.write_bitpacked_bitmap(w, use_ref_vec)
-                if any(use_ref_vec)
-                    # collect deltas for ref-only entries in vertex order
-                    deltas = UInt32[]
-                    for idx in 1:s
-                        if use_ref_vec[idx]
-                            push!(deltas, ref_delta_vec[idx])
+                if params.intra_ref_fixwidth
+                    # Fixed-width: 1-bit flag + ceil(log2(window)) bits per ref vertex
+                    _write_fixwidth_ref_deltas(w, use_ref_vec, ref_delta_vec, params.intra_ref_window)
+                else
+                    # Legacy: byte-padded bitmap + varint delta list
+                    Compression.write_bitpacked_bitmap(w, use_ref_vec)
+                    if any(use_ref_vec)
+                        deltas = UInt32[]
+                        for idx in 1:s
+                            if use_ref_vec[idx]
+                                push!(deltas, ref_delta_vec[idx])
+                            end
                         end
-                    end
-                    if params.intra_ref_rle
-                        Compression.write_rle_ones_deltas(w, deltas, params.varint)
-                    else
-                        # Write plain count and each delta using varint
-                        write_encoded_value(w, T(length(deltas)), params.varint)
-                        for d in deltas
-                            write_varint(w, d; encoding=params.varint)
+                        if params.intra_ref_rle
+                            Compression.write_rle_ones_deltas(w, deltas, params.varint)
+                        else
+                            write_encoded_value(w, T(length(deltas)), params.varint)
+                            for d in deltas
+                                write_varint(w, d; encoding=params.varint)
+                            end
                         end
                     end
                 end
@@ -1208,25 +1258,30 @@ function decode_level(r::BitReader, params::RCGEParams; T::Type{<:Unsigned}=UInt
             has_any_ref = false
 
             if params.intra_ref_enabled
-                use_ref_vec = Vector{Bool}(read_bitpacked_bitmap(r, s))
-                has_any_ref = any(use_ref_vec)
-                if has_any_ref
-                    # Read ref deltas for ref-only entries
-                    if params.intra_ref_rle
-                        ref_deltas = read_rle_ones_deltas(r, params.varint, UInt32)
-                    else
-                        ndelt = Int(read_encoded_value(r, params.varint, T))
-                        ref_deltas = UInt32[]
-                        for _ in 1:ndelt
-                            push!(ref_deltas, read_encoded_value(r, params.varint, UInt32))
+                if params.intra_ref_fixwidth
+                    # Fixed-width: 1-bit flag + ceil(log2(window)) bits per ref vertex
+                    use_ref_vec, ref_delta_vec = _read_fixwidth_ref_deltas(r, s, params.intra_ref_window)
+                    has_any_ref = any(use_ref_vec)
+                else
+                    # Legacy: byte-padded bitmap + varint delta list
+                    use_ref_vec = Vector{Bool}(read_bitpacked_bitmap(r, s))
+                    has_any_ref = any(use_ref_vec)
+                    if has_any_ref
+                        if params.intra_ref_rle
+                            ref_deltas = read_rle_ones_deltas(r, params.varint, UInt32)
+                        else
+                            ndelt = Int(read_encoded_value(r, params.varint, T))
+                            ref_deltas = UInt32[]
+                            for _ in 1:ndelt
+                                push!(ref_deltas, read_encoded_value(r, params.varint, UInt32))
+                            end
                         end
-                    end
-                    # Distribute deltas to ref vertices
-                    di = 1
-                    for idx in 1:s
-                        if use_ref_vec[idx]
-                            ref_delta_vec[idx] = ref_deltas[di]
-                            di += 1
+                        di = 1
+                        for idx in 1:s
+                            if use_ref_vec[idx]
+                                ref_delta_vec[idx] = ref_deltas[di]
+                                di += 1
+                            end
                         end
                     end
                 end
