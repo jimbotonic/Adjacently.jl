@@ -98,6 +98,8 @@ Base.@kwdef struct RCGEParams
     intra_greedy_mil::Bool = false    # Per-vertex greedy mil search over {2,3,4,5}
     intra_mgs::Bool = false           # Use full MGS encoder (reference+interval+recursive) per cluster
     intra_zigzag::Bool = false        # Zigzag relative first-value encoding (offset from local vertex index)
+    intra_stop_deltas::Bool = false   # Use STOP-terminated delta lists (eliminates per-vertex count prefix)
+    intra_copy_blocks::Bool = false   # WebGraph-style copy-blocks for reference positions (vs RLE bitmap)
 end
 
 # --------------------------
@@ -138,6 +140,133 @@ function write_stop_delta_list(w::BitWriter, sorted_vals::Vector{T}; encoding::S
         prev = v
     end
     write_bit(w, false) # STOP
+end
+
+"""
+    _write_stop_delta_zigzag(w, sorted_vals, encoding, vertex_id)
+
+STOP-terminated delta list with optional zigzag first value.
+Format: for each value: bit '1' + varint(gap); then bit '0'.
+Gaps are v[i] - v[i-1] (>= 1 for sorted unique lists, Fibonacci-safe).
+When vertex_id is provided, the first value is zigzag-encoded relative to it.
+"""
+function _write_stop_delta_zigzag(w::BitWriter, sorted_vals::Vector{T}, encoding::Symbol, vertex_id) where {T<:Unsigned}
+    if isempty(sorted_vals)
+        write_bit(w, false)  # STOP
+        return
+    end
+    # First value
+    write_bit(w, true)
+    if vertex_id !== nothing
+        offset = Int64(sorted_vals[1]) - Int64(vertex_id)
+        write_encoded_value(w, T(Compression._rl_zigzag_encode(offset) + 1), encoding)
+    else
+        write_encoded_value(w, sorted_vals[1], encoding)
+    end
+    # Remaining: gaps (>= 1 for sorted unique lists)
+    for i in 2:length(sorted_vals)
+        write_bit(w, true)
+        write_encoded_value(w, sorted_vals[i] - sorted_vals[i-1], encoding)
+    end
+    write_bit(w, false)  # STOP
+end
+
+"""
+    _read_stop_delta_zigzag(r, encoding, T, vertex_id)
+
+Read a STOP-terminated delta list written by `_write_stop_delta_zigzag`.
+"""
+function _read_stop_delta_zigzag(r::BitReader, encoding::Symbol, ::Type{T}, vertex_id) where {T<:Unsigned}
+    result = T[]
+    first = true
+    prev = zero(T)
+    while read_bit(r)  # '1' = more values, '0' = STOP
+        raw = read_encoded_value(r, encoding, T)
+        if first && vertex_id !== nothing
+            val = T(Int64(vertex_id) + Compression._rl_zigzag_decode(UInt64(raw - 1)))
+            first = false
+        else
+            val = prev + raw
+            first = false
+        end
+        push!(result, val)
+        prev = val
+    end
+    return result
+end
+
+"""
+    _write_copy_blocks(w, positions, encoding)
+
+Write sorted position indices as WebGraph-style copy-blocks.
+Positions are grouped into contiguous runs (copy blocks). Format:
+  small_count(num_blocks), then for each block:
+  - first block: varint(start), varint(length)
+  - subsequent blocks: varint(gap_from_prev_end), varint(length)
+All values >= 1 (1-based positions, gaps >= 1, lengths >= 1).
+"""
+function _write_copy_blocks(w::BitWriter, positions::Vector{Int}, encoding::Symbol)
+    if isempty(positions)
+        Compression.write_small_count(w, UInt32(0), encoding)
+        return
+    end
+    # Compute copy blocks: contiguous runs of sorted positions
+    blocks = Tuple{Int,Int}[]  # (start, length)
+    i = 1
+    while i <= length(positions)
+        start = positions[i]
+        len = 1
+        while i + len <= length(positions) && positions[i + len] == start + len
+            len += 1
+        end
+        push!(blocks, (start, len))
+        i += len
+    end
+
+    ncb = length(blocks)
+    Compression.write_small_count(w, UInt32(ncb), encoding)
+    # First block: start (>= 1) and length (>= 1)
+    write_encoded_value(w, UInt32(blocks[1][1]), encoding)
+    write_encoded_value(w, UInt32(blocks[1][2]), encoding)
+    # Subsequent blocks: gap from previous block end, then length
+    prev_end = blocks[1][1] + blocks[1][2]
+    for i in 2:ncb
+        gap = blocks[i][1] - prev_end  # >= 1 for sorted unique positions
+        write_encoded_value(w, UInt32(gap), encoding)
+        write_encoded_value(w, UInt32(blocks[i][2]), encoding)
+        prev_end = blocks[i][1] + blocks[i][2]
+    end
+end
+
+"""
+    _read_copy_blocks(r, encoding, T) → Vector{Int}
+
+Read copy-blocks written by `_write_copy_blocks`. Returns sorted position indices.
+"""
+function _read_copy_blocks(r::BitReader, encoding::Symbol, ::Type{T}) where {T<:Unsigned}
+    ncb = Int(Compression.read_small_count(r, encoding, T))
+    if ncb == 0
+        return Int[]
+    end
+    positions = Int[]
+    # First block
+    start = Int(read_encoded_value(r, encoding, T))
+    len = Int(read_encoded_value(r, encoding, T))
+    for j in 0:(len-1)
+        push!(positions, start + j)
+    end
+    prev_end = start + len
+    # Subsequent blocks
+    for i in 2:ncb
+        gap = Int(read_encoded_value(r, encoding, T))
+        start = prev_end + gap
+        len = Int(read_encoded_value(r, encoding, T))
+        for j in 0:(len-1)
+            push!(positions, start + j)
+        end
+        prev_end = start + len
+    end
+    return positions
 end
 
 """
@@ -581,9 +710,13 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
 
                                 # Positions cost (doesn't depend on mil)
                                 io_pos = IOBuffer(); w_pos = BitWriter(io_pos)
-                                Compression.write_small_count(w_pos, T(length(positions)), params.count_varint)
-                                if !isempty(positions)
-                                    write_delta(w_pos, UInt32.(positions), :fibonacci)
+                                if params.intra_copy_blocks
+                                    _write_copy_blocks(w_pos, positions, params.varint)
+                                else
+                                    Compression.write_small_count(w_pos, T(length(positions)), params.count_varint)
+                                    if !isempty(positions)
+                                        write_delta(w_pos, UInt32.(positions), :fibonacci)
+                                    end
                                 end
                                 flush_bitwriter(w_pos; flush_last_bits=true)
                                 pos_bits = length(take!(io_pos)) * 8
@@ -623,6 +756,8 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                         io_raw = IOBuffer(); w_raw = BitWriter(io_raw)
                         if params.intra_intervals
                             Compression.write_intervals_and_residuals(w_raw, T.(nl), :fibonacci, params.intra_mil; vertex_id=_zz_vid)
+                        elseif params.intra_stop_deltas
+                            _write_stop_delta_zigzag(w_raw, T.(nl), :fibonacci, _zz_vid)
                         else
                             Compression.write_small_count(w_raw, T(length(nl)), params.count_varint)
                             if !isempty(nl)
@@ -653,14 +788,20 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                             while i <= length(nl); push!(adds, nl[i]); i += 1; end
                             # estimate ref bits
                             io_ref = IOBuffer(); w_ref = BitWriter(io_ref)
-                            # positions small-count + delta (NO zigzag — positions are indices into ref list)
-                            Compression.write_small_count(w_ref, T(length(positions)), params.count_varint)
-                            if !isempty(positions)
-                                write_delta(w_ref, UInt32.(positions), :fibonacci)
+                            # positions: copy-blocks or small-count + delta (NO zigzag — positions are indices into ref list)
+                            if params.intra_copy_blocks
+                                _write_copy_blocks(w_ref, positions, params.varint)
+                            else
+                                Compression.write_small_count(w_ref, T(length(positions)), params.count_varint)
+                                if !isempty(positions)
+                                    write_delta(w_ref, UInt32.(positions), :fibonacci)
+                                end
                             end
                             # additions: interval-aware or plain delta
                             if params.intra_intervals
                                 Compression.write_intervals_and_residuals(w_ref, T.(adds), :fibonacci, params.intra_mil; vertex_id=_zz_vid)
+                            elseif params.intra_stop_deltas
+                                _write_stop_delta_zigzag(w_ref, T.(adds), :fibonacci, _zz_vid)
                             else
                                 Compression.write_small_count(w_ref, T(length(adds)), params.count_varint)
                                 if !isempty(adds)
@@ -768,13 +909,14 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                 _zz_vid = params.intra_zigzag ? T(idx_local) : nothing
 
                 if use_ref_vec[idx_local]
-                    # write copied positions as dense bitmap over reference list, using RLE Ones-Deltas
+                    # write copied positions into reference list
                     ref_positions = ref_positions_list[idx_local]
                     additions = additions_list[idx_local]
                     ref_len = ref_len_list[idx_local]
-                    # positions: dense bitmap runs only (no mode, no positions count)
                     local bpos0 = _total_bits(w)
-                    if ref_len > 0
+                    if params.intra_copy_blocks
+                        _write_copy_blocks(w, ref_positions, params.varint)
+                    elseif ref_len > 0
                         copied = fill(false, ref_len)
                         for p in ref_positions
                             if 1 <= p <= ref_len; copied[p] = true; end
@@ -818,9 +960,13 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                             write_delta(w, T.(singles), :fibonacci; vertex_id=_zz_vid)
                         end
                     else
-                        Compression.write_small_count(w, T(length(additions)), params.count_varint)
-                        if !isempty(additions)
-                            write_delta(w, T.(additions), :fibonacci; vertex_id=_zz_vid)
+                        if params.intra_stop_deltas
+                            _write_stop_delta_zigzag(w, T.(additions), :fibonacci, _zz_vid)
+                        else
+                            Compression.write_small_count(w, T(length(additions)), params.count_varint)
+                            if !isempty(additions)
+                                write_delta(w, T.(additions), :fibonacci; vertex_id=_zz_vid)
+                            end
                         end
                     end
                     local b3 = _total_bits(w)
@@ -836,6 +982,8 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                     local rb0 = _total_bits(w)
                     if params.intra_intervals || params.intra_greedy_mil
                         Compression.write_intervals_and_residuals(w, T.(nl), :fibonacci, mil_vec[idx_local]; vertex_id=_zz_vid)
+                    elseif params.intra_stop_deltas
+                        _write_stop_delta_zigzag(w, T.(nl), :fibonacci, _zz_vid)
                     else
                         # raw count: use small-count which escapes to varint for large values and handles zero
                         Compression.write_small_count(w, T(length(nl)), params.count_varint)
@@ -1116,8 +1264,16 @@ function decode_level(r::BitReader, params::RCGEParams; T::Type{<:Unsigned}=UInt
                     ref_list = ref_index >= 1 ? prev_lists[ref_index] : Int[]
                     ref_len = length(ref_list)
 
-                    # Read positions bitmap (RLE ones-deltas over reference)
-                    if ref_len > 0
+                    # Read copied positions from reference
+                    if params.intra_copy_blocks
+                        copied_positions = _read_copy_blocks(r, params.varint, T)
+                        copied_vals = Int[]
+                        for p in copied_positions
+                            if 1 <= p <= ref_len
+                                push!(copied_vals, ref_list[p])
+                            end
+                        end
+                    elseif ref_len > 0
                         copied_bitmap = read_bitmap_rle_ones_deltas(r, params.varint, UInt32)
                         # Extract copied positions from ref
                         copied_vals = Int[]
@@ -1153,6 +1309,8 @@ function decode_level(r::BitReader, params::RCGEParams; T::Type{<:Unsigned}=UInt
                             append!(add_vals, singles)
                         end
                         additions = add_vals
+                    elseif params.intra_stop_deltas
+                        additions = Int.(_read_stop_delta_zigzag(r, :fibonacci, T, _zz_vid))
                     else
                         n_add = Int(read_small_count(r, params.count_varint, T))
                         if n_add > 0
@@ -1168,6 +1326,8 @@ function decode_level(r::BitReader, params::RCGEParams; T::Type{<:Unsigned}=UInt
                     # Raw mode
                     if params.intra_intervals || params.intra_greedy_mil
                         nl_local = Int.(read_intervals_and_residuals(r, :fibonacci, mil_vec[idx_local], T; vertex_id=_zz_vid))
+                    elseif params.intra_stop_deltas
+                        nl_local = Int.(_read_stop_delta_zigzag(r, :fibonacci, T, _zz_vid))
                     else
                         cnt = Int(read_small_count(r, params.count_varint, T))
                         if cnt > 0
