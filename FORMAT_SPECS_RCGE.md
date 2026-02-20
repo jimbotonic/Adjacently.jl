@@ -7,7 +7,7 @@ RCGE (Reversible Coarsening Graph Encoding) compresses directed graphs through m
 Key properties:
 - Multi-level coarsening via Leiden community detection
 - Cluster membership encoded with Elias-Fano, delta, or STOP-terminated lists
-- Intra-cluster edges use optional reference encoding (greedy lookback with bitmap positions + additions)
+- Intra-cluster edges use optional reference encoding (greedy lookback with copy-blocks positions + additions)
 - Inter-cluster edges organized by (source cluster, target cluster) pairs with STOP-terminated neighbor lists
 - Raw bitstream output (not wrapped in MGZ container)
 
@@ -53,6 +53,9 @@ Key properties:
 | `intra_mil` | 4 | Minimum interval length for interval detection |
 | `intra_greedy_mil` | `false` | Per-vertex greedy search over mil values {2,3,4,5} |
 | `intra_mgs` | `false` | Use full MGS encoder (reference+interval+recursive) per cluster |
+| `intra_zigzag` | `false` | Zigzag relative first-value encoding (offset from local vertex index) |
+| `intra_stop_deltas` | `false` | STOP-terminated delta lists (eliminates per-vertex count prefix) |
+| `intra_copy_blocks` | `false` | WebGraph-style copy-blocks for reference positions (vs RLE bitmap) |
 
 ## Bitstream Structure
 
@@ -123,31 +126,44 @@ Per-vertex adjacency lists with optional reference encoding. If reference encodi
 
 For **referenced vertices** (use_ref=true):
 ```
-positions_bitmap:
-  RLE ones-deltas bitmap over the reference vertex's neighbor list
-  indicating which positions are copied
+positions:
+  IF intra_copy_blocks:
+    copy-blocks encoding (see Copy-Blocks below)
+  ELSE:
+    RLE ones-deltas bitmap over the reference vertex's neighbor list
 additions:
-  IF additions_mode = :delta:
-    small_count(num_additions)
-    delta-encoded addition list
-  IF additions_mode = :intervals:
+  IF intra_intervals OR intra_greedy_mil:
+    intervals_and_residuals encoding [†]
+  ELIF additions_mode = :intervals:
     small_count(num_runs)
     For each run: (start, length) varints
     small_count(num_singles)
-    delta-encoded singles
+    delta-encoded singles [†]
+  ELIF intra_stop_deltas:
+    STOP-terminated delta list [†]
+  ELSE (additions_mode = :delta):
+    small_count(num_additions)
+    delta-encoded addition list [†]
 ```
 
 For **non-referenced vertices** (use_ref=false):
 ```
-small_count(degree_in_cluster)
-delta-encoded sorted local neighbor IDs
+IF intra_intervals OR intra_greedy_mil:
+  intervals_and_residuals encoding [†]
+ELIF intra_stop_deltas:
+  STOP-terminated delta list [†]
+ELSE:
+  small_count(degree_in_cluster)
+  delta-encoded sorted local neighbor IDs [†]
 ```
+
+`[†]` When `intra_zigzag=true`, the first value in delta-encoded and intervals_and_residuals lists is encoded as a zigzag offset from the current vertex's local index (see Zigzag Relative First-Value Encoding below), rather than as an absolute value. This does not apply to reference position lists, which are indices into the reference neighbor list.
 
 #### Reference Encoding Decision
 
 For each vertex, the encoder measures the bitstream cost of:
-1. **Raw encoding**: small_count + delta-coded neighbor list
-2. **Reference encoding** (for each candidate in lookback window): positions bitmap + additions
+1. **Raw encoding**: delta-coded neighbor list (with STOP-terminated or small_count prefix)
+2. **Reference encoding** (for each candidate in lookback window): copy-blocks positions + additions
 
 The cheapest option is selected per vertex. Two-pointer merge is used to compute positions (shared elements with the reference) and additions (elements not in the reference).
 
@@ -174,20 +190,90 @@ The intra-cluster reference encoding exploits similarity between successive adja
 
 1. **Lookback window**: For vertex at position `idx`, consider reference candidates from position `max(1, idx - window)` to `idx - 1`
 2. **Two-pointer merge**: Compute shared positions (elements present in both current and reference lists) and additions (elements only in current list)
-3. **Cost estimation**: Measure actual bits for positions bitmap + additions vs raw delta encoding
+3. **Cost estimation**: Measure actual bits for positions (copy-blocks or bitmap) + additions vs raw delta encoding
 4. **Greedy selection**: Pick the reference yielding the fewest bits, or use raw encoding if no reference helps
 
-### Positions Bitmap
+### Copy-Blocks Positions Encoding
 
-The positions where the current vertex's neighbors match the reference's neighbors are encoded as a dense boolean bitmap over the reference list, using RLE ones-deltas:
+When `intra_copy_blocks=true`, reference positions are encoded as WebGraph-style copy-blocks — contiguous runs of copied positions:
+
+```
+Copy-blocks format:
+  small_count(num_copy_blocks)     # number of contiguous runs
+  IF num_copy_blocks > 0:
+    varint(first_start)            # start position of first run (1-based, >= 1)
+    varint(first_length)           # length of first run (>= 1)
+    For each subsequent block i = 2..num_copy_blocks:
+      varint(gap)                  # gap from end of previous block (>= 1)
+      varint(length)               # length of this run (>= 1)
+```
+
+**Example**: Reference list has 10 neighbors. Current vertex shares neighbors at positions 1,2,3,6,7.
+- Copy blocks: [(start=1, len=3), (start=6, len=2)]
+- Encoded: small_count(2), fib(1), fib(3), fib(2), fib(2)
+- gap = 6 - (1+3) = 2
+
+This is more compact than the RLE ones-deltas bitmap because:
+1. Skip runs are implicit (encoded by gaps between copy blocks)
+2. No per-run type flag (alternation between copy/skip is implicit)
+3. No explicit bitmap length needed (decoder knows ref_len from reference list)
+4. All values >= 1, avoiding +1 shifts needed for zero-tolerant block encoding
+
+### RLE Ones-Deltas Bitmap (Legacy)
+
+When `intra_copy_blocks=false`, positions are encoded as a dense boolean bitmap over the reference list:
+- `varint(token_count)`: number of alternating runs
+- For each token: 1-bit flag (is_ones_run) + `varint(run_length)`
 - The bitmap has length equal to the reference's neighbor count
 - `true` at position j means the j-th neighbor of the reference is also a neighbor of the current vertex
 
 ### Additions
 
 Neighbors of the current vertex that are not in the reference list. Encoded as:
-- **Delta mode**: small_count + gap-coded sorted list (Fibonacci)
-- **Intervals mode**: detected consecutive runs as (start, length) pairs + remaining singles delta-coded
+- **STOP-terminated** (`intra_stop_deltas=true`): Each value preceded by `1` bit, delta-coded, terminated by `0` bit. No explicit count prefix.
+- **Delta mode** (`additions_mode=:delta`): small_count + gap-coded sorted list (Fibonacci)
+- **Intervals mode** (`intra_intervals` or `intra_greedy_mil`): intervals_and_residuals encoding (interval start/length pairs + delta-coded residuals)
+- **Custom intervals mode** (`additions_mode=:intervals`): detected consecutive runs as (start, length) pairs + remaining singles delta-coded
+
+### STOP-Terminated Delta Lists
+
+When `intra_stop_deltas=true`, neighbor lists (both raw and additions) use STOP-terminated encoding instead of small_count + delta:
+
+```
+STOP-terminated delta list:
+  For each value v in sorted order:
+    bit '1'                        # more values
+    varint(gap)                    # v - prev (first value: absolute or zigzag-encoded)
+  bit '0'                          # STOP terminator
+```
+
+This eliminates the per-list count prefix. Cost: 1 bit per value + 1 stop bit, vs small_count (2 bits for degree 0-2, 2+varint for degree >= 3). STOP wins for degree 0-5, ties at 6, loses at 7+. Net saving: ~0.05 BPE on CNR-2000.
+
+### Zigzag Relative First-Value Encoding
+
+When `intra_zigzag=true`, the first value in neighbor lists and residual lists is encoded as a signed offset from the current vertex's local index within the cluster, rather than as an absolute value. This exploits the locality created by LLP reordering: neighbors tend to cluster near the vertex in the ordering, so the offset is typically small.
+
+**Encoding**: For vertex at local index `v` with first neighbor value `v1`:
+```
+offset = v1 - v
+zigzag(offset) = offset >= 0 ? 2*offset : 2*(-offset) - 1
+encoded = zigzag(offset) + 1     # +1 shift for Fibonacci/Zeta compatibility (must be >= 1)
+```
+
+**Decoding**: Read raw value, then recover:
+```
+offset = zigzag_decode(raw - 1)
+v1 = v + offset
+```
+
+The zigzag mapping converts signed offsets to positive integers: 0->0, -1->1, +1->2, -2->3, +2->4, ...
+
+**Scope**: Zigzag applies to:
+- First value in delta-encoded neighbor lists (raw and additions)
+- First interval start in intervals_and_residuals encoding
+- First value in residual sublists within intervals_and_residuals encoding
+
+Zigzag does **not** apply to reference position lists (these are indices into the reference's neighbor list, not local vertex IDs).
 
 ## Integer Encodings
 
@@ -224,7 +310,7 @@ The coarse weighted graph is converted to a `TestGraph` (unweighted with repeate
 | `bits_membership` | Bits for Section 1 (cluster membership lists) |
 | `bits_intra` | Total bits for Section 2 (intra-cluster edges) |
 | `bits_intra_headers` | Bits for intra-cluster structural headers (ref bitmaps, deltas, raw counts) |
-| `bits_intra_copy` | Bits for reference positions bitmaps |
+| `bits_intra_copy` | Bits for reference copy-blocks / positions bitmaps |
 | `bits_intra_add` | Bits for reference additions |
 | `bits_intra_raw` | Bits for non-referenced vertex adjacency data |
 | `bits_intra_ref_small_headers` | Bits for small reference headers |
@@ -243,37 +329,66 @@ Graph: 325,557 vertices, 3,216,152 edges. Partitioned via Leiden with K=8 cluste
 
 | Configuration | Bits/Edge | File Size |
 |---------------|-----------|-----------|
-| Baseline (ref_window=32) | 4.753 | 1,866 KB |
-| ref_window=64 | 4.716 | 1,852 KB |
-| **ref_window=128 (best)** | **4.693** | **1,842 KB** |
-| ref_window=128, LLP 20 passes | 4.693 | 1,842 KB |
-| K=4, ref_window=128 | 4.718 | 1,852 KB |
-| K=12, ref_window=128 | 4.829 | 1,896 KB |
-| K=16, ref_window=128 | 4.844 | 1,902 KB |
+| Baseline (ref_window=32, delta) | 4.307 | 1,691 KB |
+| Zigzag | 3.566 | 1,400 KB |
+| Zigzag + STOP deltas | 3.515 | 1,380 KB |
+| **Zigzag + STOP + CopyBlocks** | **3.117** | **1,224 KB** |
+| GreedyMIL (intervals, no zigzag) | 4.998 | 1,962 KB |
+| GreedyMIL+Zigzag | 4.097 | 1,609 KB |
 | Intervals (mil=2) | 5.062 | 1,987 KB |
 | Intervals (mil=3) | 5.011 | 1,967 KB |
 | Full MGS per cluster | 5.863 | 2,302 KB |
 
 **Reference**: WebGraph (Zeta-3, LLP) achieves 2.90 BPE on this dataset.
 
-### Intra-Cluster Breakdown (best config, ref_window=128)
+### Intra-Cluster Breakdown
 
-| Component | Size | Share |
-|-----------|------|-------|
-| Headers (ref bitmaps, deltas) | 233 KB | 13.4% |
-| Copy (positions bitmaps) | 370 KB | 21.2% |
-| Additions (delta residuals) | 776 KB | 44.5% |
-| Raw (non-referenced vertices) | 366 KB | 21.0% |
+**Best config (Zigzag + STOP + CopyBlocks)**:
 
-61.6% of vertices (200,408/325,557) use reference encoding with window=128.
+| Component | Size | BPE | Share |
+|-----------|------|-----|-------|
+| Membership | 125 KB | 0.318 | 10.2% |
+| Headers (ref bitmaps, deltas) | 200 KB | 0.510 | 16.3% |
+| Copy (copy-blocks positions) | 268 KB | 0.683 | 21.9% |
+| Additions (STOP delta residuals) | 460 KB | 1.170 | 37.5% |
+| Raw (non-referenced vertices) | 159 KB | 0.406 | 13.0% |
+| Inter-cluster | 12 KB | 0.031 | 1.0% |
+
+62.0% of vertices (201,902/325,557) use reference encoding.
+
+**Zigzag + STOP baseline (before copy-blocks)**:
+
+| Component | Size | BPE | Share |
+|-----------|------|-----|-------|
+| Membership | 125 KB | 0.318 | 9.1% |
+| Headers (ref bitmaps, deltas) | 203 KB | 0.516 | 14.7% |
+| Copy (RLE bitmap positions) | 343 KB | 0.873 | 24.8% |
+| Additions (STOP delta residuals) | 485 KB | 1.236 | 35.1% |
+| Raw (non-referenced vertices) | 213 KB | 0.542 | 15.4% |
+| Inter-cluster | 12 KB | 0.031 | 0.9% |
+
+60.4% of vertices (196,654/325,557) use reference encoding.
+
+### Optimization History
+
+| Change | BPE | Delta | Cumulative |
+|--------|-----|-------|------------|
+| Baseline (ref+delta) | 4.307 | — | — |
+| + Zigzag first-value | 3.566 | -0.741 | -17.2% |
+| + STOP-terminated deltas | 3.515 | -0.051 | -18.4% |
+| + Copy-blocks positions | 3.117 | -0.398 | -27.6% |
+| Gap to WebGraph (2.90) | | 0.217 | |
 
 ### Key Findings
 
-- **Wider reference windows help**: 32→128 saves 1.27% (diminishing returns beyond 128).
+- **Copy-blocks is the second most impactful optimization**: 3.117 BPE vs 3.515 with STOP (-0.398 BPE, -11.3%). By encoding reference positions as contiguous copy runs instead of RLE bitmaps, the format eliminates per-run type flags, implicit skip lengths, and explicit bitmap lengths. Copy positions shrink 21.7% (343 KB -> 268 KB). Additionally, 5,248 more vertices switch to reference encoding (improving raw by 25%), because the more accurate copy-blocks cost estimation reveals references that were marginally rejected under the old bitmap cost model.
+- **Zigzag is the single most impactful optimization**: 3.566 BPE vs 4.307 baseline (-17.2%). By encoding the first neighbor value as a signed offset from the vertex's local index, the encoder exploits LLP locality. Raw encoding shrinks by 40% (372 KB -> 221 KB), additions by 22% (626 KB -> 489 KB).
+- **STOP-terminated deltas provide modest savings**: 3.515 vs 3.566 (-0.051 BPE, -1.4%). Eliminates small_count prefix (2-6 bits) at the cost of 1 bit per value + 1 stop bit. Wins for degree 0-5 vertices, which are common in intra-cluster lists.
+- **GreedyMIL (interval encoding) hurts on short lists**: 4.998 BPE, 16% worse than baseline. The intervals_and_residuals format has per-list overhead (num_intervals + num_residuals counts) that isn't amortized on RCGE's typically short intra-cluster lists.
+- **Global LLP before Leiden hurts RCGE**: +0.33 BPE. Leiden on LLP-relabeled graph produces non-contiguous clusters; inter-cluster edges explode 5x (12 KB -> 64 KB).
+- **Zeta-3 slightly worse than Fibonacci for RCGE**: Moderate-sized local IDs (1-36K) within clusters favor Fibonacci's fixed-width codewords.
 - **K=8 is optimal**: Fewer clusters increase intra-cluster encoding cost; more clusters increase membership + inter-cluster overhead.
-- **Interval detection hurts**: Two count fields per vertex (num_intervals + num_residuals) add overhead that outweighs savings on cluster-local IDs which lack long consecutive runs.
-- **Full MGS per cluster hurts**: Stop values (2 bits/vertex) and reference flags (1 bit/vertex) add ~121KB overhead without compensating gains.
-- **Additions dominate**: 44.5% of intra-cluster bytes — the primary optimization target for future work.
+- **Recommended config**: `intra_zigzag=true, intra_stop_deltas=true, intra_copy_blocks=true` with moderate reference window (`intra_ref_window=32`).
 
 ## Example
 

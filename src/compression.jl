@@ -3433,7 +3433,8 @@ function write_rl_compressed_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         ref_window_size::Int=7;
         integer_encoding::Symbol=_RL_FIXED_ENCODING,
         vertex_actions::Union{Dict,Nothing}=nothing,
-        stats::Union{Dict,Nothing}=nothing) where {T<:Unsigned}
+        stats::Union{Dict,Nothing}=nothing,
+        copy_blocks::Bool=false) where {T<:Unsigned}
 
     vs = length(keys(neighbor_lists))
     ie = integer_encoding
@@ -3473,14 +3474,14 @@ function write_rl_compressed_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
             enc_type = action_enc_type
 
             if !isempty(current_neighbors) && ref_mode != :none && !isempty(reference_window)
-                ref_result = _rl_try_find_reference(current_neighbors, neighbor_lists, reference_window, ie, mil; vertex_id=v)
+                ref_result = _rl_try_find_reference(current_neighbors, neighbor_lists, reference_window, ie, mil; vertex_id=v, copy_blocks=copy_blocks)
                 if ref_result !== nothing
                     actual_ref_mode = ref_mode
                 end
             end
         else
             # Greedy search
-            _, actual_ref_mode, mil, ref_result, enc_type = _rl_greedy_vertex_search(current_neighbors, neighbor_lists, reference_window, ie; vertex_id=v)
+            _, actual_ref_mode, mil, ref_result, enc_type = _rl_greedy_vertex_search(current_neighbors, neighbor_lists, reference_window, ie; vertex_id=v, copy_blocks=copy_blocks)
         end
 
         # Write VLC vertex header
@@ -3496,7 +3497,11 @@ function write_rl_compressed_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         if actual_ref_mode != :none && ref_result !== nothing
             ref_distance, copy_bitmap, residuals = ref_result
             write_encoded_value(w, T(ref_distance), ie)
-            write_bitmap_adaptive(w, copy_bitmap, ie)
+            if copy_blocks
+                _write_rl_copy_blocks(w, copy_bitmap, ie)
+            else
+                write_bitmap_adaptive(w, copy_bitmap, ie)
+            end
             target_list = residuals
         end
 
@@ -3523,7 +3528,7 @@ function write_rl_compressed_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
 end
 
 function read_rl_compressed_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Type{T};
-        integer_encoding::Symbol=:fibonacci) where {T<:Unsigned}
+        integer_encoding::Symbol=:fibonacci, copy_blocks::Bool=false) where {T<:Unsigned}
 
     neighbor_lists = Dict{T,Vector{T}}()
 
@@ -3582,16 +3587,28 @@ function read_rl_compressed_graph_data(r::BitReader, vs::T, coding_scheme::Symbo
 
         if is_ref
             distance = read_encoded_value(r, ie, T)
-            copy_bitmap = read_bitmap_adaptive(r, ie)
-            residuals = read_encoded_list_body()
-
-            ref_idx = length(reference_window) - Int(distance) + 1
-            if 1 <= ref_idx <= length(reference_window)
-                ref_v = reference_window[ref_idx]
-                ref_nbs = get(neighbor_lists, ref_v, T[])
-                current_neighbors = reconstruct_from_reference(ref_nbs, copy_bitmap, residuals)
+            if copy_blocks
+                copy_positions = _read_rl_copy_blocks(r, ie, T)
+                residuals = read_encoded_list_body()
+                ref_idx = length(reference_window) - Int(distance) + 1
+                if 1 <= ref_idx <= length(reference_window)
+                    ref_v = reference_window[ref_idx]
+                    ref_nbs = get(neighbor_lists, ref_v, T[])
+                    current_neighbors = reconstruct_from_copy_positions(ref_nbs, copy_positions, residuals)
+                else
+                    current_neighbors = residuals
+                end
             else
-                current_neighbors = residuals
+                copy_bitmap = read_bitmap_adaptive(r, ie)
+                residuals = read_encoded_list_body()
+                ref_idx = length(reference_window) - Int(distance) + 1
+                if 1 <= ref_idx <= length(reference_window)
+                    ref_v = reference_window[ref_idx]
+                    ref_nbs = get(neighbor_lists, ref_v, T[])
+                    current_neighbors = reconstruct_from_reference(ref_nbs, copy_bitmap, residuals)
+                else
+                    current_neighbors = residuals
+                end
             end
         else
             current_neighbors = read_encoded_list_body()
@@ -3610,6 +3627,112 @@ function _estimate_adaptive_bitmap_cost(bitmap::Vector{Bool}, ie::Symbol)::Int
     raw_cost = estimate_encoded_value_cost(UInt32(length(bitmap)) + UInt32(1), ie) + length(bitmap)
     block_cost = estimate_block_encoding_cost(bitmap, ie)
     return 1 + min(raw_cost, block_cost)  # 1-bit format flag
+end
+
+# --- Copy-blocks for RL path ---
+# More compact than adaptive bitmap: no bitmap length, no flag bit, no skip block lengths.
+# Format: small_count(num_copy_blocks), then for each block:
+#   first: varint(start) + varint(length)
+#   subsequent: varint(gap_from_prev_end) + varint(length)
+
+function _bitmap_to_copy_blocks(bitmap::Vector{Bool})
+    positions = Int[i for i in 1:length(bitmap) if bitmap[i]]
+    if isempty(positions)
+        return Tuple{Int,Int}[]
+    end
+    blocks = Tuple{Int,Int}[]
+    i = 1
+    while i <= length(positions)
+        start = positions[i]
+        len = 1
+        while i + len <= length(positions) && positions[i + len] == start + len
+            len += 1
+        end
+        push!(blocks, (start, len))
+        i += len
+    end
+    return blocks
+end
+
+function _write_rl_copy_blocks(w::BitWriter, bitmap::Vector{Bool}, encoding::Symbol)
+    blocks = _bitmap_to_copy_blocks(bitmap)
+    ncb = length(blocks)
+    write_small_count(w, UInt32(ncb), encoding)
+    ncb == 0 && return
+    write_encoded_value(w, UInt32(blocks[1][1]), encoding)
+    write_encoded_value(w, UInt32(blocks[1][2]), encoding)
+    prev_end = blocks[1][1] + blocks[1][2]
+    for i in 2:ncb
+        gap = blocks[i][1] - prev_end
+        write_encoded_value(w, UInt32(gap), encoding)
+        write_encoded_value(w, UInt32(blocks[i][2]), encoding)
+        prev_end = blocks[i][1] + blocks[i][2]
+    end
+end
+
+function _read_rl_copy_blocks(r::BitReader, encoding::Symbol, ::Type{T}) where {T<:Unsigned}
+    ncb = Int(read_small_count(r, encoding, T))
+    ncb == 0 && return Int[]
+    positions = Int[]
+    start = Int(read_encoded_value(r, encoding, T))
+    len = Int(read_encoded_value(r, encoding, T))
+    for j in 0:(len-1); push!(positions, start + j); end
+    prev_end = start + len
+    for i in 2:ncb
+        gap = Int(read_encoded_value(r, encoding, T))
+        start = prev_end + gap
+        len = Int(read_encoded_value(r, encoding, T))
+        for j in 0:(len-1); push!(positions, start + j); end
+        prev_end = start + len
+    end
+    return positions
+end
+
+@inline function _small_count_cost(v::UInt32, encoding::Symbol)::Int
+    v <= 2 && return 2
+    return 2 + estimate_encoded_value_cost(v, encoding)
+end
+
+function _estimate_rl_copy_blocks_cost(bitmap::Vector{Bool}, encoding::Symbol)::Int
+    blocks = _bitmap_to_copy_blocks(bitmap)
+    ncb = length(blocks)
+    cost = _small_count_cost(UInt32(ncb), encoding)
+    ncb == 0 && return cost
+    cost += estimate_encoded_value_cost(UInt32(blocks[1][1]), encoding)
+    cost += estimate_encoded_value_cost(UInt32(blocks[1][2]), encoding)
+    prev_end = blocks[1][1] + blocks[1][2]
+    for i in 2:ncb
+        gap = blocks[i][1] - prev_end
+        cost += estimate_encoded_value_cost(UInt32(gap), encoding)
+        cost += estimate_encoded_value_cost(UInt32(blocks[i][2]), encoding)
+        prev_end = blocks[i][1] + blocks[i][2]
+    end
+    return cost
+end
+
+function reconstruct_from_copy_positions(reference::Vector{T}, positions::Vector{Int}, residuals::Vector{T}) where {T<:Unsigned}
+    selected = T[]
+    @inbounds for p in positions
+        if 1 <= p <= length(reference)
+            push!(selected, reference[p])
+        end
+    end
+    isempty(selected) && return copy(residuals)
+    isempty(residuals) && return selected
+    result = Vector{T}(undef, length(selected) + length(residuals))
+    i = 1; j = 1; k = 1
+    n1 = length(selected); n2 = length(residuals)
+    @inbounds while i <= n1 && j <= n2
+        if selected[i] <= residuals[j]
+            result[k] = selected[i]; i += 1
+        else
+            result[k] = residuals[j]; j += 1
+        end
+        k += 1
+    end
+    @inbounds while i <= n1; result[k] = selected[i]; i += 1; k += 1; end
+    @inbounds while j <= n2; result[k] = residuals[j]; j += 1; k += 1; end
+    return result
 end
 
 function _estimate_delta_cost(neighbors::Vector{T}, ie::Symbol; vertex_id=nothing) where {T<:Unsigned}
@@ -3677,7 +3800,7 @@ function _estimate_base_cost(target::Vector{T}, ie::Symbol, mil::Int, enc_type::
 end
 
 function _rl_try_find_reference(neighbors::Vector{T}, neighbor_lists::Dict{T,Vector{T}},
-                                ref_window::Vector{T}, ie::Symbol, mil::Int, enc_type::Symbol= :interval; vertex_id=nothing) where {T<:Unsigned}
+                                ref_window::Vector{T}, ie::Symbol, mil::Int, enc_type::Symbol= :interval; vertex_id=nothing, copy_blocks::Bool=false) where {T<:Unsigned}
     ns = Set(neighbors)
     best_cost = nothing
     best_distance = nothing
@@ -3699,7 +3822,7 @@ function _rl_try_find_reference(neighbors::Vector{T}, neighbor_lists::Dict{T,Vec
 
         distance = T(length(ref_window) - i + 1)
         ref_cost = estimate_encoded_value_cost(distance, ie)
-        ref_cost += _estimate_adaptive_bitmap_cost(copy_bitmap, ie)
+        ref_cost += copy_blocks ? _estimate_rl_copy_blocks_cost(copy_bitmap, ie) : _estimate_adaptive_bitmap_cost(copy_bitmap, ie)
 
         if !isempty(residuals)
             ref_cost += _estimate_base_cost(residuals, ie, mil, enc_type; vertex_id=vertex_id)
@@ -3720,7 +3843,7 @@ function _rl_try_find_reference(neighbors::Vector{T}, neighbor_lists::Dict{T,Vec
 end
 
 function _rl_greedy_vertex_search(neighbors::Vector{T}, neighbor_lists::Dict{T,Vector{T}},
-                                   ref_window::Vector{T}, ie::Symbol; vertex_id=nothing) where {T<:Unsigned}
+                                   ref_window::Vector{T}, ie::Symbol; vertex_id=nothing, copy_blocks::Bool=false) where {T<:Unsigned}
     if isempty(neighbors)
         return (ie, :none, RL_MIL_OPTIONS[1], nothing, :interval)
     end
@@ -3745,11 +3868,12 @@ function _rl_greedy_vertex_search(neighbors::Vector{T}, neighbor_lists::Dict{T,V
 
         # Reference cost
         if !isempty(ref_window) && length(neighbors) >= 3
-            ref_res = _rl_try_find_reference(neighbors, neighbor_lists, ref_window, ie, mil, enc_type; vertex_id=vertex_id)
+            ref_res = _rl_try_find_reference(neighbors, neighbor_lists, ref_window, ie, mil, enc_type; vertex_id=vertex_id, copy_blocks=copy_blocks)
             if ref_res !== nothing
                 # Recalculate cost since _rl_try_find_reference calculates it but returns result
                 dist, bmp, res = ref_res
-                ref_c = estimate_encoded_value_cost(dist, ie) + _estimate_adaptive_bitmap_cost(bmp, ie)
+                ref_c = estimate_encoded_value_cost(dist, ie)
+                ref_c += copy_blocks ? _estimate_rl_copy_blocks_cost(bmp, ie) : _estimate_adaptive_bitmap_cost(bmp, ie)
                 if !isempty(res)
                     ref_c += _estimate_base_cost(res, ie, mil, enc_type; vertex_id=vertex_id)
                 end

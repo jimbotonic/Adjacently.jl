@@ -751,7 +751,7 @@ Supported compression schemes:
 
 Returns a graph loaded with the compression scheme specified in the header.
 """
-function load_compressed_mgs3_graph(filename::AbstractString)
+function load_compressed_mgs3_graph(filename::AbstractString; copy_blocks::Bool=false)
 	# Header format: see MGS_HEADER.md
 	f = open(filename, "r")
 	
@@ -787,7 +787,7 @@ function load_compressed_mgs3_graph(filename::AbstractString)
 		g = load_huffman_compressed_mgs3_graph(f, graph_type, encoding, gs)
 	elseif OPTION_RL_POLICY_BASE <= option_flags <= OPTION_RL_POLICY_MAX
 		policy_id = Int(option_flags - OPTION_RL_POLICY_BASE) + 1
-		g = load_rl_compressed_mgs3_graph(f, graph_type, encoding, gs, policy_id, compression)
+		g = load_rl_compressed_mgs3_graph(f, graph_type, encoding, gs, policy_id, compression; copy_blocks=copy_blocks)
 	elseif compression in supported_schemes
 		g = load_complex_encoded_compressed_mgs3_graph(f, graph_type, encoding, gs, compression)
 	else
@@ -982,7 +982,7 @@ Load graph from RL-compressed MGS v3 format. The data stream is self-describing,
 so the policy is not needed for decompression (policy_id is informational).
 """
 function load_rl_compressed_mgs3_graph(io::IO, graph_type::Symbol, coding_scheme::Symbol, gs::UInt64, policy_id::Int,
-		integer_encoding::Symbol=:fibonacci)
+		integer_encoding::Symbol=:fibonacci; copy_blocks::Bool=false)
 	n_bits_v = convert(UInt8, ceil(log(2, gs)))
 	V = infer_uint_custom_type(n_bits_v)
 
@@ -996,7 +996,7 @@ function load_rl_compressed_mgs3_graph(io::IO, graph_type::Symbol, coding_scheme
 
 	@info("reading RL-compressed graph data")
 	neighbor_lists = read_rl_compressed_graph_data(reader, V(gs), coding_scheme, V;
-		integer_encoding=integer_encoding)
+		integer_encoding=integer_encoding, copy_blocks=copy_blocks)
 
 	@info("building graph from neighbor lists")
 	for (source_vertex, neighbors) in neighbor_lists

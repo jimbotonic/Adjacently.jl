@@ -16,7 +16,7 @@ using Adjacently
 using Adjacently.RCGE: encode_level, RCGEParams, RCGEStats, decode_level, load_rcge_graph
 using Adjacently.IO: load_adjacency_list_from_csv, BitWriter, BitReader, flush_bitwriter
 using Adjacently.Clustering: leiden_partition, aggregate_graph
-using Adjacently.Relabeling: relabel_vertices_llp, relabel_graph
+using Adjacently.Relabeling: relabel_vertices_llp
 using Adjacently.Graph: subgraph
 
 # Minimal TestGraph for coarse weighted graph
@@ -198,25 +198,6 @@ n = nv(g)
 m_original = count_edges(g)
 println("  Loaded: $n vertices, $m_original edges ($(round(time()-t0, digits=2))s)")
 
-base_params = RCGEParams(
-    L=128,
-    varint=:fibonacci,
-    count_varint=:fibonacci,
-    gap=:fibonacci,
-    degree=:elias_delta,
-    undirected_pairs=false,
-    perm_strategy=:blockpos,
-    membership=:elias_fano,
-    inter_strategy=:perm,
-    intra_ref_enabled=true,
-    intra_ref_window=32,
-    intra_ref_min_overlap=0.3,
-    intra_ref_rle=false,
-    intra_block_try=false,
-    positions_mode=:delta,
-    additions_mode=:delta
-)
-
 # Helper to create params with overrides
 function make_params(; kwargs...)
     d = Dict{Symbol,Any}(
@@ -226,7 +207,8 @@ function make_params(; kwargs...)
         :intra_ref_window=>32, :intra_ref_min_overlap=>0.3, :intra_ref_rle=>false,
         :intra_block_try=>false, :positions_mode=>:delta, :additions_mode=>:delta,
         :min_cluster_density=>0.0, :intra_intervals=>false, :intra_mil=>4,
-        :intra_greedy_mil=>false, :intra_zigzag=>false,
+        :intra_greedy_mil=>false, :intra_zigzag=>false, :intra_stop_deltas=>false,
+        :intra_copy_blocks=>false,
     )
     for (k, v) in kwargs
         d[k] = v
@@ -234,21 +216,23 @@ function make_params(; kwargs...)
     return RCGEParams(; d...)
 end
 
-# Test configurations: (name, params, output_suffix, K_override, llp_passes)
+# Test configurations: (name, params, output_suffix, K_override, llp_passes, graph)
 configs = [
-    ("Baseline RW32", base_params, "rcge", 8, 5),
-    ("Zigzag", make_params(intra_zigzag=true), "rcge_zz", 8, 5),
-    ("GreedyMIL", make_params(intra_greedy_mil=true), "rcge_gmil", 8, 5),
-    ("GreedyMIL+Zigzag", make_params(intra_greedy_mil=true, intra_zigzag=true), "rcge_gmil_zz", 8, 5),
+    ("Zigzag + STOP (baseline)",
+        make_params(intra_zigzag=true, intra_stop_deltas=true),
+        "rcge_zz_stop", 8, 5, g),
+    ("ZZ+STOP+CopyBlocks",
+        make_params(intra_zigzag=true, intra_stop_deltas=true, intra_copy_blocks=true),
+        "rcge_zz_stop_cb", 8, 5, g),
 ]
 
 results = []
-for (name, params, suffix, K_val, llp_val) in configs
+for (name, params, suffix, K_val, llp_val, input_g) in configs
     println("\n" * "=" ^ 70)
     println("Config: $name")
     println("=" ^ 70)
 
-    all_level_bytes, total_bytes, first_level_bytes = run_rcge(g, m_original, params; K=K_val, llp_passes=llp_val)
+    all_level_bytes, total_bytes, first_level_bytes = run_rcge(input_g, m_original, params; K=K_val, llp_passes=llp_val)
 
     output_file = joinpath(@__DIR__, "..", "datasets", "webgraph", "cnr-2000", "cnr2000_$(suffix).rcge")
     output_file = normpath(output_file)
@@ -277,8 +261,8 @@ for (name, params, suffix, K_val, llp_val) in configs
         println("  Roundtrip: MISMATCH (expected $m_original, got $decoded_edges, $(dt_dec)s)")
         # Spot-check a few vertices
         mismatches = 0
-        for v in 1:min(nv(g), 20)
-            orig_nbs = sort(UInt32.(outneighbors(g, v)))
+        for v in 1:min(nv(input_g), 20)
+            orig_nbs = sort(UInt32.(outneighbors(input_g, v)))
             dec_nbs = get(decoded_neighbors, UInt32(v), UInt32[])
             if orig_nbs != dec_nbs
                 println("    v=$v: orig=$(length(orig_nbs)) dec=$(length(dec_nbs))")
@@ -295,7 +279,7 @@ println("\n" * "=" ^ 70)
 println("SUMMARY")
 println("=" ^ 70)
 for (name, fsize, bpe) in results
-    println("  $(rpad(name, 25)) $(round(bpe, digits=3)) BPE  ($(round(fsize / 1024.0, digits=1)) KB)")
+    println("  $(rpad(name, 30)) $(round(bpe, digits=3)) BPE  ($(round(fsize / 1024.0, digits=1)) KB)")
 end
 println("  $(rpad("WebGraph reference", 25)) 2.900 BPE")
 println("=" ^ 70)

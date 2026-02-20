@@ -27,7 +27,8 @@ function write_greedy_mgz(g, filename::AbstractString;
         integer_encoding::Symbol=:zeta,
         ref_window_size::Int=7,
         coding_scheme::Symbol=:children,
-        stats::Union{Dict,Nothing}=nothing)
+        stats::Union{Dict,Nothing}=nothing,
+        copy_blocks::Bool=false)
 
     T = eltype(g)
     vs = vertices(g)
@@ -65,7 +66,7 @@ function write_greedy_mgz(g, filename::AbstractString;
 
     # Greedy mode: vertex_actions=nothing triggers exhaustive search
     write_rl_compressed_graph_data(bw, neighbor_lists, coding_scheme, ref_window_size;
-        integer_encoding=integer_encoding, vertex_actions=nothing, stats=stats)
+        integer_encoding=integer_encoding, vertex_actions=nothing, stats=stats, copy_blocks=copy_blocks)
 
     flush_bitwriter(bw; flush_last_bits=true)
     close(f)
@@ -73,8 +74,8 @@ function write_greedy_mgz(g, filename::AbstractString;
     return mgz_path
 end
 
-function verify_roundtrip(mgz_path, original_graph)
-    g_loaded = load_compressed_mgs3_graph(mgz_path)
+function verify_roundtrip(mgz_path, original_graph; copy_blocks::Bool=false)
+    g_loaded = load_compressed_mgs3_graph(mgz_path; copy_blocks=copy_blocks)
     m_orig = ne(original_graph)
     m_loaded = ne(g_loaded)
     n_orig = nv(original_graph)
@@ -128,22 +129,40 @@ function main()
     println("  Relabeling: $(round(time() - t1, digits=2))s")
 
     # ==================================================================
-    # LLP + Zeta-3 with action statistics
+    # Config 1: LLP + Zeta-3 baseline (adaptive bitmap)
     # ==================================================================
     action_stats = Dict{Tuple{Symbol,Symbol,Int}, Int}()
     output_path = joinpath(OUTPUT_DIR, "cnr2000_greedy_llp_zeta_w7")
 
-    println("\n  Compressing with ie=zeta, window=7 (VLC headers)...")
+    println("\n  [1] Compressing with ie=zeta, window=7 (adaptive bitmap)...")
     t2 = time()
     mgz_path = write_greedy_mgz(g_llp, output_path;
         integer_encoding=:zeta, ref_window_size=7, stats=action_stats)
     compress_time = time() - t2
     println("    Compress time: $(round(compress_time, digits=2))s")
 
-    bpe = compute_bpe(mgz_path, m)
+    bpe1 = compute_bpe(mgz_path, m)
 
     println("    Verifying roundtrip...")
-    ok = verify_roundtrip(mgz_path, g_llp)
+    ok1 = verify_roundtrip(mgz_path, g_llp)
+
+    # ==================================================================
+    # Config 2: LLP + Zeta-3 + Copy-blocks
+    # ==================================================================
+    action_stats_cb = Dict{Tuple{Symbol,Symbol,Int}, Int}()
+    output_path_cb = joinpath(OUTPUT_DIR, "cnr2000_greedy_llp_zeta_w7_cb")
+
+    println("\n  [2] Compressing with ie=zeta, window=7 (copy-blocks)...")
+    t3 = time()
+    mgz_path_cb = write_greedy_mgz(g_llp, output_path_cb;
+        integer_encoding=:zeta, ref_window_size=7, stats=action_stats_cb, copy_blocks=true)
+    compress_time_cb = time() - t3
+    println("    Compress time: $(round(compress_time_cb, digits=2))s")
+
+    bpe2 = compute_bpe(mgz_path_cb, m)
+
+    println("    Verifying roundtrip...")
+    ok2 = verify_roundtrip(mgz_path_cb, g_llp; copy_blocks=true)
 
     # ==================================================================
     # Summary
@@ -151,41 +170,12 @@ function main()
     println("\n" * "=" ^ 70)
     println("RESULT — CNR-2000 ($n vertices, $m edges)")
     println("=" ^ 70)
-    rt = ok ? "OK" : "FAIL"
-    println("  LLP + Zeta-3 (VLC):  BPE = $(round(bpe, digits=4)),  Roundtrip = $rt")
-    println("  WebGraph reference:  BPE = 2.90")
+    rt1 = ok1 ? "OK" : "FAIL"
+    rt2 = ok2 ? "OK" : "FAIL"
+    println("  LLP + Zeta-3 (adaptive):    BPE = $(round(bpe1, digits=4)),  Roundtrip = $rt1")
+    println("  LLP + Zeta-3 (copy-blocks): BPE = $(round(bpe2, digits=4)),  Roundtrip = $rt2")
+    println("  WebGraph reference:         BPE = 2.90")
     println("=" ^ 70)
-
-    # ==================================================================
-    # Action Statistics
-    # ==================================================================
-    println("\n" * "=" ^ 70)
-    println("ACTION STATISTICS — LLP + Zeta-3")
-    println("=" ^ 70)
-    total_vertices = sum(values(action_stats))
-    sorted_stats = sort(collect(action_stats), by=x -> -x[2])
-
-    entropy = 0.0
-    for (_, count) in sorted_stats
-        p = count / total_vertices
-        if p > 0; entropy -= p * log2(p); end
-    end
-    println("\n  Total vertices: $total_vertices")
-    println("  Distinct action combos: $(length(sorted_stats))")
-    println("  Shannon entropy:        $(round(entropy, digits=4)) bits")
-    println()
-
-    println("  $(rpad("Ref Mode", 12)) $(rpad("Enc Type", 12)) $(rpad("MIL", 6)) $(rpad("Count", 10)) $(rpad("Pct %", 10)) Cum %")
-    println("  " * "-" ^ 62)
-    cum_pct = 0.0
-    for (key, count) in sorted_stats
-        ref_mode, enc_type, mil = key
-        pct = 100.0 * count / total_vertices
-        cum_pct += pct
-        mil_str = enc_type == :delta ? "-" : string(mil)
-        println("  $(rpad(ref_mode, 12)) $(rpad(enc_type, 12)) $(rpad(mil_str, 6)) $(rpad(count, 10)) $(rpad(round(pct, digits=2), 10)) $(round(cum_pct, digits=1))")
-    end
-    println()
 end
 
 main()
