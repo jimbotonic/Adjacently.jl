@@ -16,7 +16,7 @@ using Adjacently
 using Adjacently.RCGE: encode_level, RCGEParams, RCGEStats, decode_level, load_rcge_graph
 using Adjacently.IO: load_adjacency_list_from_csv, BitWriter, BitReader, flush_bitwriter
 using Adjacently.Clustering: leiden_partition, aggregate_graph
-using Adjacently.Relabeling: relabel_vertices_llp
+using Adjacently.Relabeling: relabel_graph, relabel_vertices_llp, relabel_vertices_bisection
 using Adjacently.Graph: subgraph
 
 # Minimal TestGraph for coarse weighted graph
@@ -65,20 +65,24 @@ end
 
 count_edges(h) = sum(length(outneighbors(h, v)) for v in 1:nv(h))
 
-# Reorder within clusters using LLP on induced subgraph
-function reorder_clusters!(clusters, base_g; llp_passes::Int=5)
+# Reorder within clusters using LLP or bisection on induced subgraph
+function reorder_clusters!(clusters, base_g; llp_passes::Int=5, ordering::Symbol=:llp)
     for idx in 1:length(clusters)
         C = clusters[idx]
         length(C) <= 2 && continue
         sg, oni, _ = subgraph(base_g, C)
-        mapping = relabel_vertices_llp(sg, :sym; passes=llp_passes)
+        mapping = if ordering == :bisection
+            relabel_vertices_bisection(sg)
+        else
+            relabel_vertices_llp(sg, :sym; passes=llp_passes)
+        end
         sort!(C, by = v -> Int(mapping[oni[v]]))
         clusters[idx] = C
     end
     return clusters
 end
 
-function run_rcge(g, m_original, params; K::Int=8, llp_passes::Int=5)
+function run_rcge(g, m_original, params; K::Int=8, llp_passes::Int=5, ordering::Symbol=:llp)
     max_levels = 5
     min_clusters = 32
     cur_g = g
@@ -131,8 +135,8 @@ function run_rcge(g, m_original, params; K::Int=8, llp_passes::Int=5)
         clusters = filter(!isempty, clusters)
         println("    Effective clusters: $(length(clusters)) (top=$topK)")
 
-        # Reorder within clusters using LLP
-        reorder_clusters!(clusters, cur_g; llp_passes=llp_passes)
+        # Reorder within clusters
+        reorder_clusters!(clusters, cur_g; llp_passes=llp_passes, ordering=ordering)
 
         # Prepare next level's K
         K = max(16, min(K, ceil(Int, nclusters / 2)))
@@ -216,41 +220,26 @@ function make_params(; kwargs...)
     return RCGEParams(; d...)
 end
 
-# Test configurations: (name, params, output_suffix, K_override, llp_passes, graph)
+# Shared best params builder (FW64 base)
+fw64_base(; kwargs...) = make_params(
+    intra_zigzag=true, intra_stop_deltas=true, intra_copy_blocks=true,
+    intra_ref_window=64, intra_ref_fixwidth=true; kwargs...)
+
+# Test configurations: (name, params, output_suffix, K_override, llp_passes, ordering, graph)
 configs = [
-    # Current best baseline
-    ("ZZ+STOP+CB (best)",
-        make_params(intra_zigzag=true, intra_stop_deltas=true, intra_copy_blocks=true),
-        "rcge_best", 8, 5, g),
-    # Fixed-width ref deltas (W32)
-    ("ZZ+STOP+CB+FW32",
-        make_params(intra_zigzag=true, intra_stop_deltas=true, intra_copy_blocks=true,
-                    intra_ref_fixwidth=true),
-        "rcge_fw32", 8, 5, g),
-    # Larger window (W64) + fixed-width
-    ("ZZ+STOP+CB+FW64",
-        make_params(intra_zigzag=true, intra_stop_deltas=true, intra_copy_blocks=true,
-                    intra_ref_window=64, intra_ref_fixwidth=true),
-        "rcge_fw64", 8, 5, g),
-    # W64 without fixed-width (for comparison)
-    ("ZZ+STOP+CB+W64",
-        make_params(intra_zigzag=true, intra_stop_deltas=true, intra_copy_blocks=true,
-                    intra_ref_window=64),
-        "rcge_w64", 8, 5, g),
-    # W128 + fixed-width
-    ("ZZ+STOP+CB+FW128",
-        make_params(intra_zigzag=true, intra_stop_deltas=true, intra_copy_blocks=true,
-                    intra_ref_window=128, intra_ref_fixwidth=true),
-        "rcge_fw128", 8, 5, g),
+    ("FW64 K=2 LLP (ref)",   fw64_base(), "rcge_fw64_k2",        2, 5, :llp,       g),
+    ("FW64 K=1 LLP",         fw64_base(), "rcge_fw64_k1",        1, 5, :llp,       g),
+    ("FW64 K=2 Bisection",   fw64_base(), "rcge_fw64_k2_bisect", 2, 5, :bisection, g),
+    ("FW64 K=1 Bisection",   fw64_base(), "rcge_fw64_k1_bisect", 1, 5, :bisection, g),
 ]
 
 results = []
-for (name, params, suffix, K_val, llp_val, input_g) in configs
+for (name, params, suffix, K_val, llp_val, ord_val, input_g) in configs
     println("\n" * "=" ^ 70)
     println("Config: $name")
     println("=" ^ 70)
 
-    all_level_bytes, total_bytes, first_level_bytes = run_rcge(input_g, m_original, params; K=K_val, llp_passes=llp_val)
+    all_level_bytes, total_bytes, first_level_bytes = run_rcge(input_g, m_original, params; K=K_val, llp_passes=llp_val, ordering=ord_val)
 
     output_file = joinpath(@__DIR__, "..", "datasets", "webgraph", "cnr-2000", "cnr2000_$(suffix).rcge")
     output_file = normpath(output_file)
@@ -292,6 +281,90 @@ for (name, params, suffix, K_val, llp_val, input_g) in configs
         end
     end
 end
+
+# ==================================================================
+# FW64 K=1 + Implicit Ranges Membership (pre-relabeled by vertex-ID rank)
+# Key insight: encode_level() re-sorts clusters by vertex ID internally.
+# Relabeling by vertex-ID rank keeps local indices identical to EF encoding.
+# Only the membership encoding changes (88K bytes → 7 bytes = 0.221 BPE savings).
+# ==================================================================
+println("\n" * "=" ^ 70)
+println("Config: FW64 K=1 + Implicit Ranges Membership")
+println("=" ^ 70)
+
+println("\n  Step 1: Leiden K=1 partition...")
+t_rel = time()
+part_impl = leiden_partition(g; max_passes=8, max_levels=5)
+
+counts_impl = Dict{Int,Int}()
+for c in part_impl; counts_impl[c] = get(counts_impl, c, 0) + 1; end
+top_label_impl = argmax(counts_impl)
+
+TV = eltype(g)
+clusters_impl_raw = [TV[], TV[]]
+for i in 1:n
+    push!(clusters_impl_raw[part_impl[i] == top_label_impl ? 1 : 2], TV(i))
+end
+# Sort by vertex ID (matches encode_level's internal sort → local indices are identical to EF)
+clusters_impl_by_id = [sort(C) for C in clusters_impl_raw]
+S1_impl = length(clusters_impl_by_id[1])
+S2_impl = length(clusters_impl_by_id[2])
+println("    Cluster sizes: $S1_impl (top) + $S2_impl (rest)")
+
+println("\n  Step 2: Build relabeled graph (relabel by vertex-ID rank)...")
+vertex_mapping_impl = let new_id = TV(1)
+    d = Dict{TV,TV}()
+    for C in clusters_impl_by_id
+        for v in C
+            d[v] = new_id
+            new_id += TV(1)
+        end
+    end
+    d
+end
+g_relabeled = relabel_graph(g, vertex_mapping_impl)
+clusters_contiguous = [TV.(1:S1_impl), TV.(S1_impl+1:n)]
+println("    Done ($(round(time()-t_rel, digits=2))s). Cluster 1 → 1..$S1_impl, cluster 2 → $(S1_impl+1)..$n")
+
+println("\n  Step 3: RCGE encode with implicit_ranges membership...")
+fw64_implicit = fw64_base(membership=:implicit_ranges)
+
+io_impl = IOBuffer()
+w_impl = BitWriter(io_impl)
+t_enc = time()
+stats_impl = RCGEStats()
+encode_level(w_impl, g_relabeled, clusters_contiguous; params=fw64_implicit, stats=stats_impl)
+flush_bitwriter(w_impl; flush_last_bits=true)
+bytes_impl = take!(io_impl)
+t_enc_done = time()
+
+level_bytes_impl = length(bytes_impl)
+bpe_impl = 8.0 * level_bytes_impl / m_original
+println("  Encoded: $(level_bytes_impl) bytes ($(round(level_bytes_impl/1024.0, digits=1)) KB), BPE=$(round(bpe_impl, digits=3)) ($(round(t_enc_done-t_enc, digits=2))s)")
+println("  Stats: membership=$(ceil(Int, stats_impl.bits_membership/8))B, intra=$(ceil(Int, stats_impl.bits_intra/8))B [headers=$(ceil(Int, stats_impl.bits_intra_headers/8))B, copy=$(ceil(Int, stats_impl.bits_intra_copy/8))B, add=$(ceil(Int, stats_impl.bits_intra_add/8))B, raw=$(ceil(Int, stats_impl.bits_intra_raw/8))B, ref=$(stats_impl.intra_ref_used)/$(stats_impl.intra_ref_used+stats_impl.intra_no_ref)], inter=$(ceil(Int, (stats_impl.bits_inter_headers+stats_impl.bits_inter_lists)/8))B")
+
+output_file_impl = normpath(joinpath(@__DIR__, "..", "datasets", "webgraph", "cnr-2000", "cnr2000_rcge_gllp_implicit.rcge"))
+open(output_file_impl, "w") do f; write(f, bytes_impl); end
+
+println("\n  Verifying decoder roundtrip...")
+t_dec = time()
+r_verify_impl = BitReader(IOBuffer(bytes_impl))
+decoded_impl = decode_level(r_verify_impl, fw64_implicit; T=TV, directed=true)
+decoded_edges_impl = sum(length(v) for v in values(decoded_impl))
+dt_dec = round(time() - t_dec, digits=3)
+if decoded_edges_impl == m_original
+    println("  Roundtrip: OK ($decoded_edges_impl edges, $(dt_dec)s)")
+else
+    println("  Roundtrip: MISMATCH (expected $m_original, got $decoded_edges_impl, $(dt_dec)s)")
+    for v in 1:min(n, 20)
+        orig_nbs = sort(TV.(outneighbors(g_relabeled, v)))
+        dec_nbs  = sort(get(decoded_impl, TV(v), TV[]))
+        if orig_nbs != dec_nbs
+            println("    v=$v: orig=$(length(orig_nbs)) dec=$(length(dec_nbs))")
+        end
+    end
+end
+push!(results, ("FW64 K=1 implicit ranges", level_bytes_impl, bpe_impl))
 
 println("\n" * "=" ^ 70)
 println("SUMMARY")

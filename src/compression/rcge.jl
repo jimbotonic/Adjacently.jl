@@ -83,7 +83,7 @@ Base.@kwdef struct RCGEParams
     degree::Symbol = :golomb
     perm_strategy::Symbol = :lehmer
     undirected_pairs::Bool = true
-    membership::Symbol = :stop        # :stop | :delta | :elias_fano
+    membership::Symbol = :stop        # :stop | :delta | :elias_fano | :implicit_ranges
     inter_strategy::Symbol = :lists
     intra_ref_enabled::Bool = true
     intra_ref_window::Int = 16
@@ -101,6 +101,10 @@ Base.@kwdef struct RCGEParams
     intra_stop_deltas::Bool = false   # Use STOP-terminated delta lists (eliminates per-vertex count prefix)
     intra_copy_blocks::Bool = false   # WebGraph-style copy-blocks for reference positions (vs RLE bitmap)
     intra_ref_fixwidth::Bool = false  # Fixed-width ref delta encoding (1-bit flag + ceil(log2(window)) bits per ref)
+    intra_ref_vlc::Bool = false       # VLC (Fibonacci) for ref delta instead of fixed-width (requires intra_ref_fixwidth=true)
+    intra_add_adaptive::Bool = false  # Per-vertex adaptive additions: pick cheaper of STOP-delta vs intervals (requires intra_stop_deltas=true)
+    intra_raw_adaptive::Bool = false  # Per-vertex adaptive raw: pick cheaper of STOP-delta vs intervals (requires intra_stop_deltas=true)
+    intra_adapt_mil::Int = 2          # MIL for adaptive interval encoding (2=most aggressive)
 end
 
 # --------------------------
@@ -271,47 +275,67 @@ function _read_copy_blocks(r::BitReader, encoding::Symbol, ::Type{T}) where {T<:
 end
 
 """
-    _write_fixwidth_ref_deltas(w, use_ref_vec, ref_delta_vec, window)
+    _write_fixwidth_ref_deltas(w, use_ref_vec, ref_delta_vec, window; vlc=false)
 
-Per-vertex fixed-width ref delta encoding. For each vertex in order:
+Per-vertex ref delta encoding. For each vertex in order:
   - 1 bit: has_ref flag
-  - If has_ref: (delta - 1) in ceil(log2(window)) bits (fixed width)
-This avoids byte-padded bitmap + varint delta list, saving overhead.
+  - If has_ref and vlc=false: (delta - 1) in ceil(log2(window)) fixed bits
+  - If has_ref and vlc=true:  Fibonacci(delta) VLC code (saves bits for small deltas)
 """
 function _write_fixwidth_ref_deltas(w::BitWriter, use_ref_vec::Vector{Bool},
-                                    ref_delta_vec::Vector{UInt32}, window::Int)
-    nbits = max(1, ceil(Int, log2(window)))
-    for idx in 1:length(use_ref_vec)
-        if use_ref_vec[idx]
-            write_bit(w, true)
-            d = Int(ref_delta_vec[idx]) - 1  # delta ∈ [1, window] → [0, window-1]
-            for b in (nbits-1):-1:0
-                write_bit(w, ((d >> b) & 1) == 1)
+                                    ref_delta_vec::Vector{UInt32}, window::Int;
+                                    vlc::Bool=false)
+    if vlc
+        for idx in 1:length(use_ref_vec)
+            write_bit(w, use_ref_vec[idx])
+            if use_ref_vec[idx]
+                write_encoded_value(w, ref_delta_vec[idx], :fibonacci)  # delta ≥ 1
             end
-        else
-            write_bit(w, false)
+        end
+    else
+        nbits = max(1, ceil(Int, log2(window)))
+        for idx in 1:length(use_ref_vec)
+            if use_ref_vec[idx]
+                write_bit(w, true)
+                d = Int(ref_delta_vec[idx]) - 1  # delta ∈ [1, window] → [0, window-1]
+                for b in (nbits-1):-1:0
+                    write_bit(w, ((d >> b) & 1) == 1)
+                end
+            else
+                write_bit(w, false)
+            end
         end
     end
 end
 
 """
-    _read_fixwidth_ref_deltas(r, s, window) → (use_ref_vec, ref_delta_vec)
+    _read_fixwidth_ref_deltas(r, s, window; vlc=false) → (use_ref_vec, ref_delta_vec)
 
-Read per-vertex fixed-width ref delta encoding written by `_write_fixwidth_ref_deltas`.
+Read per-vertex ref delta encoding written by `_write_fixwidth_ref_deltas`.
 """
-function _read_fixwidth_ref_deltas(r::BitReader, s::Int, window::Int)
-    nbits = max(1, ceil(Int, log2(window)))
+function _read_fixwidth_ref_deltas(r::BitReader, s::Int, window::Int; vlc::Bool=false)
     use_ref_vec = Vector{Bool}(undef, s)
     ref_delta_vec = zeros(UInt32, s)
-    for idx in 1:s
-        has_ref = read_bit(r)
-        use_ref_vec[idx] = has_ref
-        if has_ref
-            d = 0
-            for _ in 1:nbits
-                d = (d << 1) | Int(read_bit(r))
+    if vlc
+        for idx in 1:s
+            has_ref = read_bit(r)
+            use_ref_vec[idx] = has_ref
+            if has_ref
+                ref_delta_vec[idx] = read_encoded_value(r, :fibonacci, UInt32)
             end
-            ref_delta_vec[idx] = UInt32(d + 1)  # restore delta ∈ [1, window]
+        end
+    else
+        nbits = max(1, ceil(Int, log2(window)))
+        for idx in 1:s
+            has_ref = read_bit(r)
+            use_ref_vec[idx] = has_ref
+            if has_ref
+                d = 0
+                for _ in 1:nbits
+                    d = (d << 1) | Int(read_bit(r))
+                end
+                ref_delta_vec[idx] = UInt32(d + 1)  # restore delta ∈ [1, window]
+            end
         end
     end
     return use_ref_vec, ref_delta_vec
@@ -577,18 +601,24 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
     # write number of clusters
     write_varint(w, T(length(clusters)); encoding=params.varint)
     for C in clusters
-        Cm = sort(copy(C))
-        unique!(Cm)
-        if params.membership == :elias_fano
-            # Elias-Fano encodes its own length; omit explicit |C| when using EF
-            write_elias_fano(w, Cm)
-        elseif params.membership == :delta
-            # Legacy: explicit length + delta list
-            write_varint(w, T(length(Cm)); encoding=params.varint)
-            write_gap_coded(w, Cm; encoding=params.gap)
+        if params.membership == :implicit_ranges
+            # Clusters are contiguous ID ranges; store only the size.
+            # Decoder reconstructs cluster i as offset+1..offset+|C| from cumulative sizes.
+            write_varint(w, T(length(C)); encoding=params.varint)
         else
-            # STOP-terminated delta list (no explicit length)
-            write_stop_delta_list(w, Cm; encoding=params.gap)
+            Cm = sort(copy(C))
+            unique!(Cm)
+            if params.membership == :elias_fano
+                # Elias-Fano encodes its own length; omit explicit |C| when using EF
+                write_elias_fano(w, Cm)
+            elseif params.membership == :delta
+                # Legacy: explicit length + delta list
+                write_varint(w, T(length(Cm)); encoding=params.varint)
+                write_gap_coded(w, Cm; encoding=params.gap)
+            else
+                # STOP-terminated delta list (no explicit length)
+                write_stop_delta_list(w, Cm; encoding=params.gap)
+            end
         end
     end
     if stats !== nothing
@@ -896,8 +926,8 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
             if params.intra_ref_enabled
                 local hb0 = _total_bits(w)
                 if params.intra_ref_fixwidth
-                    # Fixed-width: 1-bit flag + ceil(log2(window)) bits per ref vertex
-                    _write_fixwidth_ref_deltas(w, use_ref_vec, ref_delta_vec, params.intra_ref_window)
+                    # Fixed-width (or VLC): 1-bit flag + delta encoding per ref vertex
+                    _write_fixwidth_ref_deltas(w, use_ref_vec, ref_delta_vec, params.intra_ref_window; vlc=params.intra_ref_vlc)
                 else
                     # Legacy: byte-padded bitmap + varint delta list
                     Compression.write_bitpacked_bitmap(w, use_ref_vec)
@@ -1009,6 +1039,25 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                         if !isempty(singles)
                             write_delta(w, T.(singles), :fibonacci; vertex_id=_zz_vid)
                         end
+                    elseif params.intra_add_adaptive && params.intra_stop_deltas
+                        # Adaptive: per-vertex pick cheaper of STOP-delta vs intervals
+                        # Write mode bit inline (0=stop-delta, 1=intervals), then payload
+                        local adds_T = T.(additions)
+                        local _io_sd = IOBuffer(); local _w_sd = BitWriter(_io_sd)
+                        _write_stop_delta_zigzag(_w_sd, adds_T, :fibonacci, _zz_vid)
+                        flush_bitwriter(_w_sd; flush_last_bits=true)
+                        local _sd_bits = length(take!(_io_sd)) * 8
+                        local _io_iv = IOBuffer(); local _w_iv = BitWriter(_io_iv)
+                        Compression.write_intervals_and_residuals(_w_iv, adds_T, :fibonacci, params.intra_adapt_mil; vertex_id=_zz_vid)
+                        flush_bitwriter(_w_iv; flush_last_bits=true)
+                        local _iv_bits = length(take!(_io_iv)) * 8
+                        if _iv_bits + 1 < _sd_bits   # +1 for the mode flag itself
+                            write_bit(w, true)   # intervals
+                            Compression.write_intervals_and_residuals(w, adds_T, :fibonacci, params.intra_adapt_mil; vertex_id=_zz_vid)
+                        else
+                            write_bit(w, false)  # stop-delta
+                            _write_stop_delta_zigzag(w, adds_T, :fibonacci, _zz_vid)
+                        end
                     else
                         if params.intra_stop_deltas
                             _write_stop_delta_zigzag(w, T.(additions), :fibonacci, _zz_vid)
@@ -1032,6 +1081,24 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                     local rb0 = _total_bits(w)
                     if params.intra_intervals || params.intra_greedy_mil
                         Compression.write_intervals_and_residuals(w, T.(nl), :fibonacci, mil_vec[idx_local]; vertex_id=_zz_vid)
+                    elseif params.intra_raw_adaptive && params.intra_stop_deltas
+                        # Adaptive: per-vertex pick cheaper of STOP-delta vs intervals
+                        local nl_T = T.(nl)
+                        local _io_sd2 = IOBuffer(); local _w_sd2 = BitWriter(_io_sd2)
+                        _write_stop_delta_zigzag(_w_sd2, nl_T, :fibonacci, _zz_vid)
+                        flush_bitwriter(_w_sd2; flush_last_bits=true)
+                        local _sd_bits2 = length(take!(_io_sd2)) * 8
+                        local _io_iv2 = IOBuffer(); local _w_iv2 = BitWriter(_io_iv2)
+                        Compression.write_intervals_and_residuals(_w_iv2, nl_T, :fibonacci, params.intra_adapt_mil; vertex_id=_zz_vid)
+                        flush_bitwriter(_w_iv2; flush_last_bits=true)
+                        local _iv_bits2 = length(take!(_io_iv2)) * 8
+                        if _iv_bits2 + 1 < _sd_bits2
+                            write_bit(w, true)   # intervals
+                            Compression.write_intervals_and_residuals(w, nl_T, :fibonacci, params.intra_adapt_mil; vertex_id=_zz_vid)
+                        else
+                            write_bit(w, false)  # stop-delta
+                            _write_stop_delta_zigzag(w, nl_T, :fibonacci, _zz_vid)
+                        end
                     elseif params.intra_stop_deltas
                         _write_stop_delta_zigzag(w, T.(nl), :fibonacci, _zz_vid)
                     else
@@ -1182,14 +1249,24 @@ function decode_level(r::BitReader, params::RCGEParams; T::Type{<:Unsigned}=UInt
     K = Int(read_encoded_value(r, params.varint, T))
     clusters = Vector{Vector{T}}(undef, K)
 
-    for ci in 1:K
-        if params.membership == :elias_fano
-            clusters[ci] = read_elias_fano(r, T)
-        elseif params.membership == :delta
-            len = Int(read_encoded_value(r, params.varint, T))
-            clusters[ci] = read_delta(r, params.gap, T; max_elements=len)
-        else  # :stop
-            clusters[ci] = read_stop_delta_list(r; encoding=params.gap, T=T)
+    if params.membership == :implicit_ranges
+        # Clusters are contiguous ID ranges: cluster i = offset+1..offset+size_i
+        offset = T(0)
+        for ci in 1:K
+            sz = Int(read_encoded_value(r, params.varint, T))
+            clusters[ci] = collect(offset + T(1) : offset + T(sz))
+            offset += T(sz)
+        end
+    else
+        for ci in 1:K
+            if params.membership == :elias_fano
+                clusters[ci] = read_elias_fano(r, T)
+            elseif params.membership == :delta
+                len = Int(read_encoded_value(r, params.varint, T))
+                clusters[ci] = read_delta(r, params.gap, T; max_elements=len)
+            else  # :stop
+                clusters[ci] = read_stop_delta_list(r; encoding=params.gap, T=T)
+            end
         end
     end
 
@@ -1259,8 +1336,8 @@ function decode_level(r::BitReader, params::RCGEParams; T::Type{<:Unsigned}=UInt
 
             if params.intra_ref_enabled
                 if params.intra_ref_fixwidth
-                    # Fixed-width: 1-bit flag + ceil(log2(window)) bits per ref vertex
-                    use_ref_vec, ref_delta_vec = _read_fixwidth_ref_deltas(r, s, params.intra_ref_window)
+                    # Fixed-width (or VLC): 1-bit flag + delta encoding per ref vertex
+                    use_ref_vec, ref_delta_vec = _read_fixwidth_ref_deltas(r, s, params.intra_ref_window; vlc=params.intra_ref_vlc)
                     has_any_ref = any(use_ref_vec)
                 else
                     # Legacy: byte-padded bitmap + varint delta list
@@ -1364,6 +1441,13 @@ function decode_level(r::BitReader, params::RCGEParams; T::Type{<:Unsigned}=UInt
                             append!(add_vals, singles)
                         end
                         additions = add_vals
+                    elseif params.intra_add_adaptive && params.intra_stop_deltas
+                        # Adaptive: read mode bit then decode accordingly
+                        if read_bit(r)  # true = intervals
+                            additions = Int.(read_intervals_and_residuals(r, :fibonacci, params.intra_adapt_mil, T; vertex_id=_zz_vid))
+                        else            # false = stop-delta
+                            additions = Int.(_read_stop_delta_zigzag(r, :fibonacci, T, _zz_vid))
+                        end
                     elseif params.intra_stop_deltas
                         additions = Int.(_read_stop_delta_zigzag(r, :fibonacci, T, _zz_vid))
                     else
@@ -1381,6 +1465,13 @@ function decode_level(r::BitReader, params::RCGEParams; T::Type{<:Unsigned}=UInt
                     # Raw mode
                     if params.intra_intervals || params.intra_greedy_mil
                         nl_local = Int.(read_intervals_and_residuals(r, :fibonacci, mil_vec[idx_local], T; vertex_id=_zz_vid))
+                    elseif params.intra_raw_adaptive && params.intra_stop_deltas
+                        # Adaptive: read mode bit then decode accordingly
+                        if read_bit(r)  # true = intervals
+                            nl_local = Int.(read_intervals_and_residuals(r, :fibonacci, params.intra_adapt_mil, T; vertex_id=_zz_vid))
+                        else            # false = stop-delta
+                            nl_local = Int.(_read_stop_delta_zigzag(r, :fibonacci, T, _zz_vid))
+                        end
                     elseif params.intra_stop_deltas
                         nl_local = Int.(_read_stop_delta_zigzag(r, :fibonacci, T, _zz_vid))
                     else

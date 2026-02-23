@@ -212,6 +212,24 @@ Raw encoding:
 
 The encoder chooses block vs raw by estimating both costs and picking the cheaper option.
 
+## Copy-Blocks Reference Encoding
+
+When `copy_blocks=true`, the reference bitmap (which neighbor positions to copy) is replaced by a run-length encoding of contiguous copy runs. This is the same format as WebGraph BV.
+
+```
+Copy-blocks format:
+  small_count(num_copy_blocks)       // number of contiguous runs to copy
+  IF num_copy_blocks > 0:
+    varint(first_start)              // 1-based index of first copied position (≥ 1)
+    For each subsequent block (2nd onward):
+      varint(skip_length + 1)        // positions skipped since end of last block
+      // run length is implicit: consumes one position per step until next skip
+```
+
+The encoder picks the cheaper of adaptive bitmap and copy-blocks for each vertex. Copy-blocks wins when copied positions form long contiguous runs — common under LLP ordering. It saves ~0.32 BPE vs adaptive bitmap on CNR-2000 at window=64.
+
+**Note**: the `copy_blocks` flag is currently passed externally (not stored in the file header). The decoder must receive it out-of-band (e.g., from a companion configuration).
+
 ## Encoding Options (Action Space)
 
 The greedy encoder evaluates all 27 combinations:
@@ -232,24 +250,95 @@ For each vertex, the combination with the lowest estimated bit cost is selected.
 
 ## Parameters
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| integer_encoding | :zeta (V3) | Global integer encoding for all varints |
-| ZETA_BASE | 3 | Zeta coding parameter k |
-| ref_window_size | 7 | Reference window size (recent vertices) |
-| MIN_INTERVAL_LENGTH | 2–5 | Per-vertex, selected by greedy search |
-| coding_scheme | :children | Stop-delimited vertex encoding |
+| Parameter | Default | Best greedy config | Description |
+|-----------|---------|-------------------|-------------|
+| integer_encoding | :zeta | :fibonacci | Global integer encoding for all varints |
+| ZETA_BASE | 3 | — | Zeta coding parameter k |
+| ref_window_size | 7 | 64 | Reference window size (recent vertices) |
+| MIN_INTERVAL_LENGTH | 2–5 | 2–5 | Per-vertex, selected by greedy search |
+| coding_scheme | :children | :children | Stop-delimited vertex encoding |
+| copy_blocks | false | true | WebGraph-style copy-blocks for reference bitmap |
+
+## Vertex Ordering
+
+Vertex ordering is the single largest factor in greedy MGS compression quality. The greedy encoder's reference window looks back at the previous `ref_window_size` vertices — if those vertices share many neighbors with the current vertex, compression is effective.
+
+### Global LLP (recommended)
+
+Layered Label Propagation (LLP) with 10 passes and `:sym` mode is the best ordering for the greedy approach. LLP runs across all 325,557 vertices jointly, optimizing the global sequential locality. It considers both in- and out-edges, which matches the symmetric reference window behavior.
+
+### Two-step Leiden + per-group LLP (not beneficial for greedy)
+
+The RCGE format uses a two-step ordering: Leiden community detection → per-group LLP on induced subgraphs. This dramatically improves RCGE because RCGE's reference window is **cluster-local** (only looks within the same encoding cluster).
+
+For the greedy approach, both the two-step ordering and cluster-local window resets were tested (Leiden K=1 → 2 groups of 18K + 307K vertices, LLP on each induced subgraph, optional window reset at group boundary):
+
+| Ordering | Window mode | Codec | w | BPE |
+|----------|-------------|-------|---|-----|
+| Global LLP | global | Fibonacci | 64 | **3.268** |
+| Leiden K=1 + per-group LLP | global | Fibonacci | 64 | 3.326 |
+| Leiden K=1 + per-group LLP | **cluster-local** | Fibonacci | 64 | 3.326 |
+
+The cluster-local window reset (resetting the reference window at the group boundary) produces **byte-for-byte identical output** to the global window. The reason: the greedy encoder already never picks cross-group references at the K=1 boundary — they are universally non-beneficial since group 1 (18K vertices, one large Leiden community) and group 2 (307K vertices, all others) have completely disjoint local neighborhoods. The greedy search already avoids them without needing an explicit reset.
+
+The deeper reason per-group LLP still underperforms global LLP is that it ignores cross-group edges when computing the ordering, slightly degrading end-to-end sequential locality. Global LLP jointly optimizes all edges and produces better BPE for the greedy global reference window.
+
+**Key finding**: the RCGE advantage over greedy is **architectural**, not replicable by vertex ordering or window management changes:
+- RCGE uses **per-cluster local vertex indexing** (vertices renumbered 1…|C| within each cluster), enabling much tighter intra-cluster reference encoding
+- RCGE's reference window is structurally cluster-local by design — it indexes into a local vertex space, not a global one
+- The greedy approach uses global vertex IDs throughout; resetting the window boundary cannot reproduce RCGE's per-cluster locality gains
 
 ## Benchmark: CNR-2000
 
-### WebGraph Reference
-- **2.90 bits/edge** (BPE)
-- Zeta-3 encoding, LLP ordering, window=7
+CNR-2000: 325,557 vertices, 3,216,152 edges (directed web graph).
 
-### MGS V3 (Zeta-3 + VLC headers)
-- **~4.68 BPE** (greedy, LLP ordering, window=7)
+### Results summary
 
-### Action distribution (LLP + Zeta-3, CNR-2000)
+| Config | Relabeling | Codec | Window | Local window | BPE |
+|--------|-----------|-------|--------|--------------|-----|
+| [1] LLP baseline | Global LLP | Zeta-3 | 7 | No | 3.844 |
+| [2] LLP + CB | Global LLP | Zeta-3 | 7 | No | 3.528 |
+| [3] LLP + CB w=64 | Global LLP | Zeta-3 | 64 | No | 3.355 |
+| [4] **LLP + Fib + CB w=64** | **Global LLP** | **Fibonacci** | **64** | **No** | **3.268** |
+| [5] Leiden+LLP, global w | Leiden K=1 + LLP | Fibonacci | 7 | No | 3.514 |
+| [6] Leiden+LLP, global w | Leiden K=1 + LLP | Fibonacci | 64 | No | 3.326 |
+| [7] Leiden+LLP, local w | Leiden K=1 + LLP | Fibonacci | 7 | Yes | 3.514 |
+| [8] Leiden+LLP, local w | Leiden K=1 + LLP | Fibonacci | 64 | Yes | 3.326 |
+| WebGraph BV | LLP | Zeta-3 | 7 | No | 2.897 |
+| RCGE FW64 K=1 | Leiden + LLP | Fibonacci | 64 | Cluster-local | **2.887** |
+
+Configs 7 and 8 are byte-for-byte identical to configs 5 and 6 — the cluster-local window reset has no effect (see Vertex Ordering section).
+
+### Best greedy config (config 4)
+
+```
+Relabeling:  global LLP, :sym mode, 10 passes
+Encoding:    Fibonacci varint
+Window:      ref_window_size = 64
+Copy-blocks: enabled
+BPE:         ~3.27 (varies slightly due to LLP randomness)
+```
+
+### Optimization history
+
+| Step | Change | BPE |
+|------|--------|-----|
+| Baseline | LLP + Zeta-3, w=7, adaptive bitmap | 3.844 |
+| Copy-blocks | Replace adaptive bitmap with copy-blocks | 3.528 (−0.316) |
+| Larger window | w=7 → w=64 | 3.355 (−0.173) |
+| Fibonacci | Zeta-3 → Fibonacci encoding | **3.268** (−0.087) |
+
+### Remaining gap vs WebGraph (0.37 BPE)
+
+The greedy approach cannot close to WebGraph through vertex ordering, window management, or codec changes:
+
+- **Two-step Leiden+LLP ordering**: slightly worse than global LLP for the greedy global window (3.326 vs 3.268 BPE)
+- **Cluster-local window reset**: zero effect — the greedy encoder already avoids cross-cluster references
+- **Architecture**: the gap is structural — RCGE's per-cluster local indexing gives ~0.4 BPE advantage that cannot be replicated in the greedy framework
+
+See FORMAT_SPECS_RCGE.md for the RCGE approach which achieves 2.887 BPE.
+
+### Action distribution (LLP + Zeta-3, w=7, CNR-2000)
 
 | Action | % | VLC bits |
 |--------|---|----------|
@@ -260,8 +349,3 @@ For each vertex, the combination with the lowest estimated bit cost is selected.
 | other (14 combos) | 3.0% | 9 |
 
 Shannon entropy of action distribution: **2.13 bits** (theoretical minimum).
-
-### Remaining gaps vs WebGraph
-- **Vertex ordering**: LLP quality (number of passes, resolution levels)
-- **Reference window**: WebGraph uses window=7 with highly optimized LLP; larger windows may help with weaker orderings
-- **Cost estimation accuracy**: WebGraph uses exact bit counting; MGS uses estimates

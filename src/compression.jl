@@ -3434,7 +3434,8 @@ function write_rl_compressed_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         integer_encoding::Symbol=_RL_FIXED_ENCODING,
         vertex_actions::Union{Dict,Nothing}=nothing,
         stats::Union{Dict,Nothing}=nothing,
-        copy_blocks::Bool=false) where {T<:Unsigned}
+        copy_blocks::Bool=false,
+        cluster_sizes::Vector{Int}=Int[]) where {T<:Unsigned}
 
     vs = length(keys(neighbor_lists))
     ie = integer_encoding
@@ -3444,6 +3445,16 @@ function write_rl_compressed_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         push!(reference_window, vertex)
         if length(reference_window) > ref_window_size
             popfirst!(reference_window)
+        end
+    end
+
+    # Cluster-local window: compute vertex indices where the window resets
+    cluster_boundary_starts = Set{Int}()
+    if !isempty(cluster_sizes)
+        cumpos = 0
+        for sz in cluster_sizes[1:end-1]
+            cumpos += sz
+            push!(cluster_boundary_starts, cumpos + 1)
         end
     end
 
@@ -3460,6 +3471,11 @@ function write_rl_compressed_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
     # Unified Data section
     for v_idx in 1:vs
         v = T(v_idx)
+
+        # Reset reference window at cluster boundaries (cluster-local window mode)
+        if v_idx in cluster_boundary_starts
+            empty!(reference_window)
+        end
 
         current_neighbors = sort(get(neighbor_lists, v, T[]))
 
@@ -3528,7 +3544,8 @@ function write_rl_compressed_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
 end
 
 function read_rl_compressed_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Type{T};
-        integer_encoding::Symbol=:fibonacci, copy_blocks::Bool=false) where {T<:Unsigned}
+        integer_encoding::Symbol=:fibonacci, copy_blocks::Bool=false,
+        ref_window_size::Int=7, cluster_sizes::Vector{Int}=Int[]) where {T<:Unsigned}
 
     neighbor_lists = Dict{T,Vector{T}}()
 
@@ -3546,7 +3563,6 @@ function read_rl_compressed_graph_data(r::BitReader, vs::T, coding_scheme::Symbo
     end
 
     reference_window = T[]
-    ref_window_size = 7
     function add_to_ref_window!(vertex::T)
         push!(reference_window, vertex)
         if length(reference_window) > ref_window_size
@@ -3554,9 +3570,24 @@ function read_rl_compressed_graph_data(r::BitReader, vs::T, coding_scheme::Symbo
         end
     end
 
+    # Cluster-local window: compute vertex indices where the window resets
+    cluster_boundary_starts = Set{Int}()
+    if !isempty(cluster_sizes)
+        cumpos = 0
+        for sz in cluster_sizes[1:end-1]
+            cumpos += sz
+            push!(cluster_boundary_starts, cumpos + 1)
+        end
+    end
+
     # Unified Data loop
     for v_idx in 1:Int(vs)
         v = T(v_idx)
+
+        # Reset reference window at cluster boundaries (cluster-local window mode)
+        if v_idx in cluster_boundary_starts
+            empty!(reference_window)
+        end
         
         
         # Read VLC vertex header
