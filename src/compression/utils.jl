@@ -48,15 +48,44 @@ function delta_encode_vector(lst::Vector{T})::Vector{T} where {T<:Unsigned}
     return diffs
 end
 
+"""
+Precomputed Fibonacci numbers F(2)..F(86) for exact Fibonacci coding bit-length.
+Fibonacci coding of positive integer n uses exactly k bits, where F(k) ≤ n < F(k+1).
+"""
+const _FIB_TABLE = let
+    fibs = UInt64[1, 2]  # F(2)=1, F(3)=2
+    while fibs[end] < typemax(UInt64) ÷ 2
+        push!(fibs, fibs[end] + fibs[end-1])
+    end
+    fibs
+end
+
+"""
+Exact bit length of Fibonacci coding for value n ≥ 1.
+"""
+@inline function _fibonacci_bit_length(n::Integer)::Int
+    n <= 0 && return 1
+    # Binary search for k such that _FIB_TABLE[k] ≤ n < _FIB_TABLE[k+1]
+    # _FIB_TABLE[i] = F(i+1), so bit length = i + 1
+    lo, hi = 1, length(_FIB_TABLE)
+    while lo < hi
+        mid = (lo + hi + 1) >> 1
+        if _FIB_TABLE[mid] <= UInt64(n)
+            lo = mid
+        else
+            hi = mid - 1
+        end
+    end
+    return lo + 1  # _FIB_TABLE index lo corresponds to F(lo+1), bit length = lo + 1
+end
+
 function estimate_encoded_value_cost(value::T, encoding::Symbol) where {T<:Unsigned}
     if value == 0
         return 1  # Special case
     end
-    
-    # Rough bit cost estimates for different encodings
+
     if encoding == :fibonacci
-        # Fibonacci encoding roughly log_phi(n) + log_phi(n)/phi bits
-        return ceil(Int, log(2, max(1, value)) * 1.44) + 2
+        return _fibonacci_bit_length(value)
     elseif encoding == :elias_gamma
         # Elias gamma: 2⌊log2(n)⌋ + 1 bits  
         return 2 * floor(Int, log(2, max(1, value))) + 1

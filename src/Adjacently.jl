@@ -55,7 +55,7 @@ include("pr.jl")  # Now PageRank will have access to both CustomTypes and Random
 using .PageRank
 export PageRank
 
-include("graph.jl")  # Load Graph before Compression (Compression.ASTRALayered depends on Graph)
+include("graph.jl")
 using .Graph
 export Graph
 
