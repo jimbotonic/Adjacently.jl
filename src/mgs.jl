@@ -26,15 +26,12 @@ using ..Compression: huffman_encoding, get_huffman_codes!, decode_huffman_values
 	delta_encode_vector, write_elias_coding, read_elias_coding,
 	write_golomb, read_golomb, write_fibonacci, read_fibonacci,
 	write_zeta, read_zeta, write_compressed_graph_data, read_compressed_graph_data,
-	write_rl_compressed_graph_data, read_rl_compressed_graph_data
+	write_greedy_graph_data, read_greedy_graph_data
 
 using ..Graph: get_basic_stats, get_in_out_degrees, get_out_degrees
 using ..Relabeling: relabel_vertices, relabel_graph
 using ..Constants: GOLOMB_BASE, ZETA_BASE
 
-using ..RL: QPolicy, load_policy, best_action, action_from_index, feature_index,
-	extract_features, VertexFeatures, Action, NUM_ACTIONS, GnnACPolicy, best_action_gnn
-using ..GNN: GNNModel, gnn_forward
 
 # constants for new header format
 # Header structure: 'MGS' (3 bytes) + major/minor version (2 bytes) + flags (2 bytes) + vertices (5 bytes)
@@ -63,9 +60,9 @@ const INT_ENCODING_FIBONACCI = 0x6
 const OPTION_NONE = 0b00000000          # no options
 const OPTION_ASTRA = 0b00001111         # ASTRA: Adaptive Streaming Adjacency (greedy cost-based, adaptive bitmaps, recursive references)
 const OPTION_HUFFMAN = 0xFF             # Huffman compression (deprecated)
-# RL policy range: 0x10-0x8F (128 policy slots)
-const OPTION_RL_POLICY_BASE = 0x10
-const OPTION_RL_POLICY_MAX = 0x8F
+# Greedy mode range: 0x10-0x8F (128 slots)
+const OPTION_GREEDY_BASE = 0x10
+const OPTION_GREEDY_MAX = 0x8F
 
 # maximum number of vertices
 MGS_MAX_SIZE = 0xffffffffff
@@ -162,8 +159,7 @@ export write_mgs3_graph,
 	   write_complex_encoded_compressed_mgs3_graph,
 	   load_huffman_compressed_mgs3_graph,
 	   load_complex_encoded_compressed_mgs3_graph,
-	   write_rl_compressed_mgs3_graph,
-	   load_rl_compressed_mgs3_graph
+	   load_greedy_mgs3_graph
 
 ################################################################################
 # Write uncompressed MGS v3 graph
@@ -751,7 +747,7 @@ Supported compression schemes:
 
 Returns a graph loaded with the compression scheme specified in the header.
 """
-function load_compressed_mgs3_graph(filename::AbstractString; copy_blocks::Bool=false, ref_window_size::Int=7, cluster_sizes::Vector{Int}=Int[])
+function load_compressed_mgs3_graph(filename::AbstractString; copy_blocks::Bool=false, adaptive_copy::Bool=false, ref_window_size::Int=7, fixwidth_ref::Bool=false, stop_deltas::Bool=false)
 	# Header format: see MGS_HEADER.md
 	f = open(filename, "r")
 	
@@ -785,9 +781,8 @@ function load_compressed_mgs3_graph(filename::AbstractString; copy_blocks::Bool=
 	# Check if Huffman is enabled via option flags
 	if option_flags == OPTION_HUFFMAN
 		g = load_huffman_compressed_mgs3_graph(f, graph_type, encoding, gs)
-	elseif OPTION_RL_POLICY_BASE <= option_flags <= OPTION_RL_POLICY_MAX
-		policy_id = Int(option_flags - OPTION_RL_POLICY_BASE) + 1
-		g = load_rl_compressed_mgs3_graph(f, graph_type, encoding, gs, policy_id, compression; copy_blocks=copy_blocks, ref_window_size=ref_window_size, cluster_sizes=cluster_sizes)
+	elseif OPTION_GREEDY_BASE <= option_flags <= OPTION_GREEDY_MAX
+		g = load_greedy_mgs3_graph(f, graph_type, encoding, gs, compression; copy_blocks=copy_blocks, adaptive_copy=adaptive_copy, ref_window_size=ref_window_size, fixwidth_ref=fixwidth_ref, stop_deltas=stop_deltas)
 	elseif compression in supported_schemes
 		g = load_complex_encoded_compressed_mgs3_graph(f, graph_type, encoding, gs, compression)
 	else
@@ -972,31 +967,30 @@ function load_complex_encoded_compressed_mgs3_graph(io::IO, graph_type::Symbol, 
 end
 
 ################################################################################
-# RL policy-based compressed MGS v3 graph
+# Greedy compressed MGS v3 graph
 ################################################################################
 
 """
-    load_rl_compressed_mgs3_graph(io, graph_type, coding_scheme, gs, policy_id)
+    load_greedy_mgs3_graph(io, graph_type, coding_scheme, gs, integer_encoding; ...)
 
-Load graph from RL-compressed MGS v3 format. The data stream is self-describing,
-so the policy is not needed for decompression (policy_id is informational).
+Load graph from greedy-compressed MGS v3 format. The data stream is self-describing.
 """
-function load_rl_compressed_mgs3_graph(io::IO, graph_type::Symbol, coding_scheme::Symbol, gs::UInt64, policy_id::Int,
-		integer_encoding::Symbol=:fibonacci; copy_blocks::Bool=false, ref_window_size::Int=7, cluster_sizes::Vector{Int}=Int[])
+function load_greedy_mgs3_graph(io::IO, graph_type::Symbol, coding_scheme::Symbol, gs::UInt64,
+		integer_encoding::Symbol=:fibonacci; copy_blocks::Bool=false, adaptive_copy::Bool=false, ref_window_size::Int=7, fixwidth_ref::Bool=false, stop_deltas::Bool=false, adaptive_deltas::Bool=false, empty_prefix::Bool=false, split_residual::Bool=false)
 	n_bits_v = convert(UInt8, ceil(log(2, gs)))
 	V = infer_uint_custom_type(n_bits_v)
 
 	g = graph_type == :directed ? SimpleDiGraph{V}() : SimpleGraph{V}()
 
-	@info("generating graph (RL policy mode, policy_id=$policy_id)")
+	@info("generating graph (greedy mode)")
 	@info("adding vertices")
 	add_vertices!(g, gs)
 
 	reader = BitReader(io)
 
-	@info("reading RL-compressed graph data")
-	neighbor_lists = read_rl_compressed_graph_data(reader, V(gs), coding_scheme, V;
-		integer_encoding=integer_encoding, copy_blocks=copy_blocks, ref_window_size=ref_window_size, cluster_sizes=cluster_sizes)
+	@info("reading greedy-compressed graph data")
+	neighbor_lists = read_greedy_graph_data(reader, V(gs), coding_scheme, V;
+		integer_encoding=integer_encoding, copy_blocks=copy_blocks, adaptive_copy=adaptive_copy, ref_window_size=ref_window_size, fixwidth_ref=fixwidth_ref, stop_deltas=stop_deltas, adaptive_deltas=adaptive_deltas, empty_prefix=empty_prefix, split_residual=split_residual)
 
 	@info("building graph from neighbor lists")
 	for (source_vertex, neighbors) in neighbor_lists
@@ -1007,119 +1001,5 @@ function load_rl_compressed_mgs3_graph(io::IO, graph_type::Symbol, coding_scheme
 
 	@info("graph construction completed: $(nv(g)) vertices, $(ne(g)) edges")
 	return g
-end
-function write_rl_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString,
-        policy::GnnACPolicy, gnn::GNNModel;
-        coding_scheme::Symbol=:children, ref_window_size::Int=7,
-        integer_encoding::Symbol=:fibonacci) where {T<:Unsigned}
-
-    vs = vertices(g)
-    gs = convert(UInt64, length(vs))
-
-    if gs > MGS_MAX_SIZE
-        error("Input graph cannot have more than 2^40-1 vertices")
-    end
-
-    n_bits_v = convert(UInt8, ceil(log(2, gs)))
-    V = infer_uint_custom_type(n_bits_v)
-
-    # GNN policy is identified by a high policy_id
-    option_flags = UInt8(OPTION_RL_POLICY_BASE + 16)
-    flag_byte1, flag_byte2 = create_header_flags(:directed, coding_scheme, integer_encoding, option_flags)
-
-    # Construct 12-byte header
-    header_bytes = UInt8[
-        0x4d, 0x47, 0x53,  # 'MGS'
-        0x03, 0x00,         # Version 3.0
-        flag_byte1, flag_byte2,
-        (gs & 0xff), ((gs >> 8) & 0xff), ((gs >> 16) & 0xff), ((gs >> 24) & 0xff), ((gs >> 32) & 0xff)
-    ]
-
-    f = open(filename * ".mgz", "w")
-    bw = BitWriter(f)
-
-    @info("writing header section (GNN policy mode)")
-    write_bytes(bw, header_bytes)
-    
-    gnn_forward(gnn) # Make sure features are computed
-    
-    hidden_dim = size(gnn.H1, 2)
-    feature_fn(v) = [gnn.H1[v,:]; gnn.Z2[v]]
-
-    vertex_actions = Dict{V, Int}()
-    for v_idx in 1:gs
-        v = V(v_idx)
-        features = feature_fn(v)
-        a_idx = best_action_gnn(policy, features)
-        vertex_actions[v] = a_idx
-    end
-
-    neighbor_lists = Dict{V,Vector{V}}()
-    for v in vs
-        ovs = outneighbors(g, v)
-        neighbor_lists[convert(V, v)] = sort([convert(V, o) for o in ovs])
-    end
-
-    @info("writing RL-compressed graph data using GNN policy")
-    write_rl_compressed_graph_data(bw, neighbor_lists, coding_scheme, ref_window_size;
-        integer_encoding=integer_encoding, vertex_actions=vertex_actions)
-
-    flush_bitwriter(bw; flush_last_bits=true)
-    close(f)
-end
-
-"""
-    write_rl_compressed_mgs3_graph(g, filename, vertex_actions; ...)
-
-Save a graph in RL-compressed MGS v3 format using pre-computed vertex actions.
-"""
-function write_rl_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString,
-        vertex_actions::Dict{V, Int};
-        coding_scheme::Symbol=:children, ref_window_size::Int=7,
-        integer_encoding::Symbol=:fibonacci) where {T<:Unsigned, V<:Unsigned}
-
-    vs = vertices(g)
-    gs = convert(UInt64, length(vs))
-
-    if gs > MGS_MAX_SIZE
-        error("Input graph cannot have more than 2^40-1 vertices")
-    end
-
-    n_bits_v = convert(UInt8, ceil(log(2, gs)))
-    V_type = infer_uint_custom_type(n_bits_v)
-
-    # RL policy mode
-    option_flags = UInt8(OPTION_RL_POLICY_BASE)
-    flag_byte1, flag_byte2 = create_header_flags(:directed, coding_scheme, integer_encoding, option_flags)
-
-    header_bytes = UInt8[
-        0x4d, 0x47, 0x53,  # 'MGS'
-        0x03, 0x00,
-        flag_byte1, flag_byte2,
-        (gs & 0xff), ((gs >> 8) & 0xff), ((gs >> 16) & 0xff), ((gs >> 24) & 0xff), ((gs >> 32) & 0xff)
-    ]
-
-    f = open(filename * ".mgz", "w")
-    bw = BitWriter(f)
-
-    write_bytes(bw, header_bytes)
-
-    neighbor_lists = Dict{V_type,Vector{V_type}}()
-    for v in vs
-        ovs = outneighbors(g, v)
-        neighbor_lists[convert(V_type, v)] = sort([convert(V_type, o) for o in ovs])
-    end
-
-    # Ensure vertex_actions keys match V_type
-    va_converted = Dict{V_type, Int}()
-    for (v, a) in vertex_actions
-        va_converted[convert(V_type, v)] = a
-    end
-
-    write_rl_compressed_graph_data(bw, neighbor_lists, coding_scheme, ref_window_size;
-        integer_encoding=integer_encoding, vertex_actions=va_converted)
-
-    flush_bitwriter(bw; flush_last_bits=true)
-    close(f)
 end
 end # module MGS

@@ -51,7 +51,17 @@ mutable struct RCGEStats
     bits_inter_perms::Int
     bits_inter_lists::Int
     ab_metrics::Vector{Tuple{Int,Int,Int,Int,Int,Int}}
-    RCGEStats() = new(0,0,0,0,0,0,0,0,0,0,0,0,0, Tuple{Int,Int,Int,Int,Int,Int}[])
+    # Profiling: copy-mode selection counts (when intra_copy_adaptive=true)
+    intra_copy_bitmap_count::Int
+    intra_copy_blocks_count::Int
+    intra_copy_complement_count::Int
+    # Profiling: overlap fraction histogram (10 buckets: [0%,10%), …, [90%,100%])
+    intra_overlap_hist::Vector{Int}
+    # Profiling: total additions across all ref vertices
+    intra_add_count_total::Int
+    RCGEStats() = new(0,0,0,0,0,0,0,0,0,0,0,0,0,
+                      Tuple{Int,Int,Int,Int,Int,Int}[],
+                      0, 0, 0, zeros(Int, 10), 0)
 end
 
 @inline function _total_bits(w::BitWriter)
@@ -100,6 +110,7 @@ Base.@kwdef struct RCGEParams
     intra_zigzag::Bool = false        # Zigzag relative first-value encoding (offset from local vertex index)
     intra_stop_deltas::Bool = false   # Use STOP-terminated delta lists (eliminates per-vertex count prefix)
     intra_copy_blocks::Bool = false   # WebGraph-style copy-blocks for reference positions (vs RLE bitmap)
+    intra_copy_adaptive::Bool = false # Per-ref-vertex: pick cheaper of copy-blocks vs dense bitmap over reference degree (requires intra_copy_blocks=true)
     intra_ref_fixwidth::Bool = false  # Fixed-width ref delta encoding (1-bit flag + ceil(log2(window)) bits per ref)
     intra_ref_vlc::Bool = false       # VLC (Fibonacci) for ref delta instead of fixed-width (requires intra_ref_fixwidth=true)
     intra_add_adaptive::Bool = false  # Per-vertex adaptive additions: pick cheaper of STOP-delta vs intervals (requires intra_stop_deltas=true)
@@ -994,7 +1005,62 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                     additions = additions_list[idx_local]
                     ref_len = ref_len_list[idx_local]
                     local bpos0 = _total_bits(w)
-                    if params.intra_copy_blocks
+                    if params.intra_copy_adaptive && params.intra_copy_blocks
+                        # 3-way adaptive: bitmap / copy-blocks / complement copy-blocks
+                        # Copy-blocks cost
+                        local _io_cb = IOBuffer(); local _w_cb = BitWriter(_io_cb)
+                        _write_copy_blocks(_w_cb, ref_positions, params.varint)
+                        flush_bitwriter(_w_cb; flush_last_bits=true)
+                        local _cb_bits = length(take!(_io_cb)) * 8
+
+                        # Complement: encode positions NOT copied (sorted, same format)
+                        local _skipped = let pos_idx = 1, sk = Int[]
+                            for p in 1:ref_len
+                                if pos_idx <= length(ref_positions) && ref_positions[pos_idx] == p
+                                    pos_idx += 1
+                                else
+                                    push!(sk, p)
+                                end
+                            end
+                            sk
+                        end
+                        local _io_cc = IOBuffer(); local _w_cc = BitWriter(_io_cc)
+                        _write_copy_blocks(_w_cc, _skipped, params.varint)
+                        flush_bitwriter(_w_cc; flush_last_bits=true)
+                        local _cc_bits = length(take!(_io_cc)) * 8
+
+                        local _bm_bits = ref_len  # bitmap = exactly ref_len bits
+
+                        # 3-way nested mode: outer=1 → bitmap; outer=0,inner=0 → copy-blocks;
+                        #                    outer=0,inner=1 → complement
+                        # Cost: bitmap=1+ref_len  copy-blocks=2+cb_bits  complement=2+cc_bits
+                        local _t_bm = 1 + _bm_bits
+                        local _t_cb = 2 + _cb_bits
+                        local _t_cc = 2 + _cc_bits
+
+                        if _t_bm <= _t_cb && _t_bm <= _t_cc
+                            write_bit(w, true)   # outer=1: bitmap
+                            local _bm_arr = fill(false, ref_len)
+                            for p in ref_positions; if 1 <= p <= ref_len; _bm_arr[p] = true; end; end
+                            for b in _bm_arr; write_bit(w, b); end
+                            if stats !== nothing; stats.intra_copy_bitmap_count += 1; end
+                        elseif _t_cb <= _t_cc
+                            write_bit(w, false); write_bit(w, false)  # outer=0,inner=0: copy-blocks
+                            _write_copy_blocks(w, ref_positions, params.varint)
+                            if stats !== nothing; stats.intra_copy_blocks_count += 1; end
+                        else
+                            write_bit(w, false); write_bit(w, true)   # outer=0,inner=1: complement
+                            _write_copy_blocks(w, _skipped, params.varint)
+                            if stats !== nothing; stats.intra_copy_complement_count += 1; end
+                        end
+
+                        # Profiling: overlap fraction and addition count
+                        if stats !== nothing
+                            local _ov = ref_len > 0 ? length(ref_positions) / ref_len : 0.0
+                            local _bucket = min(9, floor(Int, _ov * 10))
+                            stats.intra_overlap_hist[_bucket + 1] += 1
+                        end
+                    elseif params.intra_copy_blocks
                         _write_copy_blocks(w, ref_positions, params.varint)
                     elseif ref_len > 0
                         copied = fill(false, ref_len)
@@ -1074,6 +1140,7 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                         stats.bits_intra_copy += (bpos1 - bpos0)
                         stats.bits_intra_add += (b3 - bpos1)
                         stats.intra_ref_used += 1
+                        stats.intra_add_count_total += length(additions)
                     end
                 else
                     # raw
@@ -1397,7 +1464,27 @@ function decode_level(r::BitReader, params::RCGEParams; T::Type{<:Unsigned}=UInt
                     ref_len = length(ref_list)
 
                     # Read copied positions from reference
-                    if params.intra_copy_blocks
+                    if params.intra_copy_adaptive && params.intra_copy_blocks
+                        # Nested mode bits: outer=1 → bitmap; outer=0,inner=0 → copy-blocks;
+                        #                   outer=0,inner=1 → complement (skipped positions)
+                        copied_vals = Int[]
+                        if read_bit(r)  # outer=1: bitmap
+                            for p in 1:ref_len
+                                if read_bit(r); push!(copied_vals, ref_list[p]); end
+                            end
+                        else            # outer=0: copy-blocks or complement
+                            if read_bit(r)  # inner=1: complement — read skipped positions
+                                local _skip_set = Set{Int}(Int.(collect(_read_copy_blocks(r, params.varint, T))))
+                                for p in 1:ref_len
+                                    if p ∉ _skip_set; push!(copied_vals, ref_list[p]); end
+                                end
+                            else            # inner=0: standard copy-blocks
+                                for p in _read_copy_blocks(r, params.varint, T)
+                                    if 1 <= p <= ref_len; push!(copied_vals, ref_list[p]); end
+                                end
+                            end
+                        end
+                    elseif params.intra_copy_blocks
                         copied_positions = _read_copy_blocks(r, params.varint, T)
                         copied_vals = Int[]
                         for p in copied_positions

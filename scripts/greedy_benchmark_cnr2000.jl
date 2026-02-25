@@ -17,8 +17,8 @@ using Adjacently.Relabeling: relabel_graph, relabel_vertices_llp
 using Adjacently.Clustering: leiden_partition
 using Adjacently.Graph: subgraph
 using Adjacently.MGS: load_compressed_mgs3_graph, create_header_flags,
-                       OPTION_RL_POLICY_BASE, MGS_MAX_SIZE
-using Adjacently.Compression: write_rl_compressed_graph_data
+                       OPTION_GREEDY_BASE, MGS_MAX_SIZE
+using Adjacently.Compression: write_greedy_graph_data
 using Adjacently.Util: infer_uint_custom_type
 
 const PROJECT_ROOT = normpath(joinpath(@__DIR__, ".."))
@@ -44,7 +44,7 @@ function write_greedy_mgz(g, filename::AbstractString;
     n_bits_v = convert(UInt8, ceil(log(2, gs)))
     V = infer_uint_custom_type(n_bits_v)
 
-    option_flags = UInt8(OPTION_RL_POLICY_BASE)
+    option_flags = UInt8(OPTION_GREEDY_BASE)
     flag_byte1, flag_byte2 = create_header_flags(:directed, coding_scheme, integer_encoding, option_flags)
 
     header_bytes = UInt8[
@@ -68,8 +68,8 @@ function write_greedy_mgz(g, filename::AbstractString;
     end
 
     # Greedy mode: vertex_actions=nothing triggers exhaustive search
-    write_rl_compressed_graph_data(bw, neighbor_lists, coding_scheme, ref_window_size;
-        integer_encoding=integer_encoding, vertex_actions=nothing, stats=stats, copy_blocks=copy_blocks,
+    write_greedy_graph_data(bw, neighbor_lists, coding_scheme, ref_window_size;
+        integer_encoding=integer_encoding, stats=stats, copy_blocks=copy_blocks,
         cluster_sizes=cluster_sizes)
 
     flush_bitwriter(bw; flush_last_bits=true)

@@ -12,9 +12,9 @@ Key properties:
 - Inter-cluster edges trivially small at K=1 (241 bytes on CNR-2000)
 - Raw bitstream output (not wrapped in MGZ container)
 
-**Best result on CNR-2000**: **2.550 BPE** — beats WebGraph BV (2.897 BPE) by 0.347 BPE with all roundtrips verified.
+**Best result on CNR-2000**: **2.4341 BPE** — beats WebGraph BV (2.897 BPE) by 0.463 BPE with all roundtrips verified.
 
-The 2.550 BPE result combines **implicit membership** encoding (7 bytes vs 88,764 bytes for Elias-Fano, saves 0.221 BPE) with **adaptive additions** (per-vertex choice between STOP-delta and interval encoding, saves 0.067 BPE) and **adaptive raw** (same per-vertex adaptive choice for non-referenced vertices, saves 0.049 BPE). Each optimization is independent and their savings are additive.
+The 2.4341 BPE result combines **implicit membership** (saves 0.221 BPE), **adaptive additions** (saves 0.067 BPE), **adaptive raw** (saves 0.049 BPE), and **3-way adaptive copy positions** (bitmap / copy-blocks / complement per ref vertex, saves 0.116 BPE total). All optimizations are independent and their savings are additive.
 
 ---
 
@@ -86,6 +86,7 @@ The 0.432 BPE advantage of RCGE over global LLP + w=64 + Fibonacci is entirely f
 | `intra_ref_min_overlap` | 0.3 | Minimum overlap fraction for reference to be considered |
 | `intra_ref_rle` | `true` | Use RLE ones-deltas for reference delta sequences (legacy; `intra_ref_fixwidth` is better) |
 | `intra_ref_fixwidth` | `false` | Fixed-width per-vertex ref delta encoding (1 flag bit + ceil(log₂(window)) bits) |
+| `intra_copy_adaptive` | `false` | Per-ref-vertex: 3-way adaptive copy positions — pick cheapest of bitmap, copy-blocks, or complement copy-blocks (requires `intra_copy_blocks=true`). Nested 2-bit mode scheme: outer=1→bitmap (1 bit overhead), outer=0+inner=0→copy-blocks (2 bits), outer=0+inner=1→complement (2 bits). |
 | `intra_ref_vlc` | `false` | VLC (Fibonacci) for ref delta instead of fixed-width; harmful in practice (+0.093 BPE) |
 | `intra_add_adaptive` | `false` | Per-vertex adaptive additions: pick cheaper of STOP-delta vs interval+residuals (requires `intra_stop_deltas=true`) |
 | `intra_raw_adaptive` | `false` | Per-vertex adaptive raw: pick cheaper of STOP-delta vs interval+residuals for non-referenced vertices |
@@ -102,18 +103,19 @@ The 0.432 BPE advantage of RCGE over global LLP + w=64 + Fibonacci is entirely f
 | `intra_stop_deltas` | `false` | STOP-terminated delta lists (eliminates per-vertex count prefix) |
 | `intra_copy_blocks` | `false` | WebGraph-style copy-blocks for reference positions (vs RLE bitmap) |
 
-**Recommended best config** (2.550 BPE on CNR-2000 with K=1 + implicit ranges + adaptive encoding):
+**Recommended best config** (2.4341 BPE on CNR-2000 with K=1 + implicit ranges + all adaptive):
 ```julia
 # Step 1: Leiden K=1 partition → 2 groups, then sort each by vertex ID
 clusters_by_id = [sort(group1_vertices), sort(group2_vertices)]
 # Step 2: Relabel vertices by vertex-ID rank within each group
 g_rel = relabel_graph(g, vertex_map)  # vertex_map: v → rank in ID-sorted group
 clusters_contiguous = [TV.(1:S1), TV.(S1+1:n)]
-# Step 3: Encode with implicit_ranges + adaptive intervals
+# Step 3: Encode with implicit_ranges + all adaptive per-vertex codec choices
 RCGEParams(
     L=128, membership=:implicit_ranges, inter_strategy=:perm,
     intra_ref_window=64, intra_ref_rle=false, intra_ref_fixwidth=true,
     intra_zigzag=true, intra_stop_deltas=true, intra_copy_blocks=true,
+    intra_copy_adaptive=true,
     intra_add_adaptive=true, intra_raw_adaptive=true, intra_adapt_mil=2,
     varint=:fibonacci, degree=:elias_delta, perm_strategy=:blockpos,
     undirected_pairs=false,
@@ -227,7 +229,18 @@ No byte-padding, no count prefix, no varint overhead. Saves ~0.095–0.126 BPE o
 For **referenced vertices** (`has_ref=true`):
 ```
 positions:
-  IF intra_copy_blocks:
+  IF intra_copy_adaptive AND intra_copy_blocks:
+    bit: outer mode (1 = bitmap, 0 = copy-blocks or complement)
+    IF outer = 1 (bitmap):
+      ref_len bits: one bit per position in reference's neighbor list (1 = copied)
+    ELSE:
+      bit: inner mode (0 = copy-blocks, 1 = complement)
+      IF inner = 0 (copy-blocks):
+        copy-blocks encoding of copied positions (see Copy-Blocks below)
+      ELSE (complement):
+        copy-blocks encoding of SKIPPED positions (positions NOT copied)
+        decoder: include all ref positions not in the decoded skip set
+  ELIF intra_copy_blocks:
     copy-blocks encoding (see Copy-Blocks below)
   ELSE:
     RLE ones-deltas bitmap over the reference vertex's neighbor list
@@ -315,11 +328,18 @@ Copy-blocks format:
 - Copy blocks: [(start=1, len=3), (start=6, len=2)], gap = 6−(1+3) = 2
 - Encoded: `small_count(2), fib(1), fib(3), fib(2), fib(2)` = 2+2+3+2+3 = 12 bits
 
+**Complement variant** (when `intra_copy_adaptive=true`): For high-overlap references, it is cheaper to encode the SKIPPED positions using the same copy-blocks format. Example: reference has 20 neighbors; current vertex shares {1..18} (skips {19,20}).
+- Copy-blocks would encode 18 copied positions: many runs, high cost
+- Complement encodes 2 skipped positions: `small_count(1), fib(19), fib(2)` = ~12 bits
+- Bitmap would use 20 bits
+
+The encoder tries all three modes, picks the cheapest, and writes the appropriate mode bits.
+
 Advantages over RLE ones-deltas bitmap:
 1. Skip runs implicit (encoded as gaps) — no per-run type flag
 2. No explicit bitmap length (decoder knows ref_len from reference list)
 3. All values ≥ 1 — no +1 shifts needed
-4. Saves ~0.398 BPE on CNR-2000 (vs old RLE bitmap)
+4. Saves ~0.398 BPE on CNR-2000 (vs old RLE bitmap); +3-way adaptive saves additional −0.116 BPE
 
 ### Fixed-Width Reference Delta Encoding
 
@@ -428,6 +448,11 @@ For encodings without zero support (Fibonacci, Elias Delta), zero-valued fields 
 | `bits_inter_degrees` | Bits for inter-cluster degree vectors |
 | `bits_inter_perms` | Bits for inter-cluster permutation data |
 | `bits_inter_lists` | Bits for inter-cluster neighbor lists |
+| `intra_copy_bitmap_count` | Number of ref vertices that chose bitmap mode (when `intra_copy_adaptive`) |
+| `intra_copy_blocks_count` | Number of ref vertices that chose copy-blocks mode (when `intra_copy_adaptive`) |
+| `intra_copy_complement_count` | Number of ref vertices that chose complement mode (when `intra_copy_adaptive`) |
+| `intra_overlap_hist` | 10-bucket histogram of overlap fractions [0%,10%)…[90%,100%) for ref vertices |
+| `intra_add_count_total` | Total number of additions across all ref vertices |
 
 ---
 
@@ -456,21 +481,54 @@ Ordering: Leiden fine clustering + per-cluster LLP, K=8 unless noted.
 | + Implicit ranges membership | 1 | 2.666 | −0.221 | 1,047 KB |
 | + Adaptive additions (MIL=2) | 1 | 2.599 | −0.067 | 1,022 KB |
 | + Adaptive raw (MIL=2) | 1 | 2.617 | −0.049 | 1,028 KB |
-| **+ Adaptive adds+raw (MIL=2)** | **1** | **2.550** | **−0.116** | **1,001 KB** |
+| + Adaptive adds+raw (MIL=2) | 1 | 2.550 | −0.116 | 1,001 KB |
+| + 2-way adaptive copy (bitmap vs copy-blocks) | 1 | 2.497 | −0.053 | 981 KB |
+| **+ 3-way adaptive copy (+ complement)** | **1** | **2.4341** | **−0.063** | **956 KB** |
 
-**Total improvement**: 4.307 → 2.550 BPE (−40.8% over 9 independent optimizations).
+**Total improvement**: 4.307 → 2.4341 BPE (−43.5% over 11 independent optimizations).
 
-Note: adaptive adds (−0.067 BPE) and adaptive raw (−0.049 BPE) are independent; combined they give −0.116 BPE because each targets a different section of the bitstream. All roundtrips verified OK.
+Note: each adaptive optimization targets a different section (adds, raw, copy positions), and their savings are additive. Window size w=64 is optimal: w=128 adds +1 bit/ref-delta in headers (+26 KB) but saves only 23 KB in adds+raw — net negative. All roundtrips verified OK.
 
-### Best Config Bit Budget (FW64, K=1, Implicit Ranges + Adaptive — 2.550 BPE)
+### Best Config Bit Budget (FW64, K=1, 3-Way Adaptive — 2.4341 BPE)
 
 | Component | Bytes | BPE | Share |
 |-----------|-------|-----|-------|
 | Membership (2 sizes, implicit) | 7 | 0.000 | 0.0% |
-| Headers (fixed-width ref info) | 193,406 | 0.481 | 19.1% |
-| Copy positions (copy-blocks) | 276,433 | 0.688 | 27.5% |
-| Additions (adaptive: STOP-delta or intervals) | 422,987 | 1.052 | 42.1% |
+| Headers (fixed-width ref info) | 193,406 | 0.481 | 20.3% |
+| Copy positions (3-way adaptive: bitmap/copy-blocks/complement) | 229,790 | 0.572 | 24.1% |
+| Additions (adaptive: STOP-delta or intervals) | 422,987 | 1.052 | 44.3% |
+| Raw (adaptive: STOP-delta or intervals) | 132,121 | 0.329 | 13.9% |
+| Inter-cluster edges | 241 | 0.001 | 0.0% |
+| **Total** | **978,552** | **2.4341** | 100% |
+
+62.5% of vertices (203,615 / 325,557) use reference encoding. Copy mode distribution: 61.3% bitmap (124,864), 22.6% copy-blocks (45,982), 16.1% complement (32,769). Overlap histogram peak: 49% of ref vertices have ≥90% of reference's neighbors copied — the dominant case for complement.
+
+Adaptive savings vs fixed-encoding baseline (2.666 BPE): copy −46,643 bytes, additions −27,015 bytes, raw −19,596 bytes.
+
+### Previous Best Config Bit Budget (FW64, K=1, 2-Way Adaptive — 2.497 BPE)
+
+| Component | Bytes | BPE | Share |
+|-----------|-------|-----|-------|
+| Membership (2 sizes, implicit) | 7 | 0.000 | 0.0% |
+| Headers (fixed-width ref info) | 193,406 | 0.481 | 19.3% |
+| Copy positions (adaptive: copy-blocks or bitmap) | 255,092 | 0.635 | 25.4% |
+| Additions (adaptive: STOP-delta or intervals) | 422,987 | 1.052 | 42.2% |
 | Raw (adaptive: STOP-delta or intervals) | 132,121 | 0.329 | 13.2% |
+| Inter-cluster edges | 241 | 0.001 | 0.0% |
+| **Total** | **1,003,854** | **2.497** | 100% |
+
+62.5% of vertices (203,615 / 325,557) use reference encoding.
+Adaptive savings vs fixed-encoding baseline (2.666 BPE): copy −21,341 bytes, additions −27,015 bytes, raw −19,596 bytes.
+
+### Previous Config Bit Budget (FW64, K=1, Adaptive Adds+Raw — 2.550 BPE)
+
+| Component | Bytes | BPE | Share |
+|-----------|-------|-----|-------|
+| Membership (2 sizes, implicit) | 7 | 0.000 | 0.0% |
+| Headers (fixed-width ref info) | 193,406 | 0.481 | 18.9% |
+| Copy positions (copy-blocks, fixed) | 276,433 | 0.688 | 27.0% |
+| Additions (adaptive: STOP-delta or intervals) | 422,987 | 1.052 | 41.3% |
+| Raw (adaptive: STOP-delta or intervals) | 132,121 | 0.329 | 12.9% |
 | Inter-cluster edges | 241 | 0.001 | 0.0% |
 | **Total** | **1,025,195** | **2.550** | 100% |
 
@@ -506,31 +564,34 @@ Note: adaptive adds (−0.067 BPE) and adaptive raw (−0.049 BPE) are independe
 
 ### Comparison with WebGraph BV
 
-| Component | RCGE K=1 + Adaptive | RCGE K=1 + Implicit | RCGE K=1 + EF | WebGraph BV |
-|-----------|---------------------|---------------------|---------------|-------------|
-| Membership / structure | 0.000 BPE | 0.000 BPE | 0.221 BPE | ~0.078 BPE |
-| Headers | 0.481 BPE | 0.481 BPE | 0.481 BPE | ~0.126 BPE |
-| Copy positions | 0.688 BPE | 0.688 BPE | 0.688 BPE | ~0.556 BPE |
-| Residuals/additions | 1.052 BPE | 1.119 BPE | 1.119 BPE | ~1.583 BPE |
-| Raw / non-referenced | 0.329 BPE | 0.377 BPE | 0.377 BPE | ~0.554 BPE |
-| Inter-cluster | 0.001 BPE | 0.001 BPE | 0.001 BPE | — |
-| **Total** | **2.550 BPE** | **2.666 BPE** | **2.887 BPE** | **2.897 BPE** |
+| Component | RCGE K=1 + 3-Way Adaptive | RCGE K=1 + 2-Way Adaptive | RCGE K=1 + Adds/Raw Adaptive | RCGE K=1 + EF | WebGraph BV |
+|-----------|---------------------------|---------------------------|------------------------------|---------------|-------------|
+| Membership / structure | 0.000 BPE | 0.000 BPE | 0.000 BPE | 0.221 BPE | ~0.078 BPE |
+| Headers | 0.481 BPE | 0.481 BPE | 0.481 BPE | 0.481 BPE | ~0.126 BPE |
+| Copy positions | 0.572 BPE | 0.635 BPE | 0.688 BPE | 0.688 BPE | ~0.556 BPE |
+| Residuals/additions | 1.052 BPE | 1.052 BPE | 1.052 BPE | 1.119 BPE | ~1.583 BPE |
+| Raw / non-referenced | 0.329 BPE | 0.329 BPE | 0.329 BPE | 0.377 BPE | ~0.554 BPE |
+| Inter-cluster | 0.001 BPE | 0.001 BPE | 0.001 BPE | 0.001 BPE | — |
+| **Total** | **2.4341 BPE** | **2.497 BPE** | **2.550 BPE** | **2.887 BPE** | **2.897 BPE** |
 
-RCGE + implicit ranges + adaptive encoding beats WebGraph BV by **0.347 BPE**. The reference encoding (copy + headers) is much more effective in RCGE because the two-step Leiden + per-cluster LLP ordering creates dense locality — 62.5% of vertices can reference a recent neighbor, vs ~56% for WebGraph's bisection ordering. The adaptive per-vertex codec choice (STOP-delta vs interval+residuals) further reduces both the additions and raw sections.
+RCGE + 3-way adaptive encoding beats WebGraph BV by **0.463 BPE**. The reference encoding (copy + headers) is much more effective in RCGE because the two-step Leiden + per-cluster LLP ordering creates dense locality — 62.5% of vertices can reference a recent neighbor, vs ~56% for WebGraph's bisection ordering. The 3-way adaptive copy positions (bitmap / copy-blocks / complement) reduces the copy section from 0.688 to 0.572 BPE: complement encoding dominates for the 49% of ref vertices with ≥90% overlap, where encoding 2–3 skipped positions costs far less than a full copy-blocks list of 18–20 entries.
 
 ### Greedy Approach Comparison
 
 | Approach | Ordering | Window | BPE |
 |----------|----------|--------|-----|
-| Greedy RL | None (crawl order) | 7 | ~4.3 |
-| Greedy RL | Global LLP | 7 | 3.561 |
-| Greedy RL | Global LLP | 64 | 3.319 |
-| RCGE (K=1, EF) | Leiden + per-cluster LLP | 64 | 2.887 |
+| Greedy (baseline) | None (crawl order) | 7 | ~4.3 |
+| Greedy | Global LLP | 7 | 3.561 |
+| Greedy | Global LLP | 64 | 3.319 |
+| **Greedy (best)** | **Leiden + per-group LLP** | **64** | **2.881** |
 | WebGraph BV | Greedy bisection | 7 | 2.897 |
+| RCGE (K=1, EF) | Leiden + per-cluster LLP | 64 | 2.887 |
 | RCGE (K=1, implicit ranges) | Leiden + per-cluster LLP | 64 | 2.666 |
-| **RCGE (K=1, implicit + adaptive)** | **Leiden + per-cluster LLP** | **64** | **2.550** |
+| RCGE (K=1, adaptive adds+raw) | Leiden + per-cluster LLP | 64 | 2.550 |
+| RCGE (K=1, 2-way adaptive copy) | Leiden + per-cluster LLP | 64 | 2.497 |
+| **RCGE (K=1, 3-way adaptive copy)** | **Leiden + per-cluster LLP** | **64** | **2.4341** |
 
-The 0.432 BPE advantage of RCGE over best-case greedy (global LLP + w=64 + Fibonacci) is entirely from the two-step ordering quality. Per-cluster LLP on Leiden-induced subgraphs creates locality an order of magnitude tighter than global LLP.
+The greedy encoder now beats WebGraph BV (2.881 vs 2.897 BPE) with its best configuration (adaptive_copy + stop_deltas + empty_prefix + compact_copy + vlc2 + tight_intervals). The remaining 0.45 BPE gap to RCGE is from RCGE's per-cluster local vertex indexing and hierarchical encoding, which create fundamentally tighter locality than the single-pass greedy approach.
 
 ---
 
@@ -557,3 +618,13 @@ The 0.432 BPE advantage of RCGE over best-case greedy (global LLP + w=64 + Fibon
 9. **Adaptive per-vertex codec selection** (−0.116 BPE combined). With a single inline mode bit per vertex, the encoder picks the cheaper of STOP-terminated delta-list vs interval+residuals encoding. This recovers the benefit of interval encoding for vertices with long arithmetic progressions in their neighbor lists, while avoiding overhead for vertices where delta encoding is cheaper. At MIL=2 (aggressive interval detection): additions −0.067 BPE (450 KB → 423 KB), raw −0.049 BPE (152 KB → 132 KB), total −0.116 BPE.
 
 10. **VLC reference-delta encoding is harmful** (+0.093 BPE). Using Fibonacci variable-length coding for ref deltas instead of fixed 6-bit encoding was expected to help but hurts in practice — ref deltas are distributed uniformly over [1,64] rather than concentrated near 1, so fixed-width (6 bits average) beats Fibonacci (~7–8 bits average for uniform input). This demonstrates that VLC only helps when the distribution is heavily skewed toward small values.
+
+11. **2-way adaptive copy-position encoding** (−0.053 BPE). Per-ref-vertex choice between copy-blocks and a dense bitmap over the reference's neighbor list (one bit per reference neighbor, 1=copied). Bitmap costs exactly `ref_len` bits, which beats copy-blocks when the reference list is short (≤ ~8 neighbors) or when copied positions are scattered. Mode flag overhead: 1 bit × 203,615 ref vertices = 25 KB; gross copy savings: 47 KB; net: −21 KB = −0.053 BPE.
+
+12. **Window size w=64 is optimal** (larger windows are harmful). Increasing to w=128 adds 1 extra bit per ref-delta (+26 KB headers) but saves only 23 KB in additions+raw (0.4% more ref vertices found). Net: −3 KB (slightly worse). w=256 even more so: +53 KB headers, −44 KB adds+raw, net −9 KB. The additional references found beyond the 64-vertex window are too few to justify the wider fixed-width delta encoding.
+
+13. **Complement copy-blocks (3-way adaptive)** (−0.063 BPE, copy 255 KB → 230 KB). A third copy mode encodes the SKIPPED positions instead of the copied ones, using the same copy-blocks format. For high-overlap references (≥90% copied), complement is dramatically cheaper: encoding 1–2 skipped positions costs ~4 bits vs encoding 18–20 copied positions in a run. The 3-way mode uses nested bits: outer=1→bitmap (1 bit overhead), outer=0+inner=0→copy-blocks (2 bits), outer=0+inner=1→complement (2 bits). Despite the 1-bit additional overhead for non-bitmap modes, complement dominates for the 16.1% of ref vertices (32,769 total) where it's cheapest. The overlap histogram shows why: 49% of ref vertices (99,760) have ≥90% overlap fraction — the main beneficiaries. Net savings: 255 KB − 230 KB = 25 KB beyond the 2-way baseline.
+
+14. **Smart ref-delta encoding (delta=1 shorthand) is harmful** (+0.040 BPE). The intuition was that delta=1 (reference immediately preceding vertex) would dominate and could be encoded as just 2 bits instead of 7. In practice, **only 6% of ref vertices use delta=1**. The actual distribution is near-uniform over [1,64]: delta=49–64 is the largest bucket at 35.8%, and small deltas (1–4) account for only 17% combined. This confirms finding #10: the LLP-ordered large top-level group has useful references spread throughout the entire 64-vertex window, not concentrated at delta=1. Encoding delta=1 in 2 bits saves 5 bits for 6% of refs but costs 1 extra bit for the remaining 94%, netting +0.64 bits/ref × 203K refs = +16 KB ≈ +0.040 BPE.
+
+15. **Elias-Fano for copy positions is harmful** (+0.034 BPE). EF was expected to help for large `ref_len` with scattered copied positions (e.g., k=10 scattered copies in ref_len=64 costs ~51 bits in EF vs 64 bits bitmap vs ~95 bits copy-blocks). In practice, EF is chosen for only **0.4% of ref vertices** (753 out of 203,615) — far too few to compensate for the mode-bit overhead. The flat 2-bit mode scheme (to accommodate a 4th mode) adds 1 extra bit for all 124,864 bitmap vertices (+15.6 KB), while 753 EF-mode vertices save only ~2 KB. The root cause: most ref vertices fall into the three cases already handled well by the existing 3-way adaptive — small ref_len (bitmap wins), high overlap (complement wins), or run-structured positions (copy-blocks wins). The large-ref_len + scattered regime where EF would excel is rare in this dataset.
