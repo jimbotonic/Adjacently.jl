@@ -502,7 +502,7 @@ function make_params(; kwargs...)
         :L=>128, :varint=>:fibonacci, :count_varint=>:fibonacci, :gap=>:fibonacci,
         :degree=>:elias_delta, :undirected_pairs=>false, :perm_strategy=>:blockpos,
         :membership=>:elias_fano, :inter_strategy=>:perm, :intra_ref_enabled=>true,
-        :intra_ref_window=>32, :intra_ref_min_overlap=>0.3, :intra_ref_rle=>false,
+        :intra_ref_window=>32, :intra_ref_rle=>false,
         :intra_block_try=>false, :positions_mode=>:delta, :additions_mode=>:delta,
         :min_cluster_density=>0.0, :intra_intervals=>false, :intra_mil=>4,
         :intra_greedy_mil=>false, :intra_zigzag=>true, :intra_stop_deltas=>true,

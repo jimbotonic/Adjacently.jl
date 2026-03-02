@@ -11,14 +11,10 @@ Header has 12 bytes:
   * Byte 2:
     - option flags:
       - 0x00: no option
-      - 0x01: complex [delta only] (deprecated tag; prefer ASTRA)
-      - 0x03: complex [delta + mix (run-length + interval)] (deprecated tag)
-      - 0x07: complex [delta + mix + reference] (deprecated tag)
-      - 0x0F: ASTRA [delta + mix + recursive reference]
-      - 0x10–0x8F: Greedy compressed mode (128 slots, reserved for future use)
-        - 0x10: greedy mode 1 (default), up to 0x8F: greedy mode 128
-        - Per-vertex encoding decisions via greedy cost-based search
-        - Stream is self-describing (encoding tag in bitstream header)
+      - 0x0F: ASTRA (legacy adaptive streaming)
+      - 0x10–0x8F: STD (Standard greedy compressed mode)
+      - 0x90–0x9F: CS (Command Stream compressed mode)
+      - 0xA0–0xAF: RCGE (Reversible Coarsening Graph Encoding)
       - 0xFF: Huffman (deprecated)
 - # vertices: 5 bytes position 
 

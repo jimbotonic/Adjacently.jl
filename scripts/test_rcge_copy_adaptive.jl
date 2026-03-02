@@ -1,12 +1,10 @@
 #!/usr/bin/env julia
 
 #
-# Benchmark three new RCGE optimizations on top of implicit-ranges baseline (2.666 BPE):
-#   1. VLC reference distance (Fibonacci instead of fixed-width)
-#   2. Interval encoding for additions (per-vertex adaptive)
-#   3. Interval encoding for raw lists (per-vertex adaptive)
-#
-# All three are independent and can be combined.
+# Test adaptive copy position encoding (bitmap vs copy-blocks per ref vertex).
+# The mode bit (1 bit per ref vertex) selects the cheaper encoding:
+#   - copy-blocks: good for contiguous run patterns
+#   - bitmap: exactly ref_len bits, good for short reference lists
 #
 
 using Pkg
@@ -34,7 +32,7 @@ function make_params(; kwargs...)
         :intra_block_try=>false, :positions_mode=>:delta, :additions_mode=>:delta,
         :min_cluster_density=>0.0, :intra_intervals=>false, :intra_mil=>4,
         :intra_greedy_mil=>false, :intra_zigzag=>false, :intra_stop_deltas=>false,
-        :intra_copy_blocks=>false, :intra_ref_fixwidth=>false,
+        :intra_copy_blocks=>false, :intra_copy_adaptive=>false, :intra_ref_fixwidth=>false,
         :intra_ref_vlc=>false, :intra_add_adaptive=>false, :intra_raw_adaptive=>false,
         :intra_adapt_mil=>2,
     )
@@ -42,13 +40,15 @@ function make_params(; kwargs...)
     return RCGEParams(; d...)
 end
 
-# Baseline: best known config with implicit ranges (2.666 BPE)
-fw64_base(; kwargs...) = make_params(
+# Known best config (2.5501 BPE): adaptive adds+raw, w=64
+best64(; kwargs...) = make_params(
     intra_zigzag=true, intra_stop_deltas=true, intra_copy_blocks=true,
-    intra_ref_window=64, intra_ref_fixwidth=true; kwargs...)
+    intra_ref_fixwidth=true, intra_add_adaptive=true, intra_raw_adaptive=true,
+    intra_adapt_mil=2, intra_ref_window=64; kwargs...)
 
 println("=" ^ 70)
-println("RCGE Optimization Benchmark (baseline: 2.666 BPE implicit ranges)")
+println("RCGE Adaptive Copy Positions Benchmark")
+println("Baseline: 2.5501 BPE (adaptive adds+raw, w=64)")
 println("=" ^ 70)
 
 cnr_csv = normpath(joinpath(@__DIR__, "..", "datasets", "webgraph", "cnr-2000", "cnr-2000.csv"))
@@ -62,7 +62,6 @@ m  = count_edges(g)
 TV = eltype(g)
 println("  Loaded: $n vertices, $m edges ($(round(time()-t0, digits=2))s)")
 
-# ── Build pre-relabeled graph (shared across all configs) ─────────────────────
 println("\nBuilding pre-relabeled graph (Leiden K=1, vertex-ID rank relabeling)...")
 t_rel = time()
 part = leiden_partition(g; max_passes=8, max_levels=5)
@@ -91,7 +90,6 @@ g_rel = relabel_graph(g, vertex_map)
 clusters_impl = [TV.(1:S1), TV.(S1+1:n)]
 println("  Clusters: $S1 + $(n-S1) ($(round(time()-t_rel, digits=2))s)")
 
-# ── Helper: encode + verify ───────────────────────────────────────────────────
 function run_config(name, params)
     print("  $name ... ")
     io = IOBuffer(); w = BitWriter(io)
@@ -105,17 +103,13 @@ function run_config(name, params)
     nbytes = length(bytes)
     bpe = round(8.0 * nbytes / m, digits=4)
     println("$bpe BPE  ($(nbytes) bytes, $(dt)s)")
-    println("    headers=$(ceil(Int,stats.bits_intra_headers/8))B  copy=$(ceil(Int,stats.bits_intra_copy/8))B  add=$(ceil(Int,stats.bits_intra_add/8))B  raw=$(ceil(Int,stats.bits_intra_raw/8))B  mem=$(ceil(Int,stats.bits_membership/8))B")
+    println("    hdrs=$(ceil(Int,stats.bits_intra_headers/8))B  copy=$(ceil(Int,stats.bits_intra_copy/8))B  add=$(ceil(Int,stats.bits_intra_add/8))B  raw=$(ceil(Int,stats.bits_intra_raw/8))B")
 
-    # Roundtrip verify
     r_v = BitReader(IOBuffer(bytes))
     decoded = decode_level(r_v, params; T=TV, directed=true)
     dec_edges = sum(length(v) for v in values(decoded))
-    if dec_edges == m
-        println("    Roundtrip: OK")
-    else
-        println("    Roundtrip: MISMATCH (expected $m, got $dec_edges) !")
-    end
+    ok = dec_edges == m
+    println("    Roundtrip: $(ok ? "OK" : "MISMATCH (expected $m, got $dec_edges) !")")
     return nbytes, bpe, stats
 end
 
@@ -125,29 +119,13 @@ println("─" ^ 70)
 
 results = []
 
-# Baseline
-b, bpe, s = run_config("Baseline (implicit, no new opts)", fw64_base())
-push!(results, ("Baseline", b, bpe))
+# Baseline (known)
+b, bpe, s = run_config("Baseline (w=64, adaptive adds+raw)", best64())
+push!(results, ("Baseline w=64", b, bpe))
 
-# 1. VLC ref distance
-b, bpe, s = run_config("+ VLC ref distance", fw64_base(intra_ref_vlc=true))
-push!(results, ("+ VLC ref delta", b, bpe))
-
-# 2. Adaptive additions (MIL=2)
-b, bpe, s = run_config("+ Adaptive additions (MIL=2)", fw64_base(intra_add_adaptive=true, intra_adapt_mil=2))
-push!(results, ("+ Adaptive adds MIL=2", b, bpe))
-
-# 3. Adaptive raw (MIL=2)
-b, bpe, s = run_config("+ Adaptive raw (MIL=2)", fw64_base(intra_raw_adaptive=true, intra_adapt_mil=2))
-push!(results, ("+ Adaptive raw MIL=2", b, bpe))
-
-# Best: adaptive adds + adaptive raw WITHOUT VLC
-b, bpe, s = run_config("+ Adaptive adds+raw (no VLC)", fw64_base(intra_add_adaptive=true, intra_raw_adaptive=true, intra_adapt_mil=2))
-push!(results, ("Adaptive adds+raw MIL=2", b, bpe))
-
-# Combined: VLC + adaptive adds + adaptive raw
-b, bpe, s = run_config("+ All three combined", fw64_base(intra_ref_vlc=true, intra_add_adaptive=true, intra_raw_adaptive=true, intra_adapt_mil=2))
-push!(results, ("All three combined", b, bpe))
+# + adaptive copy (bitmap vs copy-blocks per ref vertex)
+b, bpe, s = run_config("+ Adaptive copy (bitmap vs copy-blocks)", best64(intra_copy_adaptive=true))
+push!(results, ("+ Adaptive copy", b, bpe))
 
 println("\n" * "=" ^ 70)
 println("SUMMARY")
@@ -156,11 +134,11 @@ baseline_bpe = results[1][3]
 for (name, nbytes, bpe) in results
     delta = round(bpe - baseline_bpe, digits=4)
     sign = delta <= 0 ? "" : "+"
-    println("  $(rpad(name, 28)) $(round(bpe, digits=4)) BPE  $(sign)$(delta) vs baseline")
+    println("  $(rpad(name, 32)) $(round(bpe, digits=4)) BPE  $(sign)$(delta) vs baseline")
 end
-println("")
-println("  Reference: WebGraph BV                2.897 BPE")
-println("  Baseline: implicit ranges             $(baseline_bpe) BPE")
+println()
+println("  Reference: WebGraph BV         2.897 BPE")
+println("  Known best (w=64 adaptive)     2.5501 BPE")
 best_bpe = minimum(r[3] for r in results)
-println("  New best:                             $(round(best_bpe, digits=4)) BPE")
+println("  Best this run:                 $(round(best_bpe, digits=4)) BPE")
 println("=" ^ 70)

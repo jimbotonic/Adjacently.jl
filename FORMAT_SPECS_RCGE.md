@@ -8,13 +8,17 @@ Key properties:
 - Two-step vertex ordering: Leiden fine clustering → per-cluster LLP reordering on induced subgraphs
 - Intra-cluster edges compressed with reference encoding (copy-blocks + STOP-terminated additions)
 - Fixed-width reference delta encoding (no per-cluster bitmap or varint overhead)
+- Left/right residual split after interval extraction for smaller first-value encodings
 - Cluster membership encoded with Elias-Fano, or eliminated entirely via implicit-ranges pre-relabeling
 - Inter-cluster edges trivially small at K=1 (241 bytes on CNR-2000)
 - Raw bitstream output (not wrapped in MGZ container)
+- Threaded reference search (parallel candidate evaluation across threads)
 
-**Best result on CNR-2000**: **2.4341 BPE** — beats WebGraph BV (2.897 BPE) by 0.463 BPE with all roundtrips verified.
+**Best results**:
+- **CNR-2000**: **2.3191 BPE** (K=2, w=64, no LLP, adaptive STOP-delta) — beats WebGraph BV (2.897 BPE) by 0.578 BPE
+- **enwiki-2013**: **12.4854 BPE** (K=1, w=64, LLP, intervals + LR split) — beats WebGraph BV-HC (12.639 BPE) by 0.154 BPE
 
-The 2.4341 BPE result combines **implicit membership** (saves 0.221 BPE), **adaptive additions** (saves 0.067 BPE), **adaptive raw** (saves 0.049 BPE), and **3-way adaptive copy positions** (bitmap / copy-blocks / complement per ref vertex, saves 0.116 BPE total). All optimizations are independent and their savings are additive.
+All roundtrips verified.
 
 ---
 
@@ -83,7 +87,6 @@ The 0.432 BPE advantage of RCGE over global LLP + w=64 + Fibonacci is entirely f
 | `inter_strategy` | `:lists` | Inter-cluster encoding: `:perm` or `:lists` |
 | `intra_ref_enabled` | `true` | Enable reference encoding for intra-cluster adjacency |
 | `intra_ref_window` | 16 | Lookback window size for reference candidates (best: 64) |
-| `intra_ref_min_overlap` | 0.3 | Minimum overlap fraction for reference to be considered |
 | `intra_ref_rle` | `true` | Use RLE ones-deltas for reference delta sequences (legacy; `intra_ref_fixwidth` is better) |
 | `intra_ref_fixwidth` | `false` | Fixed-width per-vertex ref delta encoding (1 flag bit + ceil(log₂(window)) bits) |
 | `intra_copy_adaptive` | `false` | Per-ref-vertex: 3-way adaptive copy positions — pick cheapest of bitmap, copy-blocks, or complement copy-blocks (requires `intra_copy_blocks=true`). Nested 2-bit mode scheme: outer=1→bitmap (1 bit overhead), outer=0+inner=0→copy-blocks (2 bits), outer=0+inner=1→complement (2 bits). |
@@ -102,15 +105,11 @@ The 0.432 BPE advantage of RCGE over global LLP + w=64 + Fibonacci is entirely f
 | `intra_zigzag` | `false` | Zigzag relative first-value encoding (offset from local vertex index) |
 | `intra_stop_deltas` | `false` | STOP-terminated delta lists (eliminates per-vertex count prefix) |
 | `intra_copy_blocks` | `false` | WebGraph-style copy-blocks for reference positions (vs RLE bitmap) |
+| `intra_lr_split` | `false` | Left/right residual split: after interval extraction, residuals are split at vertex_id into left/right halves and encoded as ascending distances (requires `intra_intervals=true` and `intra_zigzag=true`) |
 
-**Recommended best config** (2.4341 BPE on CNR-2000 with K=1 + implicit ranges + all adaptive):
+**Recommended config for CNR-2000** (2.3191 BPE, K=2, no LLP, adaptive STOP-delta):
 ```julia
-# Step 1: Leiden K=1 partition → 2 groups, then sort each by vertex ID
-clusters_by_id = [sort(group1_vertices), sort(group2_vertices)]
-# Step 2: Relabel vertices by vertex-ID rank within each group
-g_rel = relabel_graph(g, vertex_map)  # vertex_map: v → rank in ID-sorted group
-clusters_contiguous = [TV.(1:S1), TV.(S1+1:n)]
-# Step 3: Encode with implicit_ranges + all adaptive per-vertex codec choices
+# K=2 Leiden partition → 2 clusters, pre-relabel for implicit ranges, no LLP (neither global nor within-cluster)
 RCGEParams(
     L=128, membership=:implicit_ranges, inter_strategy=:perm,
     intra_ref_window=64, intra_ref_rle=false, intra_ref_fixwidth=true,
@@ -122,27 +121,33 @@ RCGEParams(
 )
 ```
 
-**Intermediate config without adaptive** (2.666 BPE, simpler — no per-vertex mode bits):
+**Recommended config for enwiki-2013** (12.4854 BPE, K=1, LLP, intervals + LR split):
 ```julia
+# K=1 with global LLP reordering, interval+residual encoding, LR residual split
 RCGEParams(
     L=128, membership=:implicit_ranges, inter_strategy=:perm,
     intra_ref_window=64, intra_ref_rle=false, intra_ref_fixwidth=true,
     intra_zigzag=true, intra_stop_deltas=true, intra_copy_blocks=true,
+    intra_copy_adaptive=true,
+    intra_intervals=true, intra_mil=4,
+    intra_add_adaptive=true, intra_raw_adaptive=true, intra_adapt_mil=2,
+    intra_lr_split=true,
     varint=:fibonacci, degree=:elias_delta, perm_strategy=:blockpos,
     undirected_pairs=false,
 )
 ```
 
-**Standard config** (2.887 BPE, simpler — no pre-relabeling needed):
+**CNR-2000 K=1 config without LR split** (2.4341 BPE, adaptive STOP-delta):
 ```julia
 RCGEParams(
-    L=128, membership=:elias_fano, inter_strategy=:perm,
+    L=128, membership=:implicit_ranges, inter_strategy=:perm,
     intra_ref_window=64, intra_ref_rle=false, intra_ref_fixwidth=true,
     intra_zigzag=true, intra_stop_deltas=true, intra_copy_blocks=true,
+    intra_copy_adaptive=true,
+    intra_add_adaptive=true, intra_raw_adaptive=true, intra_adapt_mil=2,
     varint=:fibonacci, degree=:elias_delta, perm_strategy=:blockpos,
     undirected_pairs=false,
 )
-# with K=1 in the encoding loop
 ```
 
 ---
@@ -246,7 +251,11 @@ positions:
     RLE ones-deltas bitmap over the reference vertex's neighbor list
 
 additions:
-  IF intra_add_adaptive AND intra_stop_deltas:
+  IF (intra_intervals OR intra_greedy_mil) AND intra_lr_split:
+    LR-split intervals+residuals encoding [‡]
+  ELIF intra_intervals OR intra_greedy_mil:
+    intervals_and_residuals encoding [†]
+  ELIF intra_add_adaptive AND intra_stop_deltas:
     bit: mode flag (1 = intervals, 0 = STOP-delta)
     IF mode = intervals:
       intervals_and_residuals encoding [†]
@@ -254,8 +263,6 @@ additions:
       STOP-terminated delta list [†]
   ELIF intra_stop_deltas:
     STOP-terminated delta list [†]
-  ELIF intra_intervals OR intra_greedy_mil:
-    intervals_and_residuals encoding [†]
   ELSE (additions_mode = :delta):
     small_count(num_additions)
     delta-encoded addition list [†]
@@ -263,7 +270,11 @@ additions:
 
 For **non-referenced vertices** (`has_ref=false`):
 ```
-IF intra_raw_adaptive AND intra_stop_deltas:
+IF (intra_intervals OR intra_greedy_mil) AND intra_lr_split:
+  LR-split intervals+residuals encoding [‡]
+ELIF intra_intervals OR intra_greedy_mil:
+  intervals_and_residuals encoding [†]
+ELIF intra_raw_adaptive AND intra_stop_deltas:
   bit: mode flag (1 = intervals, 0 = STOP-delta)
   IF mode = intervals:
     intervals_and_residuals encoding [†]
@@ -271,14 +282,14 @@ IF intra_raw_adaptive AND intra_stop_deltas:
     STOP-terminated delta list [†]
 ELIF intra_stop_deltas:
   STOP-terminated delta list [†]
-ELIF intra_intervals OR intra_greedy_mil:
-  intervals_and_residuals encoding [†]
 ELSE:
   small_count(degree_in_cluster)
   delta-encoded sorted local neighbor IDs [†]
 ```
 
 `[†]` When `intra_zigzag=true`, the first value is encoded as a zigzag offset from the current vertex's local index (see below). Does not apply to reference position lists.
+
+`[‡]` Left/right residual split encoding (see below). Requires `intra_zigzag=true`.
 
 #### Reference Encoding Decision
 
@@ -405,6 +416,57 @@ The encoder tries both encodings on a temporary buffer, compares byte counts (in
 
 **Implementation note**: Requires `intra_stop_deltas=true` (the STOP-delta branch). The interval branch uses `write_intervals_and_residuals` with the same `vertex_id` zigzag first-value as the delta branch.
 
+### Left/Right Residual Split
+
+When `intra_lr_split=true` (requires `intra_intervals=true` and `intra_zigzag=true`), neighbor lists are encoded using `_write_ir_lr` which applies a WebGraph-inspired left/right split to the residuals after interval extraction. This produces smaller first-value encodings by ensuring each half's residuals start near vertex_id.
+
+**Encoding format** (`_write_ir_lr`):
+```
+1. Extract intervals from the full sorted neighbor list (standard algorithm)
+2. Write intervals section (identical to standard encoding):
+   varint(num_intervals + 1)
+   For each interval (start, length):
+     First interval: varint(zigzag(start - vertex_id) + 1)
+     Subsequent: varint(start - prev_start)
+     varint(length - mil + 1)
+
+3. Write residuals with left/right split:
+   varint(num_residuals + 1)
+   IF num_residuals > 0:
+     Split residuals at vertex_id:
+       left  = residuals where value < vertex_id
+       right = residuals where value > vertex_id
+     varint(num_left + 1)
+
+     Left distances (reversed to ascending):
+       left_dists[i] = vertex_id - left[num_left - i + 1]    (i = 1..num_left)
+       delta-encoded: first value + gaps (all values ≥ 1)
+
+     Right distances (ascending):
+       right_dists[i] = right[i] - vertex_id                 (i = 1..num_right)
+       delta-encoded: first value + gaps (all values ≥ 1)
+```
+
+**Decoding** (`_read_ir_lr`):
+```
+1. Read intervals (identical to standard)
+2. Read num_residuals; if > 0:
+   Read num_left; num_right = num_residuals - num_left
+   Read left_dists (delta-decode num_left values)
+   Read right_dists (delta-decode num_right values)
+   Reconstruct: left[i] = vertex_id - left_dists[num_left - i + 1]
+                right[i] = vertex_id + right_dists[i]
+3. Merge intervals + left + right, sort ascending
+```
+
+**Why LR split helps**: Standard zigzag encoding of residuals writes the first value as `zigzag(first_residual - vertex_id) + 1`. If the first residual is far from vertex_id (e.g., vertex_id=100, first_residual=50), the zigzag value is large: `zigzag(-50) = 99 → ~7 bits`. With LR split, the closest left residual (e.g., 95) has distance 5 (`~3 bits`), and the closest right residual (e.g., 102) has distance 2 (`~2 bits`). Additionally, the gap that crosses vertex_id in the standard encoding is eliminated entirely.
+
+**Overhead**: One extra Fibonacci-encoded count (left_count) per list, typically 2–4 bits. For empty halves (all neighbors on one side of vertex_id), the overhead is just the left_count value.
+
+**Results**:
+- enwiki-2013: **−0.442 BPE** (12.927 → 12.485 BPE), crossing below WebGraph BV-HC (12.639)
+- cnr-2000 (K=1, intervals mode): −0.113 BPE (2.684 → 2.570 BPE)
+
 ### RLE Ones-Deltas Bitmap (Legacy)
 
 When `intra_copy_blocks=false`, positions use dense boolean bitmap:
@@ -456,12 +518,30 @@ For encodings without zero support (Fibonacci, Elias Delta), zero-valued fields 
 
 ---
 
-## Performance on CNR-2000
+## Performance
+
+### CNR-2000
 
 **Graph**: 325,557 vertices, 3,216,152 edges (Italian web crawl).
 **WebGraph reference**: 2.897 BPE, 1,164,843 bytes.
 
-### Optimization History
+#### Best Result: 2.3191 BPE (K=2, no LLP)
+
+The best CNR-2000 result uses K=2 Leiden clusters without global LLP pre-ordering, window=64, and adaptive STOP-delta encoding. The K=2 split produces two clusters (18,292 and 307,265 vertices) where the per-cluster LLP naturally orders vertices within each Leiden group. No global LLP reordering is applied (LLP_PASSES=0).
+
+| Component | Bytes | BPE | Share |
+|-----------|-------|-----|-------|
+| Membership (implicit ranges) | 7 | 0.000 | 0.0% |
+| Headers (fixed-width ref info) | 192,261 | 0.478 | 20.6% |
+| Copy positions (3-way adaptive) | 200,766 | 0.499 | 21.6% |
+| Additions (adaptive: STOP-delta or intervals) | 322,296 | 1.003 | 34.6% |
+| Raw (adaptive: STOP-delta or intervals) | 135,995 | 0.338 | 14.6% |
+| Inter-cluster edges | 240 | 0.001 | 0.0% |
+| **Total** | **932,328** | **2.3191** | 100% |
+
+Ref used: 202,089 / 325,557 (62.1%). Copy modes: bitmap=103,151 blocks=43,352 complement=55,586.
+
+#### Optimization History (K=1 progression)
 
 Ordering: Leiden fine clustering + per-cluster LLP, K=8 unless noted.
 
@@ -483,9 +563,10 @@ Ordering: Leiden fine clustering + per-cluster LLP, K=8 unless noted.
 | + Adaptive raw (MIL=2) | 1 | 2.617 | −0.049 | 1,028 KB |
 | + Adaptive adds+raw (MIL=2) | 1 | 2.550 | −0.116 | 1,001 KB |
 | + 2-way adaptive copy (bitmap vs copy-blocks) | 1 | 2.497 | −0.053 | 981 KB |
-| **+ 3-way adaptive copy (+ complement)** | **1** | **2.4341** | **−0.063** | **956 KB** |
+| + 3-way adaptive copy (+ complement) | 1 | 2.4341 | −0.063 | 956 KB |
+| **K=2, no LLP** | **2** | **2.3191** | **−0.115** | **932 KB** |
 
-**Total improvement**: 4.307 → 2.4341 BPE (−43.5% over 11 independent optimizations).
+**Total improvement**: 4.307 → 2.3191 BPE (−46.2% over 12 independent optimizations). The final K=2 step uses Leiden K=2 partitioning without global LLP, which produces better per-cluster locality than K=1 with the same LLP ordering.
 
 Note: each adaptive optimization targets a different section (adds, raw, copy positions), and their savings are additive. Window size w=64 is optimal: w=128 adds +1 bit/ref-delta in headers (+26 KB) but saves only 23 KB in adds+raw — net negative. All roundtrips verified OK.
 
@@ -562,21 +643,21 @@ Adaptive savings vs fixed-encoding baseline (2.666 BPE): copy −21,341 bytes, a
 
 62.5% of vertices (203,615 / 325,557) use reference encoding.
 
-### Comparison with WebGraph BV
+### Comparison with WebGraph BV (CNR-2000)
 
-| Component | RCGE K=1 + 3-Way Adaptive | RCGE K=1 + 2-Way Adaptive | RCGE K=1 + Adds/Raw Adaptive | RCGE K=1 + EF | WebGraph BV |
-|-----------|---------------------------|---------------------------|------------------------------|---------------|-------------|
-| Membership / structure | 0.000 BPE | 0.000 BPE | 0.000 BPE | 0.221 BPE | ~0.078 BPE |
-| Headers | 0.481 BPE | 0.481 BPE | 0.481 BPE | 0.481 BPE | ~0.126 BPE |
-| Copy positions | 0.572 BPE | 0.635 BPE | 0.688 BPE | 0.688 BPE | ~0.556 BPE |
-| Residuals/additions | 1.052 BPE | 1.052 BPE | 1.052 BPE | 1.119 BPE | ~1.583 BPE |
-| Raw / non-referenced | 0.329 BPE | 0.329 BPE | 0.329 BPE | 0.377 BPE | ~0.554 BPE |
-| Inter-cluster | 0.001 BPE | 0.001 BPE | 0.001 BPE | 0.001 BPE | — |
-| **Total** | **2.4341 BPE** | **2.497 BPE** | **2.550 BPE** | **2.887 BPE** | **2.897 BPE** |
+| Component | RCGE K=2 (best) | RCGE K=1 + 3-Way Adaptive | RCGE K=1 + EF | WebGraph BV |
+|-----------|-----------------|---------------------------|---------------|-------------|
+| Membership / structure | 0.000 BPE | 0.000 BPE | 0.221 BPE | ~0.078 BPE |
+| Headers | 0.478 BPE | 0.481 BPE | 0.481 BPE | ~0.126 BPE |
+| Copy positions | 0.499 BPE | 0.572 BPE | 0.688 BPE | ~0.556 BPE |
+| Residuals/additions | 1.003 BPE | 1.052 BPE | 1.119 BPE | ~1.583 BPE |
+| Raw / non-referenced | 0.338 BPE | 0.329 BPE | 0.377 BPE | ~0.554 BPE |
+| Inter-cluster | 0.001 BPE | 0.001 BPE | 0.001 BPE | — |
+| **Total** | **2.3191 BPE** | **2.4341 BPE** | **2.887 BPE** | **2.897 BPE** |
 
-RCGE + 3-way adaptive encoding beats WebGraph BV by **0.463 BPE**. The reference encoding (copy + headers) is much more effective in RCGE because the two-step Leiden + per-cluster LLP ordering creates dense locality — 62.5% of vertices can reference a recent neighbor, vs ~56% for WebGraph's bisection ordering. The 3-way adaptive copy positions (bitmap / copy-blocks / complement) reduces the copy section from 0.688 to 0.572 BPE: complement encoding dominates for the 49% of ref vertices with ≥90% overlap, where encoding 2–3 skipped positions costs far less than a full copy-blocks list of 18–20 entries.
+RCGE K=2 beats WebGraph BV by **0.578 BPE** (20.0% reduction). The K=2 split uses **no within-cluster LLP** — the crawl-order locality within each Leiden community is already excellent for CNR-2000, and within-cluster LLP actually hurts by +0.290 BPE (see finding #17).
 
-### Greedy Approach Comparison
+### Greedy Approach Comparison (CNR-2000)
 
 | Approach | Ordering | Window | BPE |
 |----------|----------|--------|-----|
@@ -587,11 +668,29 @@ RCGE + 3-way adaptive encoding beats WebGraph BV by **0.463 BPE**. The reference
 | WebGraph BV | Greedy bisection | 7 | 2.897 |
 | RCGE (K=1, EF) | Leiden + per-cluster LLP | 64 | 2.887 |
 | RCGE (K=1, implicit ranges) | Leiden + per-cluster LLP | 64 | 2.666 |
-| RCGE (K=1, adaptive adds+raw) | Leiden + per-cluster LLP | 64 | 2.550 |
-| RCGE (K=1, 2-way adaptive copy) | Leiden + per-cluster LLP | 64 | 2.497 |
-| **RCGE (K=1, 3-way adaptive copy)** | **Leiden + per-cluster LLP** | **64** | **2.4341** |
+| RCGE (K=1, 3-way adaptive copy) | Leiden + per-cluster LLP | 64 | 2.4341 |
+| **RCGE (K=2, no LLP)** | **Leiden (crawl order within clusters)** | **64** | **2.3191** |
 
-The greedy encoder now beats WebGraph BV (2.881 vs 2.897 BPE) with its best configuration (adaptive_copy + stop_deltas + empty_prefix + compact_copy + vlc2 + tight_intervals). The remaining 0.45 BPE gap to RCGE is from RCGE's per-cluster local vertex indexing and hierarchical encoding, which create fundamentally tighter locality than the single-pass greedy approach.
+### enwiki-2013
+
+**Graph**: 4,203,325 vertices (4,206,785 with isolates), 101,355,853 edges (English Wikipedia 2013 link graph).
+**WebGraph reference**: BV standard = 13.114 BPE, BV-HC (high compression) = 12.639 BPE.
+
+#### Best Result: 12.4854 BPE (K=1, LLP, intervals + LR split)
+
+Uses K=1 (single cluster) with global LLP reordering (10 passes), interval+residual encoding (`intra_intervals=true`), and left/right residual split (`intra_lr_split=true`). The reference window is 64.
+
+| Configuration | BPE | Bytes | vs BV-HC |
+|---------------|-----|-------|----------|
+| WebGraph BV standard (w=7, zeta-3) | 13.114 | 166,148,696 | +0.475 |
+| WebGraph BV-HC (high compression) | 12.639 | — | — |
+| RCGE K=1, intervals, no LR split | 12.927 | 163,782,982 | +0.288 |
+| **RCGE K=1, intervals + LR split** | **12.485** | **158,184,071** | **−0.154** |
+
+The LR split saves **0.442 BPE** on enwiki-2013 (3.4% reduction), pushing RCGE below the WebGraph BV-HC baseline. This is a larger saving than on CNR-2000 because enwiki-2013 has higher average degree (24.1 vs 9.9) and more residuals per vertex after interval extraction, amplifying the benefit of better first-value encoding.
+
+Encoding time: ~38 minutes with 16 threads (Julia `--threads=auto`).
+Ref used: 3,560,563 / 4,203,325 (84.7%).
 
 ---
 
@@ -599,7 +698,7 @@ The greedy encoder now beats WebGraph BV (2.881 vs 2.897 BPE) with its best conf
 
 1. **Vertex ordering is the dominant factor** (+1.43 BPE advantage over unordered greedy). The two-step approach — Leiden community detection creates ~34K tight fine clusters of ~9 vertices each, then per-cluster LLP ordering makes consecutive vertices share 80–90% of neighbors — is what enables RCGE to beat WebGraph.
 
-2. **K=1 is the optimal cluster count** (−0.104 BPE from K=8 to K=1). At K=1, there are 2 effective top-level groups. Membership cost drops from 0.318 to 0.221 BPE (Elias-Fano) or to 0.000 BPE (implicit ranges). Inter-cluster becomes negligible (241 bytes). Intra encoding quality is unaffected — the reference window operates locally within each group's LLP-ordered sequence regardless of group count.
+2. **K=2 is the optimal cluster count for CNR-2000** (2.3191 BPE vs 2.4341 for K=1). The two-level Leiden split produces two clusters where the original crawl order already provides excellent locality — no within-cluster LLP is needed (LLP actually hurts, see finding #17). Membership cost is 0.000 BPE with implicit ranges (two contiguous ID ranges). For datasets where K=2 is infeasible or unhelpful (e.g., enwiki-2013 at 4.2M vertices), K=1 with global LLP remains effective. The general principle: reducing from K=8 to K=1 saves −0.104 BPE (membership 0.318 → 0.000 BPE with implicit ranges, inter-cluster negligible at 241 bytes).
 
 8b. **Implicit ranges membership** (−0.221 BPE). When vertices are pre-relabeled so the two K=1 groups occupy contiguous ID ranges [1..S₁] and [S₁+1..N], membership can be encoded as just two size varints (7 bytes) instead of Elias-Fano sorted lists (88,764 bytes). The key implementation insight: `encode_level` always re-sorts cluster arrays by vertex ID internally, so the pre-relabeling must use **vertex-ID rank** within each group (not LLP rank) to preserve bit-for-bit identical intra encoding. With this approach, the intra section is completely unchanged and only the membership section is eliminated.
 
@@ -628,3 +727,9 @@ The greedy encoder now beats WebGraph BV (2.881 vs 2.897 BPE) with its best conf
 14. **Smart ref-delta encoding (delta=1 shorthand) is harmful** (+0.040 BPE). The intuition was that delta=1 (reference immediately preceding vertex) would dominate and could be encoded as just 2 bits instead of 7. In practice, **only 6% of ref vertices use delta=1**. The actual distribution is near-uniform over [1,64]: delta=49–64 is the largest bucket at 35.8%, and small deltas (1–4) account for only 17% combined. This confirms finding #10: the LLP-ordered large top-level group has useful references spread throughout the entire 64-vertex window, not concentrated at delta=1. Encoding delta=1 in 2 bits saves 5 bits for 6% of refs but costs 1 extra bit for the remaining 94%, netting +0.64 bits/ref × 203K refs = +16 KB ≈ +0.040 BPE.
 
 15. **Elias-Fano for copy positions is harmful** (+0.034 BPE). EF was expected to help for large `ref_len` with scattered copied positions (e.g., k=10 scattered copies in ref_len=64 costs ~51 bits in EF vs 64 bits bitmap vs ~95 bits copy-blocks). In practice, EF is chosen for only **0.4% of ref vertices** (753 out of 203,615) — far too few to compensate for the mode-bit overhead. The flat 2-bit mode scheme (to accommodate a 4th mode) adds 1 extra bit for all 124,864 bitmap vertices (+15.6 KB), while 753 EF-mode vertices save only ~2 KB. The root cause: most ref vertices fall into the three cases already handled well by the existing 3-way adaptive — small ref_len (bitmap wins), high overlap (complement wins), or run-structured positions (copy-blocks wins). The large-ref_len + scattered regime where EF would excel is rare in this dataset.
+
+16. **Left/right residual split** (−0.113 BPE on CNR-2000 K=1, −0.442 BPE on enwiki-2013 K=1). After interval extraction, remaining residuals are split at the vertex's own ID into left (< vertex_id) and right (> vertex_id) halves. Each half is transformed to ascending distances from vertex_id (left: `vertex_id − val`, reversed; right: `val − vertex_id`) and delta-encoded independently. This replaces zigzag encoding of the first residual value: instead of one potentially large zigzag-encoded signed offset, LR split produces two streams where the first value in each is a small positive distance (typically 1–10). Overhead is one Fibonacci-encoded `left_count` per list (~2–4 bits). The benefit scales with average degree — enwiki-2013 (avg degree 24.1) has more residuals per vertex than CNR-2000 (avg degree 9.9), so the saving is proportionally larger. On enwiki-2013, LR split pushes RCGE to **12.485 BPE**, surpassing the WebGraph BV-HC baseline (12.639 BPE) by 0.154 BPE.
+
+17. **Within-cluster LLP is harmful for CNR-2000 K=2** (+0.290 BPE). With the Leiden K=2 split, applying LLP within each cluster degrades compression from 2.3191 to 2.6087 BPE. The crawl order within each Leiden community already provides strong locality for CNR-2000 — consecutive vertices in crawl order share many neighbors because the web crawler traverses links locally. LLP disrupts this natural ordering by rearranging vertices based on label propagation, which optimizes for a different notion of locality. This is dataset-specific: for enwiki-2013 (K=1), global LLP is essential because Wikipedia articles are not crawl-ordered. The key insight is that the optimal vertex ordering depends on both the dataset's inherent structure and the clustering strategy.
+
+18. **Intervals + LR split are harmful for CNR-2000 K=2** (+0.167 BPE). Even with the LR split improvement, enabling interval+residual encoding on the best K=2 config (no within-cluster LLP) increases BPE from 2.3191 to 2.4865. The full comparison on the same Leiden partition: K=2 baseline 2.3191, K=2 + intervals 2.4865 (+0.167), K=2 + intervals + LLP 2.8093 (+0.490), K=2 + intervals + LR + LLP 2.7460 (+0.427). The STOP-delta encoding with zigzag first values remains superior for CNR-2000's short intra-cluster neighbor lists (avg degree 9.9), where interval detection overhead is not amortized. LR split helps on datasets with higher average degree (enwiki-2013, avg 24.1) where more residuals exist after interval extraction.

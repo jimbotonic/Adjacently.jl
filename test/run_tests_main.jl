@@ -43,7 +43,7 @@ using Adjacently.Compression: write_unary_coding, write_truncated_binary_coding,
 encode_huffman_tree!, decode_huffman_tree!, get_huffman_codes!, 
 write_elias_gamma, write_elias_delta, write_golomb, read_elias_gamma, read_elias_delta, read_golomb, 
 write_fibonacci, read_fibonacci, write_zeta, read_zeta, delta_encode_vector,
-write_encoded_value, read_encoded_value, write_run_length_delta, read_run_length_delta,
+write_encoded_value, read_encoded_value,
 write_compressed_graph_data, read_compressed_graph_data, write_delta, read_delta
 
 using Adjacently.Distribution: get_graph_entropy, get_degree_entropy, get_entropy, powerlaw_sample
