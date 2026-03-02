@@ -36,7 +36,6 @@ export write_unary_coding,
        write_truncated_binary_coding,
        write_encoded_value,
        read_encoded_value,
-       get_encoded_value,
        huffman_encoding,
        encode_huffman_tree!,
        decode_huffman_tree!,
@@ -65,8 +64,6 @@ export write_unary_coding,
        read_zeta,
        write_fed,
        read_fed,
-       write_run_length_delta,
-       read_run_length_delta,
        compress_intervals,
        write_intervals_and_residuals,
        read_intervals_and_residuals,
@@ -270,32 +267,6 @@ function read_encoded_value(r::BitReader, compression::Symbol, ::Type{T}=UInt8) 
     else
         throw(ArgumentError("Invalid compression code: $compression"))
     end
-end
-
-"""
-    get_encoded_value(value::T, compression::Symbol, ::Type{T}=UInt8) where {T<:Unsigned}
-
-Get what a value would be after encoding and then decoding through a compression scheme.
-This is useful for comparing stop values with encoded stream values.
-
-@param value::T: the value to encode/decode
-@param compression::Symbol: the compression coding to use (:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta, :fed)
-@param T::Type: the type to return (default: UInt8)
-@return::T: the value as it would appear after encoding/decoding
-"""
-function get_encoded_value(value::T, compression::Symbol, ::Type{T}=UInt8) where {T<:Unsigned}
-    # Create temporary buffer to encode and decode
-    temp_io = IOBuffer()
-    temp_writer = BitWriter(temp_io)
-    
-    # Encode the value
-    write_encoded_value(temp_writer, value, compression)
-    flush_bitwriter(temp_writer; flush_last_bits=true)
-    
-    # Read it back
-    seekstart(temp_io)
-    temp_reader = BitReader(temp_io)
-    return read_encoded_value(temp_reader, compression, T)
 end
 
 ################################################################################
@@ -1273,61 +1244,6 @@ Returns (intervals, residuals) where intervals are consecutive ranges ≥ min_in
 
 
 """
-    compress_run_length(residuals::Vector{T}, min_run_length::Int=3) where {T<:Unsigned}
-
-Analyze residuals for run-length patterns in the gaps (deltas).
-Returns (run_length_pairs, final_residuals) where:
-- run_length_pairs: vector of (gap, count) tuples for repeated gaps
-- final_residuals: remaining values that don't have run-length patterns
-
-@param residuals::Vector{T}: sorted residual values (after interval extraction)
-@param min_run_length::Int: minimum number of repetitions to consider run-length encoding
-@return (Vector{Tuple{T,T}}, Vector{T}): run-length pairs and final residuals
-"""
-function compress_run_length(residuals::Vector{T}, min_run_length::Int=3) where {T<:Unsigned}
-    isempty(residuals) && return (Tuple{T,T}[], T[])
-    length(residuals) == 1 && return (Tuple{T,T}[], residuals)  # Single value, no patterns
-
-    # Convert residuals to deltas to detect repeated gap patterns
-    deltas = delta_encode_vector(residuals)
-
-    run_length_pairs = Tuple{T,T}[]  # (gap, count)
-    non_rl_values = T[]  # Values that don't form run-length patterns
-
-    i = 2  # Start from second delta (first is the initial value)
-    current_val = residuals[1]
-    push!(non_rl_values, current_val)  # First value always goes to residuals
-
-    while i <= length(deltas)
-        # Count consecutive occurrences of the same gap
-        current_gap = deltas[i]
-        run_count = 1
-
-        while i + run_count <= length(deltas) && deltas[i + run_count] == current_gap
-            run_count += 1
-        end
-
-        if run_count >= min_run_length
-            # Use run-length encoding: store gap and count
-            # The run-length pair means: "repeat gap 'current_gap' for 'run_count' times"
-            push!(run_length_pairs, (current_gap, T(run_count)))
-            # Update current value
-            current_val = current_val + current_gap * T(run_count)
-            i += run_count
-        else
-            # Add these values to final residuals
-            for j in 0:(run_count-1)
-                current_val = current_val + deltas[i + j]
-                push!(non_rl_values, current_val)
-            end
-            i += run_count
-        end
-    end
-
-    return (run_length_pairs, non_rl_values)
-end
-
-"""
     write_intervals_and_residuals(w::BitWriter, neighbors::Vector{T}, encoding::Symbol, min_interval_length::Int=4) where {T<:Unsigned}
 
 Write neighbor list using interval + run-length + residual encoding.
@@ -1573,216 +1489,9 @@ function read_delta(r::BitReader, encoding::Symbol, ::Type{T}=UInt8; max_element
     return lst
 end
 
-"""
-    write_run_length_delta(w::BitWriter, compression::Symbol, lst::Vector{T}) where {T<:Unsigned}
-
-Write a run-length + delta code to the bitwriter.
-
-- [flag 0: 1 bit][delta: varint]  // delta
-- [flag 1: 1 bit][value: varint][length: varint]   // run
-
-@param w::BitWriter: the bitwriter
-@param encoding::Symbol: the compression coding to use (:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta)
-@param lst::Vector{T}: the list of vertex IDs to write
-
-"""
-function write_run_length_delta(w::BitWriter, encoding::Symbol, lst::Vector{T}) where {T<:Unsigned}
-    # if the list is empty, return
-    isempty(lst) && return
-
-    # delta encoding
-    delta_lst = delta_encode_vector(lst)
-
-    # write the first value (not delta encoded)
-    # NB: we assume that the first value is not 0
-    write_encoded_value(w, delta_lst[1], encoding)
-
-    # write the rest of the values
-    i = 2
-    while i <= length(delta_lst)
-        current_value = delta_lst[i]
-
-        # check for consecutive equal values (run)
-        run_length = 1
-        while i + run_length <= length(delta_lst) && delta_lst[i + run_length] == current_value
-            run_length += 1
-        end
-
-        if run_length >= 3  # only use run-length for 3+ consecutive values
-            # flag 1: run-length encoding
-            write_bit(w, true)
-            # encode the run length
-            write_encoded_value(w, T(run_length), encoding)
-            # encode the value shifted by 1 to avoid zeros
-            write_encoded_value(w, current_value + T(1), encoding)
-            i += run_length
-        else
-            # flag 0: delta encoding
-            write_bit(w, false)
-            # encode the delta value shifted by 1 to avoid zeros
-            write_encoded_value(w, current_value + T(1), encoding)
-            i += 1
-        end
-    end
-end
-
-"""
-    read_run_length_delta(r::BitReader, encoding::Symbol, ::Type{T}=UInt8; max_elements::Union{Nothing,Int}=nothing, stop_value::Union{Nothing,T}=nothing) where {T<:Unsigned}
-
-Read a run-length + delta code from the bit reader.
-
-- [flag 0: 1 bit][delta: varint]  // delta
-- [flag 1: 1 bit][value: varint][length: varint]   // run
-
-@param r::BitReader: the bit reader
-@param encoding::Symbol: the compression coding to use (:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta)
-@param T::Type: the type to return (default: UInt8)
-@param max_elements::Union{Nothing,Int}: maximum number of elements to read (for index mode)
-@param stop_value::Union{Nothing,T}: value that signals end of list (for children mode)
-@return::Vector{T}: the decoded list
-
-"""
-function read_run_length_delta(r::BitReader, encoding::Symbol, ::Type{T}=UInt8; max_elements::Union{Nothing,Int}=nothing, stop_value::Union{Nothing,T}=nothing) where {T<:Unsigned}
-    # if the list is empty (immediate end of stream), return empty
-    delta_lst = T[]
-    
-    # Pre-compute encoded stop value for comparison
-    encoded_stop_value = nothing
-    if stop_value !== nothing
-        encoded_stop_value = get_encoded_value(stop_value, encoding, T)
-    end
-    
-    try
-        # read the first value (not delta encoded)
-        # NB: we assume that the first value is not 0
-        first_value = read_encoded_value(r, encoding, T)
-
-        # if the first value is the stop value, return empty list
-        if encoded_stop_value !== nothing && first_value == encoded_stop_value
-            return T[]
-        end
-
-        push!(delta_lst, first_value)
-
-        # read the rest of the values
-        while true
-            # Check termination conditions
-            if max_elements !== nothing && length(delta_lst) >= max_elements
-                break
-            end
-            
-            # read the value flag (0: delta, 1: run-length)
-            flag = read_bit(r)
-            
-            if flag
-                # value flag 1: run-length encoding
-                # Format: [run_length: varint][value: varint]
-                run_length = Int(read_encoded_value(r, encoding, T))
-                value = read_encoded_value(r, encoding, T)
-                
-                # add the run to the delta list (unshift the data value)
-                for _ in 1:run_length
-                    # NB: no need to check for max_elements here => we copy the whole run-length
-                    push!(delta_lst, value - T(1))
-                end
-            else
-                # value flag 0: delta encoding
-                # Format: [delta_value: varint] (shifted by 1 to avoid zeros)
-                # NB: first value is assumed to be not 0
-                value = read_encoded_value(r, encoding, T)
-                
-                # Check for stop value (stop values are written as-is, not shifted)
-                if encoded_stop_value !== nothing && value == encoded_stop_value
-                    break
-                end
-
-                push!(delta_lst, value - T(1))
-            end
-        end
-    catch e
-        # end of stream reached, this is expected
-        if !isa(e, EOFError) && !isa(e, ErrorException)
-            rethrow(e)
-        end
-    end
-    
-    # reconstruct original values from delta encoding
-    isempty(delta_lst) && return T[]
-    
-    original_lst = T[delta_lst[1]]
-    for i in 2:length(delta_lst)
-        push!(original_lst, original_lst[end] + delta_lst[i])
-    end
-    
-    return original_lst
-end
-
 ################################################################################
 # Compressed graph data encoding
 ################################################################################
-
-"""
-    write_mix_encoded_list(w::BitWriter, delta_list::Vector{T}, encoding::Symbol, use_mix_mode::Bool=true) where {T<:Unsigned}
-
-Write a list using mix mode (delta + run-length) following FORMAT_SPECS.md exactly.
-This function implements the core mix mode format used by both index and children modes.
-
-@param w::BitWriter: the bitwriter
-@param delta_list::Vector{T}: the list of values to write
-@param encoding::Symbol: the compression coding to use for values (:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta)
-@param use_mix_mode::Bool: whether to use mix mode (default: true)
-
-"""
-function write_mix_encoded_list(w::BitWriter, delta_list::Vector{T}, encoding::Symbol, use_mix_mode::Bool=true) where {T<:Unsigned}
-    # Handle empty list case first - don't call this function for empty lists!
-    if isempty(delta_list)
-        error("write_mix_encoded_list should not be called with empty lists - handle empty lists at caller level")
-    end
-    
-    # write mix mode flag
-    write_bit(w, use_mix_mode)
-    
-    # write the first value
-    write_encoded_value(w, delta_list[1], encoding)
-    
-    if use_mix_mode
-        # mix mode: write vertex flags and values
-        i = 2
-        while i <= length(delta_list)
-            current_value = delta_list[i]
-            
-            # count consecutive occurrences of current_value
-            run_length = 0
-            j = i
-            while j <= length(delta_list) && delta_list[j] == current_value
-                run_length += 1
-                j += 1
-            end
-            
-            # run-length encoding is used for 3+ consecutive values
-            if run_length >= 3
-                # vertex flag = 1 (run-length encoding)
-                write_bit(w, true)
-                # run length
-                write_encoded_value(w, T(run_length), encoding)
-                # value
-                write_encoded_value(w, current_value, encoding)
-                i += run_length
-            else
-                # vertex flag = 0 (delta encoding)
-                write_bit(w, false)
-                # value
-                write_encoded_value(w, current_value, encoding)
-                i += 1
-            end
-        end
-    else
-        # delta-only: write remaining values directly
-        for i in 2:length(delta_list)
-            write_encoded_value(w, delta_list[i], encoding)
-        end
-    end
-end
 
 """
     write_hybrid_mix_encoded_list(w::BitWriter, delta_list::Vector{T}, encoding::Symbol, use_run_length_and_interval::Bool=true, min_interval_length::Int=MIN_INTERVAL_LENGTH, is_children_mode::Bool=false) where {T<:Unsigned}
@@ -2104,142 +1813,6 @@ end
 
 
 """
-    read_mix_encoded_list(r::BitReader, encoding::Symbol, mode::Symbol, ::Type{T}=UInt8; stop_value::Union{T,Nothing}=nothing, max_elements::Union{Int,Nothing}=nothing) where {T<:Unsigned}
-
-Read a mix-encoded list that exactly matches the write_mix_encoded_list format.
-This handles proper termination and value reconstruction according to the new format specifications.
-
-@param r::BitReader: the bitreader
-@param coding_scheme::Symbol: the coding scheme (:children or :index)
-@param integer_encoding::Symbol: the integer encoding used (:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta)
-@param T::Type: the unsigned integer type to use
-@param max_elements: If provided, stop reading after this many elements have been reconstructed (>= 1 for index mode)
-@param stop_value: If provided, stop reading when this encoded value is encountered in the stream (for children mode)
-
-@return Vector{T}: the reconstructed list
-
-"""
-function read_mix_encoded_list(r::BitReader, coding_scheme::Symbol, integer_encoding::Symbol, ::Type{T}=UInt8; max_elements::Union{Int,Nothing}=nothing, stop_value::Union{T,Nothing}=nothing) where {T<:Unsigned}
-    # read mix mode flag
-    use_mix_mode = read_bit(r)
-    
-    # read the first value from stream
-    first_value = read_encoded_value(r, integer_encoding, T)
-    
-    # check if first value is the stop value (encoded)
-    if stop_value !== nothing
-        if first_value == stop_value
-            # this is a stop value, indicating empty list
-            return T[]
-        end
-    end
-    
-    delta_list = T[first_value]
-    
-    if use_mix_mode
-        # mix mode: read vertex flags and values
-        while true
-            # check termination conditions
-            if max_elements !== nothing && length(delta_list) >= max_elements
-                break
-            end
-            
-            # try to read vertex flag
-            try
-                vertex_flag = read_bit(r)
-               
-                # run-length encoding
-                if vertex_flag 
-                    # read the run length and the value
-                    run_length = Int(read_encoded_value(r, integer_encoding, T))
-                    value = read_encoded_value(r, integer_encoding, T)
-                    
-                    # add the run to the delta list
-                    for _ in 1:run_length
-                        if max_elements !== nothing && length(delta_list) >= max_elements
-                            break
-                        end
-                        push!(delta_list, value)
-                    end
-                # delta-only mode
-                else  
-                    # read the delta value
-                    delta_value = read_encoded_value(r, integer_encoding, T)
-                    
-                    # check for stop value (stop values are written as-is, not shifted)
-                    if stop_value !== nothing
-                        if delta_value == stop_value
-                            # hit stop value, terminate reading
-                            break
-                        end
-                    end
-                    
-                    push!(delta_list, delta_value)
-                end
-            catch e
-                # end of available data - this is normal termination
-                if isa(e, ErrorException) || isa(e, EOFError)
-                    break
-                else
-                    rethrow(e)
-                end
-            end
-        end
-    # delta-only mode
-    else
-        # read remaining values
-        while true
-            # check termination conditions
-            if max_elements !== nothing && length(delta_list) >= max_elements
-                break
-            end
-            
-            # try to read next value
-            try
-                # NB: no vertex flag is written in delta-only mode
-                delta_value = read_encoded_value(r, integer_encoding, T)
-                
-                # check for stop value (stop values are written as-is, not shifted)
-                if stop_value !== nothing
-                    if delta_value == stop_value
-                        # hit stop value, terminate reading
-                        break
-                    end
-                end
-                
-                push!(delta_list, delta_value)
-            catch e
-                # end of available data - this is normal termination
-                if isa(e, ErrorException) || isa(e, EOFError)
-                    break
-                else
-                    rethrow(e)
-                end
-            end
-        end
-    end
-    
-    # apply mode-specific unshifting (reverse of what write function does)
-    if coding_scheme == :children && !isempty(delta_list)
-        # the write function applies delta_neighbors .+ T(1) in children mode, 
-        # so we need to reverse this: delta_list .- T(1)
-        delta_list = delta_list .- T(1)
-    end
-    
-    # reconstruct original values from delta encoding
-    if length(delta_list) <= 1
-        return delta_list
-    end
-    
-    original_list = T[delta_list[1]]
-    for i in 2:length(delta_list)
-        push!(original_list, original_list[end] + delta_list[i])
-    end
-    
-    return original_list
-end
-
-"""
     _consume_children_trailing_stop(r::BitReader, encoding::Symbol, ::Type{T}=UInt8) where {T<:Unsigned}
 
 Consume exactly one trailing stop marker in children mode, regardless of mix-mode.
@@ -2276,85 +1849,6 @@ function _consume_children_trailing_stop(r::BitReader, integer_encoding::Symbol,
     # read and discard exactly one encoded value (the stop value)
     _ = read_encoded_value(r, integer_encoding, T)
     return
-end
-
-"""
-    estimate_bitmap_rle_cost(bitmap::Vector{Bool}, varint::Symbol) where {T<:Unsigned}
-
-Estimate the bit cost of encoding a bitmap using RLE ones-delta encoding.
-Returns the estimated number of bits required.
-
-@param bitmap::Vector{Bool}: the bitmap to encode
-@param varint::Symbol: the integer encoding used (:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta)
-
-@return::Int: the estimated cost in bits
-"""
-function estimate_bitmap_rle_cost(bitmap::Vector{Bool}, varint::Symbol)
-    cost = 0
-
-    # Handle empty bitmap
-    if isempty(bitmap)
-        # length = 0 (encoded as 1)
-        cost += estimate_encoded_value_cost(UInt32(1), varint)
-        return cost
-    end
-
-    # Bitmap length (add 1 to avoid zero)
-    cost += estimate_encoded_value_cost(UInt32(length(bitmap)) + UInt32(1), varint)
-
-    # Find positions of 1s
-    ones_positions = UInt32[]
-    for (i, bit) in enumerate(bitmap)
-        if bit
-            push!(ones_positions, UInt32(i))
-        end
-    end
-
-    # Handle all-zeros bitmap
-    if isempty(ones_positions)
-        # ones_count = 0 (encoded as 1)
-        cost += estimate_encoded_value_cost(UInt32(1), varint)
-        return cost
-    end
-
-    # Number of 1s (add 1 to avoid zero)
-    cost += estimate_encoded_value_cost(UInt32(length(ones_positions)) + UInt32(1), varint)
-
-    # Compute deltas
-    deltas = UInt32[]
-    push!(deltas, ones_positions[1])  # First position (absolute)
-    for i in 2:length(ones_positions)
-        push!(deltas, ones_positions[i] - ones_positions[i-1])
-    end
-
-    # Estimate RLE ones-deltas cost
-    # Count runs of 1s
-    token_count = 0
-    i = 1
-    while i <= length(deltas)
-        if deltas[i] == 1
-            # Count consecutive 1s
-            run_len = 0
-            while i <= length(deltas) && deltas[i] == 1
-                run_len += 1
-                i += 1
-            end
-            token_count += 1
-            # flag bit + run length
-            cost += 1 + estimate_encoded_value_cost(UInt32(run_len), varint)
-        else
-            # Literal delta
-            token_count += 1
-            # flag bit + delta value
-            cost += 1 + estimate_encoded_value_cost(deltas[i], varint)
-            i += 1
-        end
-    end
-
-    # Token count
-    cost += estimate_encoded_value_cost(UInt32(token_count), varint)
-
-    return cost
 end
 
 """
@@ -3150,64 +2644,6 @@ function read_compressed_graph_data(r::BitReader, vs::T, coding_scheme::Symbol=:
     end
     
     return neighbor_lists
-end
-
-"""
-    find_best_reference(target::Vector{T}, ref_index::Union{Index.StreamInvertedIndex{T}, Nothing}, 
-                       stream_id_to_vertex::Dict{T,T}, work::Union{Index.OverlapWorkspace{T}, Nothing},
-                       available::Set{T}) where {T<:Unsigned}
-
-Find the best reference vertex for the target neighbor list using StreamingInvertedIndex with pre-built workspace.
-This optimized version reuses workspace and reverse mapping to eliminate per-query overhead.
-
-@param target::Vector{T}: the neighbor list to encode  
-@param ref_index::Union{StreamInvertedIndex{T}, Nothing}: pre-built inverted index with reference candidates
-@param stream_id_to_vertex::Dict{T,T}: pre-built mapping from stream IDs to vertex IDs
-@param work::Union{OverlapWorkspace{T}, Nothing}: pre-allocated workspace for overlap computation
-@param available::Set{T}: vertices that can serve as references (already encoded)
-
-@return::Union{T, Nothing}: the best reference vertex ID or nothing if no good reference
-"""
-function find_best_reference(target::Vector{T}, ref_index::Union{Index.StreamInvertedIndex{T}, Nothing}, 
-                           stream_id_to_vertex::Dict{T,T}, work::Union{Index.OverlapWorkspace{T}, Nothing},
-                           available::Set{T}) where {T<:Unsigned}
-    # skip if no index available, no workspace, no candidates available, or target too small
-    if ref_index === nothing || work === nothing || isempty(available) || length(target) <= 2
-        return nothing
-    end
-    
-    # compute overlaps with all candidates in the index (reusing workspace)
-    counts, touched = Index.overlap!(ref_index, target, work)
-    
-    if isempty(touched)
-        return nothing
-    end
-    
-    # find best overlap among available references only
-    best_ref = nothing
-    best_overlap = 0
-    
-    for stream_id in touched
-        overlap_count = counts[stream_id]
-        
-        # look up corresponding vertex ID using pre-built mapping
-        if haskey(stream_id_to_vertex, stream_id)
-            vertex_id = stream_id_to_vertex[stream_id]
-            
-            # skip if this candidate is not available as reference or overlap too low
-            if vertex_id in available && overlap_count > best_overlap
-                best_overlap = overlap_count
-                best_ref = vertex_id
-            end
-        end
-    end
-    
-    # apply threshold: use reference only if overlap exceeds REF_ENCODING_TH
-    if best_overlap >= REF_ENCODING_TH
-        return best_ref
-    end
-    
-    return nothing
 end
 
 ################################################################################
@@ -4795,23 +4231,6 @@ function find_best_reference_fast(target::Vector{T}, ref_index::Union{Index.Stre
     end
 
     return best_overlap >= REF_ENCODING_TH ? best_ref : nothing
-end
-
-"""
-    create_reference_data(target::Vector{T}, reference::Vector{T}) where {T<:Unsigned}
-
-Create copy bitmap and residuals for reference encoding.
-
-@param target::Vector{T}: the target neighbor list
-@param reference::Vector{T}: the reference neighbor list  
-
-@return::Tuple{Vector{Bool}, Vector{T}}: (copy_bitmap, residuals)
-"""
-function create_reference_data(target::Vector{T}, reference::Vector{T}) where {T<:Unsigned}
-    # backward-compatible wrapper allocating fresh buffers
-    work = RefBuildWorkspace{T}()
-    create_reference_data!(work, target, reference)
-    return work.copy_bitmap, work.residuals
 end
 
 """

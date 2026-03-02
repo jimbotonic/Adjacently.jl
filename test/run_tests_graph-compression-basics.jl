@@ -15,147 +15,6 @@
 
 include("run_tests_main.jl")
 
-# Temporarily commenting out failing tests
-# @testset "Run-length + delta encoding (basics)" begin
-	# Test with different encodings
-	encodings = [:elias_gamma, :elias_delta, :fibonacci, :zeta] 
-	
-	for encoding in encodings
-		@info "Testing basic run-length + delta with $encoding..."
-		
-		# Test 1: Simple sequential list
-		@testset "$encoding - Simple sequential" begin
-			original = UInt16[1, 2, 3, 4, 5]
-			
-			io = IOBuffer()
-			writer = BitWriter(io)
-			write_run_length_delta(writer, encoding, original)
-			flush_bitwriter(writer; flush_last_bits=true)
-			
-			# Debug: check what was written
-			buffer_size = position(io)
-			seekstart(io)
-			buffer_content = read(io)
-			@info "  Encoded $(length(original)) elements to $buffer_size bytes: $buffer_content"
-			
-			seekstart(io)
-			reader = BitReader(io)
-			decoded = read_run_length_delta(reader, encoding, UInt16)
-			
-			@info "  Original: $original"
-			@info "  Decoded:  $decoded"
-			@test decoded == original
-			@info "  Sequential test: PASSED"
-		end
-		
-		# Test 2: List with repeated values (should trigger run-length encoding)
-		@testset "$encoding - Repeated values" begin
-			original = UInt16[10, 15, 15, 15, 15, 20, 25]  # Four consecutive 15s
-			
-			io = IOBuffer()
-			writer = BitWriter(io)
-			write_run_length_delta(writer, encoding, original)
-			flush_bitwriter(writer; flush_last_bits=true)
-			
-			seekstart(io)
-			reader = BitReader(io)
-			decoded = read_run_length_delta(reader, encoding, UInt8)
-			
-			@test decoded == original
-			@info "  Repeated values test: PASSED"
-		end
-		
-		# Test 3: Large gaps (good for delta encoding)
-		@testset "$encoding - Large gaps" begin
-			original = UInt16[1, 100, 200, 205, 210]
-			
-			io = IOBuffer()
-			writer = BitWriter(io)
-			write_run_length_delta(writer, encoding, original)
-			flush_bitwriter(writer; flush_last_bits=true)
-			
-			seekstart(io)
-			reader = BitReader(io)
-			decoded = read_run_length_delta(reader, encoding, UInt16)
-			
-			@test decoded == original
-			@info "  Large gaps test: PASSED"
-		end
-		
-		# Test 4: Single element
-		@testset "$encoding - Single element" begin
-			original = UInt16[42]
-			
-			io = IOBuffer()
-			writer = BitWriter(io)
-			write_run_length_delta(writer, encoding, original)
-			flush_bitwriter(writer; flush_last_bits=true)
-			
-			seekstart(io)
-			reader = BitReader(io)
-			decoded = read_run_length_delta(reader, encoding, UInt16)
-			
-			@test decoded == original
-			@info "  Single element test: PASSED"
-		end
-		
-		# Test 5: Empty list
-		@testset "$encoding - Empty list" begin
-			original = UInt16[]
-			
-			io = IOBuffer()
-			writer = BitWriter(io)
-			write_run_length_delta(writer, encoding, original)
-			flush_bitwriter(writer; flush_last_bits=true)
-			
-			seekstart(io)
-			reader = BitReader(io)
-			decoded = read_run_length_delta(reader, encoding, UInt16)
-			
-			@test decoded == original
-			@info "  Empty list test: PASSED"
-		end
-		
-		# Test 6: Long run-length sequence
-		@testset "$encoding - Long run-length" begin
-			original = UInt16[5, 10, 10, 10, 10, 10, 10, 10, 15, 20]  # Seven consecutive 10s
-			
-			io = IOBuffer()
-			writer = BitWriter(io)
-			write_run_length_delta(writer, encoding, original)
-			flush_bitwriter(writer; flush_last_bits=true)
-			
-			seekstart(io)
-			reader = BitReader(io)
-			decoded = read_run_length_delta(reader, encoding, UInt16)
-			
-			@test decoded == original
-			@info "  Long run-length test: PASSED"
-		end
-		
-		# Test 7: Mixed patterns
-		@testset "$encoding - Mixed patterns" begin
-			original = UInt16[1, 5, 5, 5, 10, 50, 100, 100, 150, 200, 200, 200, 200]
-			
-			io = IOBuffer()
-			writer = BitWriter(io)
-			write_run_length_delta(writer, encoding, original)
-			flush_bitwriter(writer; flush_last_bits=true)
-			
-			seekstart(io)
-			reader = BitReader(io)
-			decoded = read_run_length_delta(reader, encoding, UInt16)
-			
-			@test decoded == original
-			@info "  Mixed patterns test: PASSED"
-		end
-		
-		@info "All basic tests for $encoding: PASSED"
-	end
-	
-	@info "Basic run-length + delta encoding tests completed successfully!"
-# end
-
 @testset "Basic delta encoding" begin
 	# Test with different encodings
 	encodings = [:elias_gamma, :elias_delta, :fibonacci, :zeta] 
@@ -239,7 +98,7 @@ end
 			
 			io = IOBuffer()
 			writer = BitWriter(io)
-			write_compressed_graph_data(writer, neighbor_lists, encoding, :children, true, true)
+			write_compressed_graph_data(writer, neighbor_lists, :children, encoding, true, true)
 			flush_bitwriter(writer; flush_last_bits=true)
 			
 			# Debug: check what was written
@@ -248,7 +107,7 @@ end
 			
 			seekstart(io)
 			reader = BitReader(io)
-			decoded = read_compressed_graph_data(reader, UInt16(length(neighbor_lists)), encoding, :children, UInt16)
+			decoded = read_compressed_graph_data(reader, UInt16(length(neighbor_lists)), :children, encoding, UInt16)
 			
 			@info "  Original vertices: $(length(neighbor_lists))"
 			@info "  Decoded vertices:  $(length(decoded))"
@@ -270,12 +129,12 @@ end
 			
 			io = IOBuffer()
 			writer = BitWriter(io)
-			write_compressed_graph_data(writer, neighbor_lists, encoding, :children, true, true)
+			write_compressed_graph_data(writer, neighbor_lists, :children, encoding, true, true)
 			flush_bitwriter(writer; flush_last_bits=true)
 			
 			seekstart(io)
 			reader = BitReader(io)
-			decoded = read_compressed_graph_data(reader, UInt16(length(neighbor_lists)), encoding, :children, UInt16)
+			decoded = read_compressed_graph_data(reader, UInt16(length(neighbor_lists)), :children, encoding, UInt16)
 			
 			@test length(decoded) == length(neighbor_lists)
 			for v in keys(neighbor_lists)
@@ -293,12 +152,12 @@ end
 			
 			io = IOBuffer()
 			writer = BitWriter(io)
-			write_compressed_graph_data(writer, neighbor_lists, encoding, :children, true, true)
+			write_compressed_graph_data(writer, neighbor_lists, :children, encoding, true, true)
 			flush_bitwriter(writer; flush_last_bits=true)
 			
 			seekstart(io)
 			reader = BitReader(io)
-			decoded = read_compressed_graph_data(reader, UInt16(length(neighbor_lists)), encoding, :children, UInt16)
+			decoded = read_compressed_graph_data(reader, UInt16(length(neighbor_lists)), :children, encoding, UInt16)
 			
 			@test length(decoded) == length(neighbor_lists)
 			for v in keys(neighbor_lists)
@@ -314,12 +173,12 @@ end
 			
 			io = IOBuffer()
 			writer = BitWriter(io)
-			write_compressed_graph_data(writer, neighbor_lists, encoding, :children, true, true)
+			write_compressed_graph_data(writer, neighbor_lists, :children, encoding, true, true)
 			flush_bitwriter(writer; flush_last_bits=true)
 			
 			seekstart(io)
 			reader = BitReader(io)
-			decoded = read_compressed_graph_data(reader, UInt16(length(neighbor_lists)), encoding, :children, UInt16)
+			decoded = read_compressed_graph_data(reader, UInt16(length(neighbor_lists)), :children, encoding, UInt16)
 			
 			@test length(decoded) == 1
 			@test Set(decoded[UInt16(1)]) == Set(neighbor_lists[UInt16(1)])
@@ -335,12 +194,12 @@ end
 			
 			io = IOBuffer()
 			writer = BitWriter(io)
-			write_compressed_graph_data(writer, neighbor_lists, encoding, :children, true, true)
+			write_compressed_graph_data(writer, neighbor_lists, :children, encoding, true, true)
 			flush_bitwriter(writer; flush_last_bits=true)
 			
 			seekstart(io)
 			reader = BitReader(io)
-			decoded = read_compressed_graph_data(reader, UInt16(length(neighbor_lists)), encoding, :children, UInt16)
+			decoded = read_compressed_graph_data(reader, UInt16(length(neighbor_lists)), :children, encoding, UInt16)
 			
 			@test length(decoded) == length(neighbor_lists)
 			for v in keys(neighbor_lists)
@@ -359,12 +218,12 @@ end
 			
 			io = IOBuffer()
 			writer = BitWriter(io)
-			write_compressed_graph_data(writer, neighbor_lists, encoding, :children, true, true)
+			write_compressed_graph_data(writer, neighbor_lists, :children, encoding, true, true)
 			flush_bitwriter(writer; flush_last_bits=true)
 			
 			seekstart(io)
 			reader = BitReader(io)
-			decoded = read_compressed_graph_data(reader, UInt16(length(neighbor_lists)), encoding, :children, UInt16)
+			decoded = read_compressed_graph_data(reader, UInt16(length(neighbor_lists)), :children, encoding, UInt16)
 			
 			@test length(decoded) == length(neighbor_lists)
 			for v in keys(neighbor_lists)

@@ -22,7 +22,8 @@ using ..Graph: get_in_degrees, get_out_degrees, get_in_out_degrees, get_reverse_
 using ..PageRank: PR
 
 export relabel_graph, relabel_vertices, relabel_vertices_score, relabel_vertices_lexicographic, relabel_vertices_rcm, relabel_vertices_webgraph_lex,
-       relabel_vertices_llp, relabel_vertices_minhash, relabel_vertices_bisection
+       relabel_vertices_llp, relabel_vertices_minhash, relabel_vertices_bisection,
+       save_llp_ordering, load_llp_ordering
 
 """
     relabel_graph(g::AbstractGraph{T}, vertex_mapping::Vector{T}) where {T<:Unsigned}
@@ -895,6 +896,46 @@ function relabel_vertices_bfs(g::AbstractGraph{T}, start_vertex::Union{Nothing,T
     end
 
     return vertex_mapping
+end
+
+"""
+    save_llp_ordering(path, mapping, n)
+
+Save an LLP vertex ordering to a binary file.
+Format: Int32 header (number of vertices), followed by n UInt32 values
+where index = old vertex ID and value = new vertex ID.
+"""
+function save_llp_ordering(path::String, mapping::Dict{T,T}, n::Int) where {T}
+    ordering = Vector{UInt32}(undef, n)
+    for (old_id, new_id) in mapping
+        ordering[Int(old_id)] = UInt32(new_id)
+    end
+    open(path, "w") do f
+        write(f, Int32(n))
+        write(f, ordering)
+    end
+    @info "Saved LLP ordering to $path ($(filesize(path)) bytes)"
+end
+
+"""
+    load_llp_ordering(path, T)
+
+Load an LLP vertex ordering from a binary file.
+Returns a Dict{T,T} mapping old_id → new_id.
+"""
+function load_llp_ordering(path::String, ::Type{T}) where {T}
+    data = open(path, "r") do f
+        n = read(f, Int32)
+        ordering = Vector{UInt32}(undef, n)
+        read!(f, ordering)
+        ordering
+    end
+    mapping = Dict{T,T}()
+    for (old_id, new_id) in enumerate(data)
+        mapping[T(old_id)] = T(new_id)
+    end
+    @info "Loaded LLP ordering from $path ($(length(data)) vertices)"
+    return mapping
 end
 
 end # module

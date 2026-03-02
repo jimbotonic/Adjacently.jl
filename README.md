@@ -1,33 +1,89 @@
-# Adjancently.jl
+# Adjacently.jl
 
-Adjancently.jl is Julia library for the analysis of large complex directed networks.
+Adjacently.jl is a Julia library for the analysis and compression of large complex directed networks.
 
-## ASTRA Compression
+## MGS Graph Compression
 
-**ASTRA** (**A**daptive **STR**eaming **A**djacency) is a graph compression method for large-scale directed networks, inspired by the [WebGraph framework](http://webgraph.di.unimi.it/).
+Adjacently provides three compression methods for large-scale directed graphs, all stored in the **MGS** (Modified Graph Structure) v3 binary format. Each method writes a `.mgz` file with a 12-byte header that encodes graph type, coding scheme, integer encoding, and an option flag that identifies the compression approach. A single loader (`load_compressed_mgs3_graph`) reads the header and dispatches to the correct decoder.
 
-### Key Features
+The three methods share a common foundation inspired by the [WebGraph framework](http://webgraph.di.unimi.it/): sorted adjacency lists, delta encoding, reference copy from a sliding window, interval encoding for runs of consecutive neighbors, and variable-length integer codes (Fibonacci, Elias-Gamma/Delta, Golomb, Zeta, FED).
 
-- **Greedy Cost-Based Reference Selection**: Unlike WebGraph's overlap-based heuristics, ASTRA evaluates all candidate references in a sliding window and selects the one with minimum encoding cost
-- **Adaptive Bitmap Encoding**: Automatically chooses between block encoding (for sparse patterns) and raw encoding (for dense patterns) based on actual bit costs
-- **Recursive Reference Compression**: Supports multi-level reference chains for graphs with strong locality
-- **Variable-Length Integer Encoding**: Supports multiple schemes (Fibonacci, Elias-Gamma/Delta, Golomb, Zeta, FED)
-- **Mix Encoding**: Combines interval encoding and run-length encoding for residual neighbors
+### STD (Standard Greedy)
+
+Per-vertex greedy cost-based encoding. For each vertex the encoder evaluates every candidate reference in a sliding window and picks the combination of reference copy, intervals, and delta residuals with the lowest bit cost.
+
+Key features:
+- Greedy cost-based reference selection (minimum encoding cost, not just maximum overlap)
+- Adaptive bitmap encoding: per-reference choice between copy-blocks, raw bitmap, and complement
+- VLC v2 vertex header tags optimized for the most common encoding patterns
+- STOP-terminated delta lists (no per-vertex count prefix)
+- 1-bit empty-vertex prefix to skip isolated vertices
+
+```julia
+write_std_mgs3_graph(g, "output"; ref_window_size=64, copy_blocks=true,
+    adaptive_copy=true, stop_deltas=true, empty_prefix=true,
+    compact_copy=true, tight_intervals=true, vlc2=true)
+```
+
+### CS (Command Stream)
+
+Unified command-stream encoding. The encoder writes a sequence of commands per vertex using the same building blocks as STD but with a simpler (non-greedy) strategy. Internally forces stop-terminated deltas and adaptive copy-blocks.
+
+```julia
+write_cs_mgs3_graph(g, "output"; ref_window_size=64,
+    compact_copy=true, tight_intervals=true)
+```
+
+### RCGE (Reversible Coarsening Graph Encoding)
+
+Two-level coarsening approach that exploits community structure. The graph is partitioned into clusters (e.g. via Leiden); intra-cluster edges use reference encoding with adaptive copy-blocks, while inter-cluster edges use permutation-based encoding of the bipartite structure.
+
+```julia
+write_rcge_mgs3_graph(g, "output", clusters; params=RCGEParams(L=128, ...))
+```
 
 ### Performance
 
 On the CNR-2000 web graph (325,557 vertices, 3,216,152 edges):
-- **5.108 bits per edge**
-- **1.57 edges per byte** compression ratio
-- Perfect round-trip fidelity
 
-### Format
+| Method | Bits per edge | File size |
+|--------|--------------|-----------|
+| STD    | 2.88         | 1,157,508 bytes |
+| CS     | 2.88         | 1,157,224 bytes |
+| RCGE   | 2.43         | 978,562 bytes   |
 
-ASTRA graphs are stored in the MGS (Modified Graph Structure) format with the `OPTION_ASTRA` flag, which enables:
-1. Delta encoding for sorted adjacency lists
-2. Mix encoding (intervals + run-length) for residuals
-3. Greedy reference selection with adaptive bitmap compression
-4. Recursive reference support
+All methods achieve perfect round-trip fidelity.
+
+### MGS File Format
+
+The `.mgz` binary format uses a 12-byte header:
+
+```
+'MGS' (3 bytes) + version (2 bytes) + flags (2 bytes) + vertex count (5 bytes)
+```
+
+The option flags byte identifies the compression method:
+- `0x00`: uncompressed
+- `0x0F`: ASTRA (legacy)
+- `0x10`-`0x8F`: STD
+- `0x90`-`0x9F`: CS
+- `0xA0`-`0xAF`: RCGE
+- `0xFF`: Huffman (deprecated)
+
+### Loading
+
+All `.mgz` files are loaded through a single entry point:
+
+```julia
+# STD / CS — pass the same encoding flags used at write time
+g = load_compressed_mgs3_graph("graph.mgz";
+    copy_blocks=true, adaptive_copy=true, ref_window_size=64,
+    stop_deltas=true, empty_prefix=true, compact_copy=true,
+    tight_intervals=true, vlc2=true)
+
+# RCGE — pass the same RCGEParams used at write time
+g = load_compressed_mgs3_graph("graph.mgz"; rcge_params=params)
+```
 
 ### References
 
@@ -36,45 +92,37 @@ ASTRA graphs are stored in the MGS (Modified Graph Structure) format with the `O
 
 ## Tests
 
-The test suite is organized into several distinct test sets that can be run individually or all together. Use the following commands from the project root directory:
+The test suite is organized into individual test files. Run from the project root:
 
-### Run tests
-```
-julia --project=. test/run_tests_{test-name}.jl
+```bash
+# Run a specific test set
+julia --project test/run_tests_{test-name}.jl
 
-```
-
-### Run tests with verbose output
-
-Add the `-v` flag for verbose output:
-```
-julia -v run_tests_{test-name}.jl
+# Run the CNR-2000 compression roundtrip (STD, CS, RCGE)
+julia --project test/cnr_2000_best_known_compression.jl
 ```
 
-### Run tests in parallel
-Use the `-p` flag to run tests in parallel (requires multiple processors):
-```
-julia -p auto run_tests_{test-name}.jl
-```
+## Notebooks
 
-### List available test sets
+Interactive Jupyter notebooks are in `notebooks/`:
 
-To see all available test sets, run:
+| Notebook | Description |
+|----------|-------------|
+| `cnr-2000-compression.ipynb` | CNR-2000 compression roundtrip with STD, CS, and RCGE (parameter documentation) |
+| `Pagerank.ipynb` | PageRank computation on the Arxiv HEP-PH citation network |
+| `shortest_paths.ipynb` | Shortest path algorithms with diffusion-based exploration |
+| `shortest_paths2.ipynb` | Extended shortest path analysis |
 
-```
-julia --project -e 'using Test; include("test/runtests.jl"); println("\nAvailable test sets:"); for ts in Test.get_testset_string() println("- ", ts) end'
-```
-
-## Development
-
-### Launch notebooks
-```
+```julia
 julia> using IJulia
 julia> notebook()
 ```
 
+## Development
+
 ### Dependencies management
-```
+
+```julia
 pkg> activate .
 pkg> add {package-name}
 pkg> update

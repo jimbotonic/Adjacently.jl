@@ -26,7 +26,10 @@ using ..Compression: huffman_encoding, get_huffman_codes!, decode_huffman_values
 	delta_encode_vector, write_elias_coding, read_elias_coding,
 	write_golomb, read_golomb, write_fibonacci, read_fibonacci,
 	write_zeta, read_zeta, write_compressed_graph_data, read_compressed_graph_data,
-	write_greedy_graph_data, read_greedy_graph_data
+	write_greedy_graph_data, read_greedy_graph_data,
+	write_cmdstream_graph_data, read_cmdstream_graph_data
+
+using ..Compression.RCGE: encode_level, decode_level, RCGEParams, RCGEStats
 
 using ..Graph: get_basic_stats, get_in_out_degrees, get_out_degrees
 using ..Relabeling: relabel_vertices, relabel_graph
@@ -60,9 +63,18 @@ const INT_ENCODING_FIBONACCI = 0x6
 const OPTION_NONE = 0b00000000          # no options
 const OPTION_ASTRA = 0b00001111         # ASTRA: Adaptive Streaming Adjacency (greedy cost-based, adaptive bitmaps, recursive references)
 const OPTION_HUFFMAN = 0xFF             # Huffman compression (deprecated)
-# Greedy mode range: 0x10-0x8F (128 slots)
-const OPTION_GREEDY_BASE = 0x10
-const OPTION_GREEDY_MAX = 0x8F
+# STD (Standard greedy) range: 0x10-0x8F (128 slots)
+const OPTION_STD_BASE  = 0x10
+const OPTION_STD_MAX   = 0x8F
+# Aliases for backward compatibility
+const OPTION_GREEDY_BASE = OPTION_STD_BASE
+const OPTION_GREEDY_MAX  = OPTION_STD_MAX
+# Command Stream range: 0x90-0x9F (16 slots)
+const OPTION_CS_BASE   = 0x90
+const OPTION_CS_MAX    = 0x9F
+# RCGE range: 0xA0-0xAF (16 slots)
+const OPTION_RCGE_BASE = 0xA0
+const OPTION_RCGE_MAX  = 0xAF
 
 # maximum number of vertices
 MGS_MAX_SIZE = 0xffffffffff
@@ -152,14 +164,13 @@ export write_mgs3_graph,
        load_mgs3_graph,
        load_compressed_mgs3_graph,
        write_huffman_compressed_mgs3_graph,
-       write_elias_compressed_mgs3_graph,
-       write_golomb_compressed_mgs3_graph,
-	   write_fibonacci_compressed_mgs3_graph,
-	   write_zeta_compressed_mgs3_graph,
 	   write_complex_encoded_compressed_mgs3_graph,
 	   load_huffman_compressed_mgs3_graph,
 	   load_complex_encoded_compressed_mgs3_graph,
-	   load_greedy_mgs3_graph
+	   load_greedy_mgs3_graph,
+	   write_std_mgs3_graph,
+	   write_cs_mgs3_graph,
+	   write_rcge_mgs3_graph
 
 ################################################################################
 # Write uncompressed MGS v3 graph
@@ -725,6 +736,188 @@ function write_complex_encoded_compressed_mgs3_graph(g::AbstractGraph{T}, filena
 end
 
 ################################################################################
+# STD (Standard greedy) compressed MGS v3 graph
+################################################################################
+
+"""
+    write_std_mgs3_graph(g, filename; ...)
+
+Write graph in MGS v3 format with STD (Standard greedy) compression.
+Produces a `.mgz` file with proper MGS header (option_flags = OPTION_STD_BASE).
+"""
+function write_std_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString;
+		coding_scheme::Symbol=:children, integer_encoding::Symbol=:fibonacci,
+		ref_window_size::Int=64, copy_blocks::Bool=true, adaptive_copy::Bool=true,
+		stop_deltas::Bool=true, empty_prefix::Bool=true, compact_copy::Bool=true,
+		tight_intervals::Bool=true, vlc2::Bool=true) where {T<:Unsigned}
+	vs = vertices(g)
+	gs = convert(UInt64, length(vs))
+
+	if gs > MGS_MAX_SIZE
+		error("Input graph cannot have more than 2^40-1 vertices")
+	end
+
+	n_bits_v = convert(UInt8, ceil(log(2, gs)))
+	V = infer_uint_custom_type(n_bits_v)
+
+	option_flags = UInt8(OPTION_STD_BASE)
+	flag_byte1, flag_byte2 = create_header_flags(:directed, coding_scheme, integer_encoding, option_flags)
+
+	header_bytes = UInt8[
+		0x4d, 0x47, 0x53,
+		0x03, 0x00,
+		flag_byte1, flag_byte2,
+		(gs & 0xff), ((gs >> 8) & 0xff), ((gs >> 16) & 0xff), ((gs >> 24) & 0xff), ((gs >> 32) & 0xff)
+	]
+
+	f = open(filename * ".mgz", "w")
+	bw = BitWriter(f)
+
+	write_bytes(bw, header_bytes)
+
+	# Build sorted neighbor lists from graph
+	nls = Dict{V,Vector{V}}()
+	for v in vs
+		nls[V(v)] = sort([V(o) for o in outneighbors(g, v)])
+	end
+
+	@info("writing STD compressed graph data")
+	write_greedy_graph_data(bw, nls, coding_scheme, ref_window_size;
+		integer_encoding=integer_encoding, copy_blocks=copy_blocks,
+		adaptive_copy=adaptive_copy, stop_deltas=stop_deltas,
+		empty_prefix=empty_prefix, compact_copy=compact_copy,
+		tight_intervals=tight_intervals, vlc2=vlc2)
+
+	flush_bitwriter(bw; flush_last_bits=true)
+	close(f)
+end
+
+################################################################################
+# CS (Command Stream) compressed MGS v3 graph
+################################################################################
+
+"""
+    write_cs_mgs3_graph(g, filename; ...)
+
+Write graph in MGS v3 format with CS (Command Stream) compression.
+Produces a `.mgz` file with proper MGS header (option_flags = OPTION_CS_BASE).
+"""
+function write_cs_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString;
+		coding_scheme::Symbol=:children, integer_encoding::Symbol=:fibonacci,
+		ref_window_size::Int=64, compact_copy::Bool=true,
+		tight_intervals::Bool=true) where {T<:Unsigned}
+	vs = vertices(g)
+	gs = convert(UInt64, length(vs))
+
+	if gs > MGS_MAX_SIZE
+		error("Input graph cannot have more than 2^40-1 vertices")
+	end
+
+	n_bits_v = convert(UInt8, ceil(log(2, gs)))
+	V = infer_uint_custom_type(n_bits_v)
+
+	option_flags = UInt8(OPTION_CS_BASE)
+	flag_byte1, flag_byte2 = create_header_flags(:directed, coding_scheme, integer_encoding, option_flags)
+
+	header_bytes = UInt8[
+		0x4d, 0x47, 0x53,
+		0x03, 0x00,
+		flag_byte1, flag_byte2,
+		(gs & 0xff), ((gs >> 8) & 0xff), ((gs >> 16) & 0xff), ((gs >> 24) & 0xff), ((gs >> 32) & 0xff)
+	]
+
+	f = open(filename * ".mgz", "w")
+	bw = BitWriter(f)
+
+	write_bytes(bw, header_bytes)
+
+	# Build sorted neighbor lists from graph
+	nls = Dict{V,Vector{V}}()
+	for v in vs
+		nls[V(v)] = sort([V(o) for o in outneighbors(g, v)])
+	end
+
+	@info("writing CS compressed graph data")
+	write_cmdstream_graph_data(bw, nls, coding_scheme, ref_window_size;
+		integer_encoding=integer_encoding, compact_copy=compact_copy,
+		tight_intervals=tight_intervals)
+
+	flush_bitwriter(bw; flush_last_bits=true)
+	close(f)
+end
+
+################################################################################
+# RCGE (Reversible Coarsening Graph Encoding) compressed MGS v3 graph
+################################################################################
+
+"""
+    write_rcge_mgs3_graph(g, filename, clusters; ...)
+
+Write graph in MGS v3 format with RCGE compression.
+Produces a `.mgz` file with proper MGS header (option_flags = OPTION_RCGE_BASE).
+
+Parameters:
+- g: Input graph
+- filename: Output filename (without .mgz extension)
+- clusters: Partition as Vector{Vector{T}} of vertex clusters
+- params: RCGEParams encoding parameters
+"""
+function write_rcge_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString,
+		clusters::Vector{Vector{T}};
+		coding_scheme::Symbol=:children, integer_encoding::Symbol=:fibonacci,
+		params::RCGEParams=RCGEParams(),
+		progress::Union{Nothing,Function}=nothing) where {T<:Unsigned}
+	vs = vertices(g)
+	gs = convert(UInt64, length(vs))
+
+	if gs > MGS_MAX_SIZE
+		error("Input graph cannot have more than 2^40-1 vertices")
+	end
+
+	option_flags = UInt8(OPTION_RCGE_BASE)
+	flag_byte1, flag_byte2 = create_header_flags(:directed, coding_scheme, integer_encoding, option_flags)
+
+	header_bytes = UInt8[
+		0x4d, 0x47, 0x53,
+		0x03, 0x00,
+		flag_byte1, flag_byte2,
+		(gs & 0xff), ((gs >> 8) & 0xff), ((gs >> 16) & 0xff), ((gs >> 24) & 0xff), ((gs >> 32) & 0xff)
+	]
+
+	f = open(filename * ".mgz", "w")
+	bw = BitWriter(f)
+
+	write_bytes(bw, header_bytes)
+
+	@info("writing RCGE compressed graph data")
+	stats = RCGEStats()
+	encode_level(bw, g, clusters; params=params, stats=stats, progress=progress)
+
+	flush_bitwriter(bw; flush_last_bits=true)
+	close(f)
+
+	# Log bit budget breakdown
+	m = ne(g)
+	total_bits = stats.bits_membership + stats.bits_intra_headers + stats.bits_intra_copy +
+	             stats.bits_intra_add + stats.bits_intra_raw +
+	             stats.bits_inter_headers + stats.bits_inter_degrees +
+	             stats.bits_inter_perms + stats.bits_inter_lists
+	@info "RCGE bit budget ($(m) edges):"
+	@info "  membership:     $(stats.bits_membership) bits ($(round(stats.bits_membership/m, digits=4)) BPE)"
+	@info "  intra headers:  $(stats.bits_intra_headers) bits ($(round(stats.bits_intra_headers/m, digits=4)) BPE)"
+	@info "  intra copy:     $(stats.bits_intra_copy) bits ($(round(stats.bits_intra_copy/m, digits=4)) BPE)"
+	@info "  intra add:      $(stats.bits_intra_add) bits ($(round(stats.bits_intra_add/m, digits=4)) BPE)"
+	@info "  intra raw:      $(stats.bits_intra_raw) bits ($(round(stats.bits_intra_raw/m, digits=4)) BPE)"
+	@info "  inter headers:  $(stats.bits_inter_headers) bits ($(round(stats.bits_inter_headers/m, digits=4)) BPE)"
+	@info "  inter degrees:  $(stats.bits_inter_degrees) bits ($(round(stats.bits_inter_degrees/m, digits=4)) BPE)"
+	@info "  inter perms:    $(stats.bits_inter_perms) bits ($(round(stats.bits_inter_perms/m, digits=4)) BPE)"
+	@info "  inter lists:    $(stats.bits_inter_lists) bits ($(round(stats.bits_inter_lists/m, digits=4)) BPE)"
+	@info "  ref used/no_ref: $(stats.intra_ref_used)/$(stats.intra_no_ref)"
+	@info "  copy modes: bitmap=$(stats.intra_copy_bitmap_count) blocks=$(stats.intra_copy_blocks_count) complement=$(stats.intra_copy_complement_count)"
+	@info "  overlap histogram: $(stats.intra_overlap_hist)"
+end
+
+################################################################################
 # Load compressed MGS v3 graph
 ################################################################################
 
@@ -747,7 +940,12 @@ Supported compression schemes:
 
 Returns a graph loaded with the compression scheme specified in the header.
 """
-function load_compressed_mgs3_graph(filename::AbstractString; copy_blocks::Bool=false, adaptive_copy::Bool=false, ref_window_size::Int=7, fixwidth_ref::Bool=false, stop_deltas::Bool=false)
+function load_compressed_mgs3_graph(filename::AbstractString;
+		copy_blocks::Bool=false, adaptive_copy::Bool=false,
+		ref_window_size::Int=7, fixwidth_ref::Bool=false, stop_deltas::Bool=false,
+		empty_prefix::Bool=false, compact_copy::Bool=false, tight_intervals::Bool=false,
+		vlc2::Bool=false,
+		rcge_params::Union{Nothing,RCGEParams}=nothing)
 	# Header format: see MGS_HEADER.md
 	f = open(filename, "r")
 	
@@ -782,7 +980,19 @@ function load_compressed_mgs3_graph(filename::AbstractString; copy_blocks::Bool=
 	if option_flags == OPTION_HUFFMAN
 		g = load_huffman_compressed_mgs3_graph(f, graph_type, encoding, gs)
 	elseif OPTION_GREEDY_BASE <= option_flags <= OPTION_GREEDY_MAX
-		g = load_greedy_mgs3_graph(f, graph_type, encoding, gs, compression; copy_blocks=copy_blocks, adaptive_copy=adaptive_copy, ref_window_size=ref_window_size, fixwidth_ref=fixwidth_ref, stop_deltas=stop_deltas)
+		g = load_greedy_mgs3_graph(f, graph_type, encoding, gs, compression;
+			copy_blocks=copy_blocks, adaptive_copy=adaptive_copy,
+			ref_window_size=ref_window_size, fixwidth_ref=fixwidth_ref,
+			stop_deltas=stop_deltas, empty_prefix=empty_prefix,
+			compact_copy=compact_copy, tight_intervals=tight_intervals,
+			vlc2=vlc2)
+	elseif OPTION_CS_BASE <= option_flags <= OPTION_CS_MAX
+		g = load_cs_mgs3_graph(f, graph_type, encoding, gs, compression;
+			compact_copy=compact_copy, tight_intervals=tight_intervals,
+			ref_window_size=ref_window_size)
+	elseif OPTION_RCGE_BASE <= option_flags <= OPTION_RCGE_MAX
+		p = rcge_params !== nothing ? rcge_params : RCGEParams()
+		g = load_rcge_mgs3_graph(f, graph_type, gs; params=p)
 	elseif compression in supported_schemes
 		g = load_complex_encoded_compressed_mgs3_graph(f, graph_type, encoding, gs, compression)
 	else
@@ -976,7 +1186,10 @@ end
 Load graph from greedy-compressed MGS v3 format. The data stream is self-describing.
 """
 function load_greedy_mgs3_graph(io::IO, graph_type::Symbol, coding_scheme::Symbol, gs::UInt64,
-		integer_encoding::Symbol=:fibonacci; copy_blocks::Bool=false, adaptive_copy::Bool=false, ref_window_size::Int=7, fixwidth_ref::Bool=false, stop_deltas::Bool=false, adaptive_deltas::Bool=false, empty_prefix::Bool=false, split_residual::Bool=false)
+		integer_encoding::Symbol=:fibonacci; copy_blocks::Bool=false, adaptive_copy::Bool=false,
+		ref_window_size::Int=7, fixwidth_ref::Bool=false, stop_deltas::Bool=false,
+		adaptive_deltas::Bool=false, empty_prefix::Bool=false, split_residual::Bool=false,
+		compact_copy::Bool=false, tight_intervals::Bool=false, vlc2::Bool=false)
 	n_bits_v = convert(UInt8, ceil(log(2, gs)))
 	V = infer_uint_custom_type(n_bits_v)
 
@@ -990,7 +1203,12 @@ function load_greedy_mgs3_graph(io::IO, graph_type::Symbol, coding_scheme::Symbo
 
 	@info("reading greedy-compressed graph data")
 	neighbor_lists = read_greedy_graph_data(reader, V(gs), coding_scheme, V;
-		integer_encoding=integer_encoding, copy_blocks=copy_blocks, adaptive_copy=adaptive_copy, ref_window_size=ref_window_size, fixwidth_ref=fixwidth_ref, stop_deltas=stop_deltas, adaptive_deltas=adaptive_deltas, empty_prefix=empty_prefix, split_residual=split_residual)
+		integer_encoding=integer_encoding, copy_blocks=copy_blocks,
+		adaptive_copy=adaptive_copy, ref_window_size=ref_window_size,
+		fixwidth_ref=fixwidth_ref, stop_deltas=stop_deltas,
+		adaptive_deltas=adaptive_deltas, empty_prefix=empty_prefix,
+		split_residual=split_residual, compact_copy=compact_copy,
+		tight_intervals=tight_intervals, vlc2=vlc2)
 
 	@info("building graph from neighbor lists")
 	for (source_vertex, neighbors) in neighbor_lists
@@ -1002,4 +1220,81 @@ function load_greedy_mgs3_graph(io::IO, graph_type::Symbol, coding_scheme::Symbo
 	@info("graph construction completed: $(nv(g)) vertices, $(ne(g)) edges")
 	return g
 end
+
+################################################################################
+# CS (Command Stream) load
+################################################################################
+
+"""
+    load_cs_mgs3_graph(io, graph_type, coding_scheme, gs, integer_encoding; ...)
+
+Load graph from CS (Command Stream) compressed MGS v3 format.
+"""
+function load_cs_mgs3_graph(io::IO, graph_type::Symbol, coding_scheme::Symbol, gs::UInt64,
+		integer_encoding::Symbol=:fibonacci;
+		compact_copy::Bool=false, tight_intervals::Bool=false, ref_window_size::Int=64)
+	n_bits_v = convert(UInt8, ceil(log(2, gs)))
+	V = infer_uint_custom_type(n_bits_v)
+
+	g = graph_type == :directed ? SimpleDiGraph{V}() : SimpleGraph{V}()
+
+	@info("generating graph (CS mode)")
+	add_vertices!(g, gs)
+
+	reader = BitReader(io)
+
+	@info("reading CS-compressed graph data")
+	neighbor_lists = read_cmdstream_graph_data(reader, V(gs), coding_scheme, V;
+		integer_encoding=integer_encoding, compact_copy=compact_copy,
+		tight_intervals=tight_intervals, ref_window_size=ref_window_size)
+
+	@info("building graph from neighbor lists")
+	for (source_vertex, neighbors) in neighbor_lists
+		for target_vertex in neighbors
+			add_edge!(g, source_vertex, target_vertex)
+		end
+	end
+
+	@info("graph construction completed: $(nv(g)) vertices, $(ne(g)) edges")
+	return g
+end
+
+################################################################################
+# RCGE load
+################################################################################
+
+"""
+    load_rcge_mgs3_graph(io, graph_type, gs; params=RCGEParams())
+
+Load graph from RCGE compressed MGS v3 format.
+"""
+function load_rcge_mgs3_graph(io::IO, graph_type::Symbol, gs::UInt64;
+		params::RCGEParams=RCGEParams())
+	n_bits_v = convert(UInt8, ceil(log(2, gs)))
+	V = infer_uint_custom_type(n_bits_v)
+
+	directed = graph_type == :directed
+
+	@info("generating graph (RCGE mode)")
+
+	reader = BitReader(io)
+
+	@info("reading RCGE-compressed graph data")
+	neighbor_lists = decode_level(reader, params; T=V, directed=directed)
+
+	# Build graph from decoded neighbor lists
+	g = directed ? SimpleDiGraph{V}() : SimpleGraph{V}()
+	add_vertices!(g, gs)
+
+	@info("building graph from neighbor lists")
+	for (source_vertex, neighbors) in neighbor_lists
+		for target_vertex in neighbors
+			add_edge!(g, source_vertex, target_vertex)
+		end
+	end
+
+	@info("graph construction completed: $(nv(g)) vertices, $(ne(g)) edges")
+	return g
+end
+
 end # module MGS

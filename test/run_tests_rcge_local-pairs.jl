@@ -142,7 +142,7 @@ import LightGraphs
         min_cl_size = try parse(Int, get(ENV, "RCGE_MIN_CLUSTER_SIZE", "16")) catch; 16 end
 
         # Encoder params (used for selection and encoding at each level)
-        params = RCGEParams(L=128, varint=:fibonacci, count_varint=:fibonacci, gap=:fibonacci, degree=:elias_delta, undirected_pairs=false, perm_strategy=:blockpos, membership=:elias_fano, inter_strategy=:lists, intra_ref_enabled=true, intra_ref_window=32, intra_ref_min_overlap=0.3, intra_ref_rle=false, intra_block_try=false, positions_mode=:delta, additions_mode=:delta)
+        params = RCGEParams(L=128, varint=:fibonacci, count_varint=:fibonacci, gap=:fibonacci, degree=:elias_delta, undirected_pairs=false, perm_strategy=:blockpos, membership=:elias_fano, inter_strategy=:lists, intra_ref_enabled=true, intra_ref_window=32, intra_ref_rle=false, intra_block_try=false, positions_mode=:delta, additions_mode=:delta)
 
         cur = g
         level = 1

@@ -31,6 +31,7 @@ export heavy_edge_matching,
        # Community detection
        louvain_partition,
        leiden_partition,
+       auto_select_K,
        # AMG exports
        Smoother,
        Jacobi,
@@ -1026,6 +1027,54 @@ function refine_partition(G::WeightedCoarseGraph, part::Vector{Int})
         end
     end
     return current
+end
+
+"""
+    auto_select_K(g; max_K=8, min_community_frac=0.005, partition=nothing)
+
+Automatically select the optimal number of RCGE clusters K.
+
+Uses Leiden community detection to identify natural communities, then selects K
+based on graph size and community structure:
+- K grows logarithmically with vertex count: `ceil(log2(n / 100_000))`
+  (graphs ≤ 100K vertices get K=1; larger graphs benefit from more clusters)
+- K is capped by the number of significant Leiden communities (those with
+  ≥ `min_community_frac` fraction of total vertices)
+
+Returns `(K, partition)`:
+- `K`: recommended number of clusters for `leiden_partition_k`
+- `partition`: the Leiden partition vector (for reuse, avoids recomputing)
+"""
+function auto_select_K(g::AbstractGraph{T};
+        max_K::Int=8,
+        min_community_frac::Float64=0.005,
+        partition::Union{Nothing,Vector{Int}}=nothing) where {T<:Unsigned}
+    n = nv(g)
+    part = partition !== nothing ? partition : leiden_partition(g; max_passes=8, max_levels=5)
+
+    # Count community sizes and sort descending
+    counts = Dict{Int,Int}()
+    for c in part; counts[c] = get(counts, c, 0) + 1; end
+    sorted_labels = sort(collect(keys(counts)); by=l->counts[l], rev=true)
+    L = length(sorted_labels)
+
+    # Graph-size baseline: K grows logarithmically with n.
+    # Graphs ≤ 100K vertices → K=1 (one cluster suffices for reference window).
+    # Larger graphs benefit from more clusters as community diversity increases.
+    K_base = n > 100_000 ? max(1, ceil(Int, log2(n / 100_000))) : 1
+
+    # Cap by number of significant communities (≥ min_community_frac of vertices)
+    min_size = max(1, ceil(Int, n * min_community_frac))
+    n_significant = count(l -> counts[l] >= min_size, sorted_labels)
+
+    K = clamp(K_base, 1, min(max_K, n_significant, L))
+
+    # Log top community sizes for diagnostics
+    n_show = min(K + 2, length(sorted_labels))
+    top_sizes = [counts[sorted_labels[i]] for i in 1:n_show]
+    @info "auto_select_K: n=$n, $L communities, $n_significant significant (≥$(min_size)v), K_base=$K_base → K=$K  top_sizes=$top_sizes"
+
+    return K, part
 end
 
 end # module Clustering

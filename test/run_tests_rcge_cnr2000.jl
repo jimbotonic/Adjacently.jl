@@ -148,7 +148,7 @@ using LightGraphs: nv, outneighbors
         INTER_STRATEGY = Symbol(get(ENV, "RCGE_INTER", "perm"))
         BLOCK_TRY = get(ENV, "RCGE_BLOCK_TRY", "false") in ("1","true","TRUE")
         # Use best from sweep: positions=delta, additions=delta, RLE=false
-        params = RCGEParams(L=128, varint=:fibonacci, count_varint=:fibonacci, gap=:fibonacci, degree=:elias_delta, undirected_pairs=false, perm_strategy=:blockpos, membership=:elias_fano, inter_strategy=INTER_STRATEGY, intra_ref_enabled=true, intra_ref_window=32, intra_ref_min_overlap=0.3, intra_ref_rle=false, intra_block_try=false, positions_mode=:delta, additions_mode=:delta)
+        params = RCGEParams(L=128, varint=:fibonacci, count_varint=:fibonacci, gap=:fibonacci, degree=:elias_delta, undirected_pairs=false, perm_strategy=:blockpos, membership=:elias_fano, inter_strategy=INTER_STRATEGY, intra_ref_enabled=true, intra_ref_window=32, intra_ref_rle=false, intra_block_try=false, positions_mode=:delta, additions_mode=:delta)
 
         # Helper: reorder vertices inside each cluster using RCM on the induced subgraph
         function reorder_clusters!(clusters, base_g)
