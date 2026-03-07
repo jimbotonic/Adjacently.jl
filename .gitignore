@@ -35,6 +35,11 @@ coverage/
 build/
 deps/build.log
 
+# Large uncompressed text files (gzipped versions are tracked instead)
+
+datasets/Web_Google/web-Google.txt
+datasets/Amazon_0601/Amazon0601.txt
+
 # Webgraph source datasets (large files — see README.md in each subfolder)
 
 datasets/webgraph/**
