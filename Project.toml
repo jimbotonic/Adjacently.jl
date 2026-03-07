@@ -1,7 +1,7 @@
 name = "Adjacently"
 uuid = "411c8731-a39f-4a7d-8b26-fcc9fee4eb7b"
-version = "0.4.0"
-authors = ["Jimmy Dubuisson <jimmy.dubuisson@gmail.com>"]
+version = "0.8.0"
+authors = ["Jimmy Dubuisson <jimmy@dubuisson.ch>"]
 
 [deps]
 BSON = "fbb218c0-5317-5bc6-957e-2ee96dd4b1f0"

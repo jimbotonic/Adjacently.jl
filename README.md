@@ -34,12 +34,12 @@ write_cs_mgs3_graph(g, "output"; ref_window_size=64,
     compact_copy=true, tight_intervals=true)
 ```
 
-### RCGE (Reversible Coarsening Graph Encoding)
+### CGE (Clustered Graph Encoding)
 
 Two-level coarsening approach that exploits community structure. The graph is partitioned into clusters (e.g. via Leiden); intra-cluster edges use reference encoding with adaptive copy-blocks, while inter-cluster edges use permutation-based encoding of the bipartite structure.
 
 ```julia
-write_rcge_mgs3_graph(g, "output", clusters; params=RCGEParams(L=128, ...))
+write_cge_mgs3_graph(g, "output", clusters; params=CGEParams(L=128, ...))
 ```
 
 ### Performance
@@ -50,7 +50,7 @@ On the CNR-2000 web graph (325,557 vertices, 3,216,152 edges):
 |--------|--------------|-----------|
 | STD    | 2.88         | 1,157,508 bytes |
 | CS     | 2.88         | 1,157,224 bytes |
-| RCGE   | 2.43         | 978,562 bytes   |
+| CGE   | 2.43         | 978,562 bytes   |
 
 All methods achieve perfect round-trip fidelity.
 
@@ -67,7 +67,7 @@ The option flags byte identifies the compression method:
 - `0x0F`: ASTRA (legacy)
 - `0x10`-`0x8F`: STD
 - `0x90`-`0x9F`: CS
-- `0xA0`-`0xAF`: RCGE
+- `0xA0`-`0xAF`: CGE
 - `0xFF`: Huffman (deprecated)
 
 ### Loading
@@ -81,8 +81,8 @@ g = load_compressed_mgs3_graph("graph.mgz";
     stop_deltas=true, empty_prefix=true, compact_copy=true,
     tight_intervals=true, vlc2=true)
 
-# RCGE — pass the same RCGEParams used at write time
-g = load_compressed_mgs3_graph("graph.mgz"; rcge_params=params)
+# CGE — pass the same CGEParams used at write time
+g = load_compressed_mgs3_graph("graph.mgz"; cge_params=params)
 ```
 
 ### References
@@ -98,7 +98,7 @@ The test suite is organized into individual test files. Run from the project roo
 # Run a specific test set
 julia --project test/run_tests_{test-name}.jl
 
-# Run the CNR-2000 compression roundtrip (STD, CS, RCGE)
+# Run the CNR-2000 compression roundtrip (STD, CS, CGE)
 julia --project test/cnr_2000_best_known_compression.jl
 ```
 
@@ -108,7 +108,7 @@ Interactive Jupyter notebooks are in `notebooks/`:
 
 | Notebook | Description |
 |----------|-------------|
-| `cnr-2000-compression.ipynb` | CNR-2000 compression roundtrip with STD, CS, and RCGE (parameter documentation) |
+| `cnr-2000-compression.ipynb` | CNR-2000 compression roundtrip with STD, CS, and CGE (parameter documentation) |
 | `Pagerank.ipynb` | PageRank computation on the Arxiv HEP-PH citation network |
 | `shortest_paths.ipynb` | Shortest path algorithms with diffusion-based exploration |
 | `shortest_paths2.ipynb` | Extended shortest path analysis |
