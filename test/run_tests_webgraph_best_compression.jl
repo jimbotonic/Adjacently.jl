@@ -1,6 +1,6 @@
 #
 # Adjacently: Julia Complex Directed Networks Library
-# Copyright (C) 2016-2025 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
+# Copyright (C) 2016-2026 Jimmy Dubuisson <jimmy@dubuisson.ch>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -14,7 +14,7 @@
 #
 
 # Best-known compression roundtrip tests for any WebGraph dataset.
-# Tests: STD (Standard greedy), CS (Command Stream), and RCGE
+# Tests: STD (Standard greedy), CS (Command Stream), and CGE
 # Each method: write .mgz → load .mgz → verify graph restored
 #
 # Usage:
@@ -24,7 +24,7 @@
 #                   a CSV file named DATASET.csv (e.g. "cnr-2000", "in-2004").
 #                   Defaults to "cnr-2000".
 #
-# METHOD            one of "std", "cs", "rcge", or "all" (default: "all").
+# METHOD            one of "std", "cs", "cge", or "all" (default: "all").
 #
 # K                 top-level Leiden split: K-1 largest communities become
 #                   separate clusters, the rest merge into cluster K.
@@ -41,9 +41,9 @@
 # Examples:
 #   julia --project test/run_tests_webgraph_best_compression.jl
 #   julia --project test/run_tests_webgraph_best_compression.jl cnr-2000
-#   julia --project test/run_tests_webgraph_best_compression.jl in-2004 rcge auto
-#   julia --project test/run_tests_webgraph_best_compression.jl in-2004 rcge 4
-#   julia --project test/run_tests_webgraph_best_compression.jl in-2004 rcge 4 500000
+#   julia --project test/run_tests_webgraph_best_compression.jl in-2004 cge auto
+#   julia --project test/run_tests_webgraph_best_compression.jl in-2004 cge 4
+#   julia --project test/run_tests_webgraph_best_compression.jl in-2004 cge 4 500000
 #   julia --project test/run_tests_webgraph_best_compression.jl enwiki-2013 cs 1 0 20
 
 include("run_tests_main.jl")
@@ -57,8 +57,8 @@ using Adjacently.IO: load_adjacency_list_from_csv
 using Adjacently.Relabeling: relabel_graph, relabel_vertices_llp, save_llp_ordering, load_llp_ordering
 using Adjacently.Clustering: leiden_partition, metis_partition, auto_select_K
 using Adjacently.Graph: subgraph
-using Adjacently.MGS: write_std_mgs3_graph, write_cs_mgs3_graph, write_rcge_mgs3_graph, load_compressed_mgs3_graph
-using Adjacently.Compression.RCGE: RCGEParams
+using Adjacently.MGS: write_std_mgs3_graph, write_cs_mgs3_graph, write_cge_mgs3_graph, load_compressed_mgs3_graph
+using Adjacently.Compression.CGE: CGEParams
 
 # ---------------------------------------------------------------------------
 # CLI argument parsing
@@ -78,11 +78,11 @@ const DS_CSV  = joinpath(DS_DIR, DATASET * ".csv")
 
 const RUN_STD  = METHOD in ("all", "std")
 const RUN_CS   = METHOD in ("all", "cs")
-const RUN_RCGE = METHOD in ("all", "rcge")
+const RUN_CGE = METHOD in ("all", "cge")
 
 @info "Dataset: $DATASET  (prefix=$PREFIX)"
-@info "Method:  $METHOD  (STD=$RUN_STD, CS=$RUN_CS, RCGE=$RUN_RCGE)"
-@info "RCGE: K=$(AUTO_K ? "auto" : K), max_cluster_size=$(MAX_CLUSTER_SIZE == 0 ? "disabled" : MAX_CLUSTER_SIZE)"
+@info "Method:  $METHOD  (STD=$RUN_STD, CS=$RUN_CS, CGE=$RUN_CGE)"
+@info "CGE: K=$(AUTO_K ? "auto" : K), max_cluster_size=$(MAX_CLUSTER_SIZE == 0 ? "disabled" : MAX_CLUSTER_SIZE)"
 @info "LLP: passes=$LLP_PASSES"
 @info "  CSV:   $DS_CSV"
 @info "  Out:   $DS_DIR"
@@ -96,19 +96,15 @@ const DATASET_PARAMS = Dict(
                      ref_window_size=64, copy_blocks=true, adaptive_copy=true,
                      stop_deltas=true, empty_prefix=true, compact_copy=true,
                      tight_intervals=true, vlc2=true),
-        std_load  = (copy_blocks=true, adaptive_copy=true, ref_window_size=64,
-                     stop_deltas=true, empty_prefix=true, compact_copy=true,
-                     tight_intervals=true, vlc2=true),
         cs_write  = (coding_scheme=:children, integer_encoding=:fibonacci,
                      ref_window_size=64, compact_copy=true, tight_intervals=true),
-        cs_load   = (compact_copy=true, tight_intervals=true, ref_window_size=64),
-        rcge_params = RCGEParams(
+        cge_params = CGEParams(
             L=128,
             varint=:fibonacci, count_varint=:fibonacci,
             gap=:fibonacci, degree=:elias_delta,
             undirected_pairs=false,
             perm_strategy=:blockpos, membership=:implicit_ranges,
-            inter_strategy=:perm,
+            inter_strategy=:lists,
             intra_ref_enabled=true, intra_ref_window=64,
             intra_ref_rle=false,
             intra_block_try=false,
@@ -119,7 +115,7 @@ const DATASET_PARAMS = Dict(
             intra_copy_blocks=true, intra_copy_adaptive=true,
             intra_ref_fixwidth=true, intra_ref_vlc=false,
             intra_add_adaptive=true, intra_raw_adaptive=true,
-            intra_adapt_mil=2,
+            intra_adapt_mil=4,
         ),
     ),
     "in-2004" => (
@@ -127,19 +123,15 @@ const DATASET_PARAMS = Dict(
                      ref_window_size=64, copy_blocks=true, adaptive_copy=true,
                      stop_deltas=true, empty_prefix=true, compact_copy=true,
                      tight_intervals=true, vlc2=true),
-        std_load  = (copy_blocks=true, adaptive_copy=true, ref_window_size=64,
-                     stop_deltas=true, empty_prefix=true, compact_copy=true,
-                     tight_intervals=true, vlc2=true),
         cs_write  = (coding_scheme=:children, integer_encoding=:fibonacci,
                      ref_window_size=64, compact_copy=true, tight_intervals=true),
-        cs_load   = (compact_copy=true, tight_intervals=true, ref_window_size=64),
-        rcge_params = RCGEParams(
+        cge_params = CGEParams(
             L=128,
             varint=:fibonacci, count_varint=:fibonacci,
             gap=:fibonacci, degree=:elias_delta,
             undirected_pairs=false,
             perm_strategy=:blockpos, membership=:implicit_ranges,
-            inter_strategy=:perm,
+            inter_strategy=:lists,
             intra_ref_enabled=true, intra_ref_window=8,
             intra_ref_rle=false,
             intra_block_try=false,
@@ -150,7 +142,7 @@ const DATASET_PARAMS = Dict(
             intra_copy_blocks=true, intra_copy_adaptive=true,
             intra_ref_fixwidth=true, intra_ref_vlc=false,
             intra_add_adaptive=true, intra_raw_adaptive=true,
-            intra_adapt_mil=2,
+            intra_adapt_mil=4,
         ),
     ),
     "enwiki-2013" => (
@@ -158,19 +150,15 @@ const DATASET_PARAMS = Dict(
                      ref_window_size=8, copy_blocks=true, adaptive_copy=true,
                      stop_deltas=true, empty_prefix=true, compact_copy=true,
                      tight_intervals=true, vlc2=true),
-        std_load  = (copy_blocks=true, adaptive_copy=true, ref_window_size=8,
-                     stop_deltas=true, empty_prefix=true, compact_copy=true,
-                     tight_intervals=true, vlc2=true),
         cs_write  = (coding_scheme=:children, integer_encoding=:zeta,
                      ref_window_size=8, compact_copy=true, tight_intervals=true),
-        cs_load   = (compact_copy=true, tight_intervals=true, ref_window_size=8),
-        rcge_params = RCGEParams(
+        cge_params = CGEParams(
             L=128,
             varint=:fibonacci, count_varint=:fibonacci,
             gap=:fibonacci, degree=:elias_delta,
             undirected_pairs=false,
             perm_strategy=:blockpos, membership=:implicit_ranges,
-            inter_strategy=:perm,
+            inter_strategy=:lists,
             intra_ref_enabled=true, intra_ref_window=64,
             intra_ref_rle=false,
             intra_block_try=false,
@@ -181,7 +169,7 @@ const DATASET_PARAMS = Dict(
             intra_copy_blocks=true, intra_copy_adaptive=true,
             intra_ref_fixwidth=true, intra_ref_vlc=false,
             intra_add_adaptive=true, intra_raw_adaptive=true,
-            intra_adapt_mil=2,
+            intra_adapt_mil=4,
             intra_lr_split=true,
         ),
     ),
@@ -341,7 +329,7 @@ n_orig = nv(g_original)
 m_orig = ne(g_original)
 @info "  Loaded in $(round(time()-t_load, digits=1))s: $n_orig vertices, $m_orig edges"
 
-# Compute (or load cached) global LLP ordering — shared by STD, CS, and RCGE K=1
+# Compute (or load cached) global LLP ordering — shared by STD, CS, and CGE K=1
 if LLP_PASSES > 0
     @info "Global LLP ordering (passes=$LLP_PASSES)..."
     t_rel = time()
@@ -356,9 +344,9 @@ end
 T_rel = eltype(g_rel)
 m = ne(g_rel)
 
-# Free original graph if not needed for RCGE K>1
+# Free original graph if not needed for CGE K>1
 # (but never free if g_rel === g_original, i.e. no LLP was applied)
-needs_g_original = RUN_RCGE && (AUTO_K || K > 1)
+needs_g_original = RUN_CGE && (AUTO_K || K > 1)
 if !needs_g_original && g_rel !== g_original
     @info "Freeing original graph to save memory..."
     g_original = nothing
@@ -391,9 +379,9 @@ if RUN_STD
     bpe = round(8.0 * filesize(std_mgz) / m, digits=4)
     @info "  Encoded: $bpe BPE ($(filesize(std_mgz)) bytes, $(dt_enc)s)"
 
-    # Load .mgz
+    # Load .mgz (v3.1: params auto-decoded from header)
     t_dec = time()
-    g_loaded = load_compressed_mgs3_graph(std_mgz; PARAMS.std_load...)
+    g_loaded = load_compressed_mgs3_graph(std_mgz)
     dt_dec = round(time() - t_dec, digits=2)
 
     # Verify
@@ -425,9 +413,9 @@ if RUN_CS
     bpe = round(8.0 * filesize(cs_mgz) / m, digits=4)
     @info "  Encoded: $bpe BPE ($(filesize(cs_mgz)) bytes, $(dt_enc)s)"
 
-    # Load .mgz
+    # Load .mgz (v3.1: params auto-decoded from header)
     t_dec = time()
-    g_loaded = load_compressed_mgs3_graph(cs_mgz; PARAMS.cs_load...)
+    g_loaded = load_compressed_mgs3_graph(cs_mgz)
     dt_dec = round(time() - t_dec, digits=2)
 
     # Verify
@@ -440,37 +428,37 @@ end
 end # RUN_CS
 
 # ============================================================================
-# 3. RCGE (Reversible Coarsening Graph Encoding) — loop over K values
+# 3. CGE (Clustered Graph Encoding) — loop over K values
 # ============================================================================
 
-if RUN_RCGE
-    rcge_params = PARAMS.rcge_params
+if RUN_CGE
+    cge_params = PARAMS.cge_params
 
     # Resolve K: auto-select or use CLI value
-    RCGE_K = if AUTO_K
+    CGE_K = if AUTO_K
         K_auto, _ = auto_select_K(g_original)
         K_auto
     else
         K
     end
 
-    @testset "RCGE K=$RCGE_K — $DATASET roundtrip" begin
-        @info "--- RCGE K=$RCGE_K: write .mgz → load .mgz → verify ---"
+    @testset "CGE K=$CGE_K — $DATASET roundtrip" begin
+        @info "--- CGE K=$CGE_K: write .mgz → load .mgz → verify ---"
 
-        if RCGE_K == 1
+        if CGE_K == 1
             # K=1: use global LLP-reordered graph with single cluster
             @info "  Using global LLP ordering (K=1)"
             TV = eltype(g_rel)
             n_v = Int(nv(g_rel))
-            g_rcge = g_rel
-            m_rcge = ne(g_rcge)
+            g_cge = g_rel
+            m_cge = ne(g_cge)
             clusters_impl = [TV.(1:n_v)]
         else
             # K>1: Leiden K-split on original graph, then LLP within each cluster
             TV = eltype(g_original)
             n_v = Int(nv(g_original))
-            clusters_raw = leiden_partition_k(g_original, RCGE_K)
-            @info "  Leiden K=$RCGE_K split: $(length.(clusters_raw)) vertices per cluster"
+            clusters_raw = leiden_partition_k(g_original, CGE_K)
+            @info "  Leiden K=$CGE_K split: $(length.(clusters_raw)) vertices per cluster"
 
             # Optionally recurse on large clusters
             if MAX_CLUSTER_SIZE > 0
@@ -510,7 +498,7 @@ if RUN_RCGE
             end
 
             # Build vertex mapping: concatenate clusters in order
-            rcge_vertex_map = let new_id = TV(1)
+            cge_vertex_map = let new_id = TV(1)
                 d = Dict{TV,TV}()
                 for C in clusters_raw
                     for v in C
@@ -521,8 +509,8 @@ if RUN_RCGE
                 d
             end
 
-            g_rcge = relabel_graph(g_original, rcge_vertex_map)
-            m_rcge = ne(g_rcge)
+            g_cge = relabel_graph(g_original, cge_vertex_map)
+            m_cge = ne(g_cge)
 
             # Build implicit-range cluster vectors
             clusters_impl = Vector{Vector{TV}}()
@@ -535,41 +523,41 @@ if RUN_RCGE
         end
 
         mcs_suffix = MAX_CLUSTER_SIZE > 0 ? "_mcs$(MAX_CLUSTER_SIZE)" : ""
-        k_suffix = RCGE_K == 1 ? "" : "_k$RCGE_K"
-        rcge_base = joinpath(DS_DIR, "$(PREFIX)_rcge$(k_suffix)$(mcs_suffix)")
-        rcge_mgz = rcge_base * ".mgz"
+        k_suffix = CGE_K == 1 ? "" : "_k$CGE_K"
+        cge_base = joinpath(DS_DIR, "$(PREFIX)_cge$(k_suffix)$(mcs_suffix)")
+        cge_mgz = cge_base * ".mgz"
 
         # Write .mgz
         t_enc = time()
         _last_progress_time = Ref(time())
-        function _rcge_progress(idx_local::Int, cluster_size::Int, ci::Int, n_clusters::Int)
+        function _cge_progress(idx_local::Int, cluster_size::Int, ci::Int, n_clusters::Int)
             now = time()
             if now - _last_progress_time[] >= 10.0 || idx_local == cluster_size
                 elapsed = round(now - t_enc, digits=1)
                 pct = round(100.0 * idx_local / cluster_size, digits=1)
-                println(stderr, "  [RCGE] cluster $ci/$n_clusters: vertex $idx_local/$cluster_size ($pct%) — $(elapsed)s elapsed")
+                println(stderr, "  [CGE] cluster $ci/$n_clusters: vertex $idx_local/$cluster_size ($pct%) — $(elapsed)s elapsed")
                 flush(stderr)
                 _last_progress_time[] = now
             end
         end
-        write_rcge_mgs3_graph(g_rcge, rcge_base, clusters_impl; params=rcge_params, progress=_rcge_progress)
+        write_cge_mgs3_graph(g_cge, cge_base, clusters_impl; params=cge_params, progress=_cge_progress)
         dt_enc = round(time() - t_enc, digits=2)
 
-        @test isfile(rcge_mgz)
-        bpe = round(8.0 * filesize(rcge_mgz) / m_rcge, digits=4)
-        @info "  Encoded: $bpe BPE ($(filesize(rcge_mgz)) bytes, $(dt_enc)s)"
+        @test isfile(cge_mgz)
+        bpe = round(8.0 * filesize(cge_mgz) / m_cge, digits=4)
+        @info "  Encoded: $bpe BPE ($(filesize(cge_mgz)) bytes, $(dt_enc)s)"
 
-        # Load .mgz
+        # Load .mgz (v3.1: params auto-decoded from header)
         t_dec = time()
-        g_loaded = load_compressed_mgs3_graph(rcge_mgz; rcge_params=rcge_params)
+        g_loaded = load_compressed_mgs3_graph(cge_mgz)
         dt_dec = round(time() - t_dec, digits=2)
 
         # Verify (lightweight: compare vertex-by-vertex without building full dicts)
-        @test nv(g_loaded) == nv(g_rcge)
-        @test ne(g_loaded) == ne(g_rcge)
+        @test nv(g_loaded) == nv(g_cge)
+        @test ne(g_loaded) == ne(g_cge)
         match = true
-        for v in vertices(g_rcge)
-            orig = sort(collect(outneighbors(g_rcge, v)))
+        for v in vertices(g_cge)
+            orig = sort(collect(outneighbors(g_cge, v)))
             decoded = sort(collect(outneighbors(g_loaded, v)))
             if orig != decoded
                 match = false
@@ -578,9 +566,9 @@ if RUN_RCGE
             end
         end
         @test match
-        @info "  RCGE roundtrip: PASSED ($bpe BPE, decode $(dt_dec)s)"
+        @info "  CGE roundtrip: PASSED ($bpe BPE, decode $(dt_dec)s)"
     end
-end # RUN_RCGE
+end # RUN_CGE
 
 # ============================================================================
 # Summary
@@ -599,14 +587,14 @@ if RUN_STD || RUN_CS
         end
     end
 end
-if RUN_RCGE
+if RUN_CGE
     mcs_suffix = MAX_CLUSTER_SIZE > 0 ? "_mcs$(MAX_CLUSTER_SIZE)" : ""
     k_suffix = K == 1 ? "" : "_k$K"
-    path = joinpath(DS_DIR, "$(PREFIX)_rcge$(k_suffix)$(mcs_suffix).mgz")
+    path = joinpath(DS_DIR, "$(PREFIX)_cge$(k_suffix)$(mcs_suffix).mgz")
     if isfile(path)
         sz = filesize(path)
         bpe = round(8.0 * sz / m_orig, digits=4)
-        @info "  RCGE K=$K: $bpe BPE  ($sz bytes)"
+        @info "  CGE K=$K: $bpe BPE  ($sz bytes)"
     end
 end
 

@@ -1,6 +1,6 @@
 #
 # Adjacently: Julia Complex Directed Networks Library
-# Copyright (C) 2016-2025 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
+# Copyright (C) 2016-2026 Jimmy Dubuisson <jimmy@dubuisson.ch>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -59,6 +59,10 @@ include("graph.jl")
 using .Graph
 export Graph
 
+include("graph_generators.jl")
+using .GraphGenerators
+export GraphGenerators
+
 include("compression/utils.jl")
 using .CompressionUtils
 export CompressionUtils
@@ -66,10 +70,6 @@ export CompressionUtils
 include("gnn/GNN.jl")
 using .GNN
 export GNN
-
-include("rl/RL.jl")
-using .RL
-export RL
 
 include("compression.jl")
 using .Compression
@@ -94,5 +94,9 @@ export Distribution
 include("clustering.jl")
 using .Clustering
 export Clustering
+
+include("param_prediction.jl")
+using .ParamPrediction
+export ParamPrediction
 
 end # module Adjacently

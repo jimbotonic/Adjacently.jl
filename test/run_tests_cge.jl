@@ -1,6 +1,6 @@
 #
 # Adjacently: Julia Complex Directed Networks Library
-# Copyright (C) 2016-2025 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
+# Copyright (C) 2016-2026 Jimmy Dubuisson <jimmy@dubuisson.ch>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -21,7 +21,7 @@ using Logging
 Pkg.activate(normpath(joinpath(@__DIR__, "..")))
 
 using Adjacently
-using Adjacently.RCGE
+using Adjacently.CGE
 using Adjacently.IO: BitWriter, flush_bitwriter, load_adjacency_list_from_csv
 using Adjacently.Clustering: louvain_partition, leiden_partition
 using LightGraphs
@@ -44,7 +44,7 @@ function LightGraphs.outneighbors(g::TestGraph{T}, v::Integer) where {T<:Unsigne
     get(g.adj, Int(v), T[])
 end
 
-@testset "RCGE basic encode_level and helpers" begin
+@testset "CGE basic encode_level and helpers" begin
     # Build a tiny undirected graph with 4 vertices and a few edges (UInt32 typed)
     T = UInt32
     undirected_adj = Dict{Int, Vector{T}}()
@@ -64,7 +64,7 @@ end
     # Encode one level
     io = IOBuffer()
     w = BitWriter(io)
-    encode_level(w, g, P; params=RCGEParams(L=128, varint=:fibonacci, count_varint=:elias_delta, gap=:fibonacci, degree=:elias_delta, perm_strategy=:blockpos, membership=:elias_fano))
+    encode_level(w, g, P; params=CGEParams(L=128, varint=:fibonacci, count_varint=:elias_delta, gap=:fibonacci, degree=:elias_delta, perm_strategy=:blockpos, membership=:elias_fano))
     flush_bitwriter(w; flush_last_bits=true)
     bytes = take!(io)
     @test length(bytes) > 0
@@ -76,28 +76,28 @@ end
         UInt32(1) => [1, 2],
         UInt32(2) => Int[]
     )
-    pi = RCGE.order_from_edges(A_local, B_local, neighbors_in_B)
+    pi = CGE.order_from_edges(A_local, B_local, neighbors_in_B)
     @test pi == [1, 2]
 
     # Test permutation writers (lehmer and raw) produce some output
     io2 = IOBuffer(); w2 = BitWriter(io2)
-    RCGE.write_permutation(w2, [1,2,3]; strategy=:lehmer)
+    CGE.write_permutation(w2, [1,2,3]; strategy=:lehmer)
     flush_bitwriter(w2; flush_last_bits=true)
     @test length(take!(io2)) > 0
 
     io3 = IOBuffer(); w3 = BitWriter(io3)
-    RCGE.write_permutation(w3, [2,1]; strategy=:raw)
+    CGE.write_permutation(w3, [2,1]; strategy=:raw)
     flush_bitwriter(w3; flush_last_bits=true)
     @test length(take!(io3)) > 0
 end
 
-@testset "RCGE encode_level on CNR-2000 with Louvain" begin
+@testset "CGE encode_level on CNR-2000 with Louvain" begin
     prev_logger = current_logger()
     global_logger(ConsoleLogger(stderr, Logging.Info))
     try
     cnr_csv_path = "datasets/webgraph/cnr-2000/cnr-2000.csv"
     if !isfile(cnr_csv_path)
-        @warn "CNR-2000 CSV not found at $cnr_csv_path; skipping RCGE full-graph test"
+        @warn "CNR-2000 CSV not found at $cnr_csv_path; skipping CGE full-graph test"
         @test_skip "CNR-2000 dataset unavailable"
     else
         # Load full directed graph
@@ -134,11 +134,11 @@ end
         # Ensure all clusters are non-empty (merging may leave empties if len<=K)
         clusters = filter(!isempty, clusters)
 
-        # Encode RCGE level
+        # Encode CGE level
         io = IOBuffer(); w = BitWriter(io)
-        params = RCGEParams(L=128, varint=:fibonacci, count_varint=:elias_delta, gap=:fibonacci, degree=:elias_delta, undirected_pairs=false, perm_strategy=:blockpos, membership=:elias_fano)
+        params = CGEParams(L=128, varint=:fibonacci, count_varint=:elias_delta, gap=:fibonacci, degree=:elias_delta, undirected_pairs=false, perm_strategy=:blockpos, membership=:elias_fano)
         t4 = time(); encode_level(w, g, clusters; params=params); flush_bitwriter(w; flush_last_bits=true); bytes = take!(io); t5 = time()
-        @info "RCGE encode: size=$(length(bytes)) bytes, time=$(round(t5-t4,digits=3))s"
+        @info "CGE encode: size=$(length(bytes)) bytes, time=$(round(t5-t4,digits=3))s"
         @test length(bytes) > 0
     finally
         global_logger(prev_logger)

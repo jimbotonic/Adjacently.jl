@@ -1,6 +1,6 @@
 #
 # Adjacently: Julia Complex Directed Networks Library
-# Copyright (C) 2016-2025 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
+# Copyright (C) 2016-2026 Jimmy Dubuisson <jimmy@dubuisson.ch>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -12,15 +12,15 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
 #
-# RCGE: Reversible Coarsening Graph Encoding
+# CGE: Clustered Graph Encoding
 
-module RCGE
+module CGE
 
 using LightGraphs
 using LightGraphs: AbstractGraph, outneighbors, nv, is_directed
 
 using ...IO: BitWriter, BitReader, write_bit, write_bits, write_value, flush_bitwriter,
-    read_bit, read_bits, read_value
+    read_bit, read_bits, read_value, write_bytes
 import ..Compression
 using ..Compression: write_encoded_value, write_delta, write_truncated_binary_coding,
     write_hybrid_mix_encoded_list, delta_encode_vector, write_elias_fano,
@@ -29,14 +29,14 @@ using ..Compression: write_encoded_value, write_delta, write_truncated_binary_co
     read_bitpacked_bitmap, read_intervals_and_residuals,
     read_compressed_graph_data, compress_intervals
 
-export RCGEParams, RCGEStats, encode_level, decode_level, load_rcge_graph
+export CGEParams, CGEStats, encode_level, decode_level, load_cge_graph
 
 """
-    RCGEStats
+    CGEStats
 
 Lightweight counters (in bits) for encode_level sections.
 """
-mutable struct RCGEStats
+mutable struct CGEStats
     bits_membership::Int
     bits_intra::Int
     bits_intra_headers::Int
@@ -59,7 +59,7 @@ mutable struct RCGEStats
     intra_overlap_hist::Vector{Int}
     # Profiling: total additions across all ref vertices
     intra_add_count_total::Int
-    RCGEStats() = new(0,0,0,0,0,0,0,0,0,0,0,0,0,
+    CGEStats() = new(0,0,0,0,0,0,0,0,0,0,0,0,0,
                       Tuple{Int,Int,Int,Int,Int,Int}[],
                       0, 0, 0, zeros(Int, 10), 0)
 end
@@ -103,11 +103,11 @@ function CostBuffer()
 end
 
 """
-    RCGEParams(; L=32, varint=:fibonacci, count_varint=:fibonacci, gap=:fibonacci, degree=:golomb, perm_strategy=:lehmer, undirected_pairs=true, membership=:delta, inter_strategy=:perm,
+    CGEParams(; L=32, varint=:fibonacci, count_varint=:fibonacci, gap=:fibonacci, degree=:golomb, perm_strategy=:lehmer, undirected_pairs=true, membership=:delta, inter_strategy=:perm,
                  intra_ref_enabled::Bool=true, intra_ref_window::Int=16, intra_ref_rle::Bool=true,
                  intra_block_try::Bool=false)
 
-Parameters for RCGE encoding.
+Parameters for CGE encoding.
 - L: cluster size threshold for bit-matrix vs list encoding
 - varint: integer encoding used for sizes/lengths (positive only)
 - count_varint: encoding for counts that may be zero (default :golomb supports zero)
@@ -118,7 +118,7 @@ Parameters for RCGE encoding.
 - membership: :delta or :elias_fano for cluster membership lists
  - inter_strategy: :perm (degree vectors + permutation) or :lists (explicit per-u neighbor lists in B)
 """
-Base.@kwdef struct RCGEParams
+Base.@kwdef struct CGEParams
     L::Int = 32
     varint::Symbol = :fibonacci
     count_varint::Symbol = :fibonacci
@@ -208,7 +208,7 @@ function _write_stop_delta_zigzag(w::BitWriter, sorted_vals::Vector{T}, encoding
     write_bit(w, true)
     if vertex_id !== nothing
         offset = Int64(sorted_vals[1]) - Int64(vertex_id)
-        write_encoded_value(w, T(Compression._zigzag_encode(offset) + 1), encoding)
+        write_encoded_value(w, UInt64(Compression._zigzag_encode(offset) + 1), encoding)
     else
         write_encoded_value(w, sorted_vals[1], encoding)
     end
@@ -230,11 +230,12 @@ function _read_stop_delta_zigzag(r::BitReader, encoding::Symbol, ::Type{T}, vert
     first = true
     prev = zero(T)
     while read_bit(r)  # '1' = more values, '0' = STOP
-        raw = read_encoded_value(r, encoding, T)
         if first && vertex_id !== nothing
-            val = T(Int64(vertex_id) + Compression._zigzag_decode(UInt64(raw - 1)))
+            raw64 = read_encoded_value(r, encoding, UInt64)
+            val = T(Int64(vertex_id) + Compression._zigzag_decode(raw64 - 1))
             first = false
         else
+            raw = read_encoded_value(r, encoding, T)
             val = prev + raw
             first = false
         end
@@ -273,7 +274,7 @@ function _write_ir_lr(w::BitWriter, neighbors::Vector{T}, encoding::Symbol,
         for (idx, (start, len)) in enumerate(intervals)
             if idx == 1
                 offset = Int64(start) - Int64(vid)
-                write_encoded_value(w, T(Compression._zigzag_encode(offset) + 1), encoding)
+                write_encoded_value(w, UInt64(Compression._zigzag_encode(offset) + 1), encoding)
             else
                 write_encoded_value(w, start - prev_ref, encoding)
             end
@@ -341,8 +342,8 @@ function _read_ir_lr(r::BitReader, encoding::Symbol, mil::Int,
         prev_ref = T(0)
         for idx in 1:num_intervals
             if idx == 1
-                raw_start = read_encoded_value(r, encoding, T)
-                start = T(Int64(vid) + Compression._zigzag_decode(UInt64(raw_start - 1)))
+                raw_start = read_encoded_value(r, encoding, UInt64)
+                start = T(Int64(vid) + Compression._zigzag_decode(raw_start - 1))
             else
                 start_delta = read_encoded_value(r, encoding, T)
                 start = prev_ref + start_delta
@@ -760,7 +761,7 @@ Estimate the bit cost of encoding `nl` without a reference (raw mode).
 Uses pre-allocated buffers from `buf` to avoid allocations.
 """
 function _estimate_raw_cost(buf::CostBuffer, nl::Vector{Int},
-                            params::RCGEParams, ::Type{T},
+                            params::CGEParams, ::Type{T},
                             idx_local::Int, _zz_vid) where {T<:Unsigned}
     _reset!(buf.io1, buf.w1)
     if params.intra_intervals && params.intra_lr_split
@@ -796,7 +797,7 @@ Returns total_bits. Populates `buf.positions` and `buf.adds` with the
 merge results (caller must copy if needed).
 """
 function _evaluate_candidate(buf::CostBuffer, nl::Vector{Int}, ref::Vector{Int},
-                             params::RCGEParams, ::Type{T},
+                             params::CGEParams, ::Type{T},
                              idx_local::Int, _zz_vid) where {T<:Unsigned}
     # Two-pointer merge into buf.positions and buf.adds (reuse vectors)
     empty!(buf.positions); empty!(buf.adds)
@@ -897,7 +898,7 @@ Greedy MIL variant: try each mil value for additions cost. Returns (best_total_b
 Populates `buf.positions` and `buf.adds`.
 """
 function _evaluate_candidate_greedy(buf::CostBuffer, nl::Vector{Int}, ref::Vector{Int},
-                                    params::RCGEParams, ::Type{T},
+                                    params::CGEParams, ::Type{T},
                                     idx_local::Int, _zz_vid,
                                     mil_options::Vector{Int}) where {T<:Unsigned}
     # Two-pointer merge into buf.positions and buf.adds
@@ -953,17 +954,17 @@ end
 # --------------------------
 
 """
-    encode_level(w, g, P; params=RCGEParams())
+    encode_level(w, g, P; params=CGEParams())
 
-Encode one coarsening level for graph `g` with partition `P` using RCGE.
+Encode one coarsening level for graph `g` with partition `P` using CGE.
 
 Inputs:
 - w::BitWriter: output bitstream
 - g::LightGraphs.AbstractGraph{T<:Unsigned}
 - P::Vector{Vector{T}}: list of clusters with global vertex ids
-- params::RCGEParams: encoding parameters
+- params::CGEParams: encoding parameters
 """
-function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; params::RCGEParams=RCGEParams(), stats::Union{Nothing,RCGEStats}=nothing, progress::Union{Nothing,Function}=nothing) where {T<:Unsigned}
+function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; params::CGEParams=CGEParams(), stats::Union{Nothing,CGEStats}=nothing, progress::Union{Nothing,Function}=nothing, cluster_offsets::Union{Nothing,Vector{Int}}=nothing) where {T<:Unsigned}
     n = nv(g)
     directed = is_directed(g)
 
@@ -1011,6 +1012,10 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
     bits_before = _total_bits(w)
     n_clusters = length(clusters)
     for (ci, C) in enumerate(clusters)
+        # Record cluster start bit offset for index mode
+        if cluster_offsets !== nothing
+            cluster_offsets[ci] = _total_bits(w)
+        end
         s = length(C)
         # Build local index map for this cluster
         local_index = Dict{T,Int}()
@@ -1363,7 +1368,18 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
             end
 
             # Now write per-vertex payloads without flags or ref_deltas
+            # In index mode (cluster_offsets !== nothing), use two-pass encoding:
+            # encode payloads to temp buffer, then write intra-vertex offset table + data
+            local _idx_mode = cluster_offsets !== nothing
+            local _vtx_payload_io = _idx_mode ? IOBuffer() : nothing
+            local _vtx_payload_bw = _idx_mode ? BitWriter(_vtx_payload_io) : nothing
+            local _vtx_offsets = _idx_mode ? Vector{Int}(undef, s + 1) : nothing
+            local pw = _idx_mode ? _vtx_payload_bw : w  # payload writer
+
             for idx_local in 1:s
+                if _idx_mode
+                    _vtx_offsets[idx_local] = _total_bits(pw)
+                end
                 _zz_vid = params.intra_zigzag ? T(idx_local) : nothing
 
                 if use_ref_vec[idx_local]
@@ -1371,7 +1387,7 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                     ref_positions = ref_positions_list[idx_local]
                     additions = additions_list[idx_local]
                     ref_len = ref_len_list[idx_local]
-                    local bpos0 = _total_bits(w)
+                    local bpos0 = _total_bits(pw)
                     if params.intra_copy_adaptive && params.intra_copy_blocks
                         # 3-way adaptive: bitmap / copy-blocks / complement copy-blocks
                         # Copy-blocks cost
@@ -1404,18 +1420,18 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                         local _t_cc = 2 + _cc_bits
 
                         if _t_bm <= _t_cb && _t_bm <= _t_cc
-                            write_bit(w, true)   # outer=1: bitmap
+                            write_bit(pw, true)   # outer=1: bitmap
                             local _bm_arr = fill(false, ref_len)
                             for p in ref_positions; if 1 <= p <= ref_len; _bm_arr[p] = true; end; end
-                            for b in _bm_arr; write_bit(w, b); end
+                            for b in _bm_arr; write_bit(pw, b); end
                             if stats !== nothing; stats.intra_copy_bitmap_count += 1; end
                         elseif _t_cb <= _t_cc
-                            write_bit(w, false); write_bit(w, false)  # outer=0,inner=0: copy-blocks
-                            _write_copy_blocks(w, ref_positions, params.varint)
+                            write_bit(pw, false); write_bit(pw, false)  # outer=0,inner=0: copy-blocks
+                            _write_copy_blocks(pw, ref_positions, params.varint)
                             if stats !== nothing; stats.intra_copy_blocks_count += 1; end
                         else
-                            write_bit(w, false); write_bit(w, true)   # outer=0,inner=1: complement
-                            _write_copy_blocks(w, _skipped, params.varint)
+                            write_bit(pw, false); write_bit(pw, true)   # outer=0,inner=1: complement
+                            _write_copy_blocks(pw, _skipped, params.varint)
                             if stats !== nothing; stats.intra_copy_complement_count += 1; end
                         end
 
@@ -1426,24 +1442,24 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                             stats.intra_overlap_hist[_bucket + 1] += 1
                         end
                     elseif params.intra_copy_blocks
-                        _write_copy_blocks(w, ref_positions, params.varint)
+                        _write_copy_blocks(pw, ref_positions, params.varint)
                     elseif ref_len > 0
                         copied = fill(false, ref_len)
                         for p in ref_positions
                             if 1 <= p <= ref_len; copied[p] = true; end
                         end
-                        Compression.write_bitmap_rle_ones_deltas(w, copied, params.varint)
+                        Compression.write_bitmap_rle_ones_deltas(pw, copied, params.varint)
                     else
                         # empty token list via small count
-                        Compression.write_small_count(w, T(0), params.count_varint)
+                        Compression.write_small_count(pw, T(0), params.count_varint)
                     end
-                    local bpos1 = _total_bits(w)
+                    local bpos1 = _total_bits(pw)
                     # additions: MGS intervals, custom intervals, or plain delta
-                    local ah0 = _total_bits(w)
+                    local ah0 = _total_bits(pw)
                     if (params.intra_intervals || params.intra_greedy_mil) && params.intra_lr_split
-                        _write_ir_lr(w, T.(additions), :fibonacci, mil_vec[idx_local], _zz_vid)
+                        _write_ir_lr(pw, T.(additions), :fibonacci, mil_vec[idx_local], _zz_vid)
                     elseif params.intra_intervals || params.intra_greedy_mil
-                        Compression.write_intervals_and_residuals(w, T.(additions), :fibonacci, mil_vec[idx_local]; vertex_id=_zz_vid)
+                        Compression.write_intervals_and_residuals(pw, T.(additions), :fibonacci, mil_vec[idx_local]; vertex_id=_zz_vid)
                     elseif params.additions_mode == :intervals
                         # detect runs and write intervals + singles
                         runs = Vector{Tuple{Int,Int}}(); singles = Int[]
@@ -1463,14 +1479,14 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                                 i3 = j3 + 1
                             end
                         end
-                        Compression.write_small_count(w, T(length(runs)), params.count_varint)
+                        Compression.write_small_count(pw, T(length(runs)), params.count_varint)
                         for (st, ln) in runs
-                            write_encoded_value(w, T(st), params.varint)
-                            write_encoded_value(w, T(ln), params.varint)
+                            write_encoded_value(pw, T(st), params.varint)
+                            write_encoded_value(pw, T(ln), params.varint)
                         end
-                        Compression.write_small_count(w, T(length(singles)), params.count_varint)
+                        Compression.write_small_count(pw, T(length(singles)), params.count_varint)
                         if !isempty(singles)
-                            write_delta(w, T.(singles), :fibonacci; vertex_id=_zz_vid)
+                            write_delta(pw, T.(singles), :fibonacci; vertex_id=_zz_vid)
                         end
                     elseif params.intra_add_adaptive && params.intra_stop_deltas
                         # Adaptive: per-vertex pick cheaper of STOP-delta vs intervals
@@ -1483,23 +1499,23 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                         Compression.write_intervals_and_residuals(_w_iv, adds_T, :fibonacci, params.intra_adapt_mil; vertex_id=_zz_vid)
                         local _iv_bits = _total_bits(_w_iv)
                         if _iv_bits + 1 < _sd_bits   # +1 for the mode flag itself
-                            write_bit(w, true)   # intervals
-                            Compression.write_intervals_and_residuals(w, adds_T, :fibonacci, params.intra_adapt_mil; vertex_id=_zz_vid)
+                            write_bit(pw, true)   # intervals
+                            Compression.write_intervals_and_residuals(pw, adds_T, :fibonacci, params.intra_adapt_mil; vertex_id=_zz_vid)
                         else
-                            write_bit(w, false)  # stop-delta
-                            _write_stop_delta_zigzag(w, adds_T, :fibonacci, _zz_vid)
+                            write_bit(pw, false)  # stop-delta
+                            _write_stop_delta_zigzag(pw, adds_T, :fibonacci, _zz_vid)
                         end
                     else
                         if params.intra_stop_deltas
-                            _write_stop_delta_zigzag(w, T.(additions), :fibonacci, _zz_vid)
+                            _write_stop_delta_zigzag(pw, T.(additions), :fibonacci, _zz_vid)
                         else
-                            Compression.write_small_count(w, T(length(additions)), params.count_varint)
+                            Compression.write_small_count(pw, T(length(additions)), params.count_varint)
                             if !isempty(additions)
-                                write_delta(w, T.(additions), :fibonacci; vertex_id=_zz_vid)
+                                write_delta(pw, T.(additions), :fibonacci; vertex_id=_zz_vid)
                             end
                         end
                     end
-                    local b3 = _total_bits(w)
+                    local b3 = _total_bits(pw)
                     if stats !== nothing
                         # positions bitmap is copy payload; additions include intervals/singles payload
                         stats.bits_intra_copy += (bpos1 - bpos0)
@@ -1510,11 +1526,11 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                 else
                     # raw
                     nl = raw_lists[idx_local]
-                    local rb0 = _total_bits(w)
+                    local rb0 = _total_bits(pw)
                     if (params.intra_intervals || params.intra_greedy_mil) && params.intra_lr_split
-                        _write_ir_lr(w, T.(nl), :fibonacci, mil_vec[idx_local], _zz_vid)
+                        _write_ir_lr(pw, T.(nl), :fibonacci, mil_vec[idx_local], _zz_vid)
                     elseif params.intra_intervals || params.intra_greedy_mil
-                        Compression.write_intervals_and_residuals(w, T.(nl), :fibonacci, mil_vec[idx_local]; vertex_id=_zz_vid)
+                        Compression.write_intervals_and_residuals(pw, T.(nl), :fibonacci, mil_vec[idx_local]; vertex_id=_zz_vid)
                     elseif params.intra_raw_adaptive && params.intra_stop_deltas
                         # Adaptive: per-vertex pick cheaper of STOP-delta vs intervals
                         local nl_T = T.(nl)
@@ -1525,24 +1541,57 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                         Compression.write_intervals_and_residuals(_w_iv2, nl_T, :fibonacci, params.intra_adapt_mil; vertex_id=_zz_vid)
                         local _iv_bits2 = _total_bits(_w_iv2)
                         if _iv_bits2 + 1 < _sd_bits2
-                            write_bit(w, true)   # intervals
-                            Compression.write_intervals_and_residuals(w, nl_T, :fibonacci, params.intra_adapt_mil; vertex_id=_zz_vid)
+                            write_bit(pw, true)   # intervals
+                            Compression.write_intervals_and_residuals(pw, nl_T, :fibonacci, params.intra_adapt_mil; vertex_id=_zz_vid)
                         else
-                            write_bit(w, false)  # stop-delta
-                            _write_stop_delta_zigzag(w, nl_T, :fibonacci, _zz_vid)
+                            write_bit(pw, false)  # stop-delta
+                            _write_stop_delta_zigzag(pw, nl_T, :fibonacci, _zz_vid)
                         end
                     elseif params.intra_stop_deltas
-                        _write_stop_delta_zigzag(w, T.(nl), :fibonacci, _zz_vid)
+                        _write_stop_delta_zigzag(pw, T.(nl), :fibonacci, _zz_vid)
                     else
                         # raw count: use small-count which escapes to varint for large values and handles zero
-                        Compression.write_small_count(w, T(length(nl)), params.count_varint)
+                        Compression.write_small_count(pw, T(length(nl)), params.count_varint)
                         if !isempty(nl)
-                            write_delta(w, T.(nl), :fibonacci; vertex_id=_zz_vid)
+                            write_delta(pw, T.(nl), :fibonacci; vertex_id=_zz_vid)
                         end
                     end
                     if stats !== nothing
-                        stats.bits_intra_raw += _total_bits(w) - rb0
+                        stats.bits_intra_raw += _total_bits(pw) - rb0
                         stats.intra_no_ref += 1
+                    end
+                end
+            end
+
+            # In index mode, write intra-vertex offset table then buffered payload data
+            if _idx_mode
+                # Record exact payload bit count BEFORE flush (flush adds padding)
+                local _payload_total_bits = _total_bits(_vtx_payload_bw)
+                _vtx_offsets[s + 1] = _payload_total_bits
+                flush_bitwriter(_vtx_payload_bw; flush_last_bits=true)
+
+                # Write offset table: 6-bit vtx_entry_width + (s+1) entries
+                local _max_vtx_offset = _vtx_offsets[s + 1]
+                local _vtx_ew = _max_vtx_offset > 0 ? max(Int(ceil(log2(_max_vtx_offset + 1))), 1) : 1
+                write_value(w, UInt64(_vtx_ew), 6)
+                for _vi in 1:(s + 1)
+                    write_value(w, UInt64(_vtx_offsets[_vi]), _vtx_ew)
+                end
+
+                # Write buffered payload data precisely (avoid byte-padding corruption)
+                seekstart(_vtx_payload_io)
+                local _vtx_data = take!(_vtx_payload_io)
+                local _full_bytes = _payload_total_bits ÷ 8
+                local _remaining_bits = _payload_total_bits % 8
+                # Write full bytes via write_bytes (MSB-first per byte)
+                if _full_bytes > 0
+                    write_bytes(w, _vtx_data[1:_full_bytes])
+                end
+                # Write remaining bits from the last byte (MSB-first)
+                if _remaining_bits > 0 && _full_bytes < length(_vtx_data)
+                    local _last_byte = _vtx_data[_full_bytes + 1]
+                    for _bi in 0:(_remaining_bits - 1)
+                        write_bit(w, ((_last_byte >> (7 - _bi)) & 0x01) == 0x01)
                     end
                 end
             end
@@ -1550,6 +1599,11 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
     end
     if stats !== nothing
         stats.bits_intra += _total_bits(w) - bits_before
+    end
+
+    # Record inter-cluster start bit offset for index mode
+    if cluster_offsets !== nothing
+        cluster_offsets[n_clusters + 1] = _total_bits(w)
     end
 
     # 3) Inter-cluster bundles via stubs (optimized: only present pairs)
@@ -1604,8 +1658,16 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
         sort!(neighbors_by_A[ia])
     end
 
+    # Record inter-section start for computing per-source-cluster relative offsets
+    local _inter_start = _total_bits(w)
+
     # Emit per-A targets and AB groups in fixed A order (1..K)
     for ia in 1:mclusters
+        # Record per-source-cluster inter offset (relative to inter start)
+        if cluster_offsets !== nothing
+            cluster_offsets[n_clusters + 1 + ia] = _total_bits(w) - _inter_start
+        end
+
         A = clusters[ia]
         Bs = get(neighbors_by_A, ia, Int[])
         sort!(Bs)
@@ -1669,12 +1731,12 @@ function read_stop_delta_list(r::BitReader; encoding::Symbol=:fibonacci, T::Type
 end
 
 """
-    decode_level(r::BitReader, params::RCGEParams; T::Type{<:Unsigned}=UInt32, directed::Bool=true)
+    decode_level(r::BitReader, params::CGEParams; T::Type{<:Unsigned}=UInt32, directed::Bool=true, coding_scheme::Symbol=:children)
 
-Decode one RCGE coarsening level from the bitstream.
+Decode one CGE coarsening level from the bitstream.
 Returns a `Dict{T, Vector{T}}` mapping global vertex ID → sorted outneighbors.
 """
-function decode_level(r::BitReader, params::RCGEParams; T::Type{<:Unsigned}=UInt32, directed::Bool=true)
+function decode_level(r::BitReader, params::CGEParams; T::Type{<:Unsigned}=UInt32, directed::Bool=true, coding_scheme::Symbol=:children)
     # ----------------------------------------------------------------
     # Section 1: Read cluster membership
     # ----------------------------------------------------------------
@@ -1814,6 +1876,13 @@ function decode_level(r::BitReader, params::RCGEParams; T::Type{<:Unsigned}=UInt
                         mil_vec[idx] = _mil_options[mi]
                     end
                 end
+            end
+
+            # In index mode, read intra-vertex offset table (skip for sequential decode)
+            if coding_scheme == :index
+                local _vtx_ew = Int(read_value(r, 6, UInt64))
+                local _vtx_offsets = [Int(read_value(r, _vtx_ew, UInt64)) for _ in 1:(s + 1)]
+                # Offsets available for future random access; sequential decode just skips them
             end
 
             # Read per-vertex payloads
@@ -1992,13 +2061,13 @@ function decode_level(r::BitReader, params::RCGEParams; T::Type{<:Unsigned}=UInt
 end
 
 """
-    load_rcge_graph(filepath::AbstractString; params::RCGEParams=RCGEParams(),
+    load_cge_graph(filepath::AbstractString; params::CGEParams=CGEParams(),
                     T::Type{<:Unsigned}=UInt32, directed::Bool=true)
 
-Load an RCGE-compressed graph from a file, decoding all levels.
+Load an CGE-compressed graph from a file, decoding all levels.
 Returns a `Dict{T, Vector{T}}` mapping vertex → sorted outneighbors.
 """
-function load_rcge_graph(filepath::AbstractString; params::RCGEParams=RCGEParams(),
+function load_cge_graph(filepath::AbstractString; params::CGEParams=CGEParams(),
                          T::Type{<:Unsigned}=UInt32, directed::Bool=true)
     data = read(filepath)
     io = IOBuffer(data)
@@ -2017,4 +2086,4 @@ function load_rcge_graph(filepath::AbstractString; params::RCGEParams=RCGEParams
     return neighbor_lists
 end
 
-end # module RCGE
+end # module CGE

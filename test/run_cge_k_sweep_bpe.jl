@@ -1,13 +1,28 @@
+#
+# Adjacently: Julia Complex Directed Networks Library
+# Copyright (C) 2016-2026 Jimmy Dubuisson <jimmy@dubuisson.ch>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+
 #!/usr/bin/env julia
 
-# RCGE K-sweep BPE study without heavy deps
+# CGE K-sweep BPE study without heavy deps
 
 using Logging
 using LightGraphs: nv, ne, outneighbors
 using Adjacently
 using Adjacently.IO: load_adjacency_list_from_csv, BitWriter, flush_bitwriter
 using Adjacently.Clustering: leiden_partition
-using Adjacently.RCGE: encode_level, RCGEParams
+using Adjacently.CGE: encode_level, CGEParams
 
 function build_partition_for_K(g, part0::Vector{Int}, K::Int)
     n = nv(g)
@@ -61,7 +76,7 @@ function compute_bpe_stats(g, clusters, params)
     mcur = sum(length(outneighbors(g, v)) for v in 1:ncur)
     # Encode
     io = IOBuffer(); w = BitWriter(io)
-    stats = Adjacently.RCGE.RCGEStats()
+    stats = Adjacently.CGE.CGEStats()
     encode_level(w, g, clusters; params=params, stats=stats)
     flush_bitwriter(w; flush_last_bits=true)
     bytes = take!(io)
@@ -98,7 +113,7 @@ function main()
     prev = current_logger()
     global_logger(ConsoleLogger(stderr, Logging.Info))
     try
-        csv = get(ENV, "RCGE_DATASET", "datasets/webgraph/cnr-2000/cnr-2000.csv")
+        csv = get(ENV, "CGE_DATASET", "datasets/webgraph/cnr-2000/cnr-2000.csv")
         if !isfile(csv)
             @error "Dataset not found" csv
             return
@@ -114,7 +129,7 @@ function main()
         @info "Base partition labels" unique_labels=length(unique(part0))
 
         # Params
-        params = RCGEParams(L=128, varint=:fibonacci, count_varint=:fibonacci, gap=:fibonacci,
+        params = CGEParams(L=128, varint=:fibonacci, count_varint=:fibonacci, gap=:fibonacci,
                             degree=:elias_delta, undirected_pairs=false, perm_strategy=:blockpos,
                             membership=:elias_fano, inter_strategy=:lists, intra_ref_enabled=true,
                             intra_ref_window=32, intra_ref_rle=false,

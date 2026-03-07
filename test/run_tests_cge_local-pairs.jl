@@ -1,6 +1,21 @@
+#
+# Adjacently: Julia Complex Directed Networks Library
+# Copyright (C) 2016-2026 Jimmy Dubuisson <jimmy@dubuisson.ch>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+
 #!/usr/bin/env julia
 
-# Study RCGE with pair-local inter lists across depths for CNR-2000
+# Study CGE with pair-local inter lists across depths for CNR-2000
 
 include("run_tests_main.jl")
 using Logging
@@ -8,12 +23,12 @@ using Adjacently
 using Adjacently.IO: load_adjacency_list_from_csv, BitWriter, flush_bitwriter
 using Adjacently.Clustering: leiden_partition, aggregate_graph
 using Adjacently.InterEncoding: cluster_density, should_stop_coarsening_by_density
-using Adjacently.RCGE: encode_level, RCGEParams
+using Adjacently.CGE: encode_level, CGEParams
 using Adjacently.Graph: subgraph
 using LightGraphs: nv, outneighbors, is_directed
 import LightGraphs
 
-@testset "RCGE local-pairs study (CNR-2000)" begin
+@testset "CGE local-pairs study (CNR-2000)" begin
     prev = current_logger()
     global_logger(ConsoleLogger(stderr, Logging.Info))
     try
@@ -60,7 +75,7 @@ import LightGraphs
             # densities
             dens = [cluster_density(g, C) for C in clusters]
             @info "Computed densities in $(ms_since(t_stats))ms"
-            # intra bits per cluster and edges (measured via RCGE intra encoder on induced subgraph)
+            # intra bits per cluster and edges (measured via CGE intra encoder on induced subgraph)
             per_cluster_bits = Float64[]
             per_cluster_edges = Int[]
             @info "Starting per-cluster encoding..."
@@ -71,9 +86,9 @@ import LightGraphs
                 s = length(C)
                 Vt = (typeof(g)).parameters[1]
                 mC = sum(length(outneighbors(h, v)) for v in 1:nv(h))
-                # Encode one level with a single cluster [1..s] and measure intra bits as used by RCGE
+                # Encode one level with a single cluster [1..s] and measure intra bits as used by CGE
                 io = IOBuffer(); w = BitWriter(io)
-                statsC = Adjacently.RCGE.RCGEStats()
+                statsC = Adjacently.CGE.CGEStats()
                 cluster_local = Vt[ Vt(i) for i in 1:s ]
                 encode_level(w, h, [cluster_local]; params=params, stats=statsC)
                 flush_bitwriter(w; flush_last_bits=true)
@@ -134,15 +149,15 @@ import LightGraphs
         end
 
         # Depth sweep
-        MAX_LEVELS = try parse(Int, get(ENV, "RCGE_MAX_LEVELS", "3")) catch; 3 end
-        KMAX = try parse(Int, get(ENV, "RCGE_K_MAX", "32")) catch; 32 end
-        K_SELECT = get(ENV, "RCGE_K_SELECT", "modularity")  # or "ncut"
-        min_clusters = try parse(Int, get(ENV, "RCGE_MIN_CLUSTERS", "2")) catch; 2 end
-        min_density = try parse(Float64, get(ENV, "RCGE_MIN_CLUSTER_DENSITY", "0.01")) catch; 0.01 end
-        min_cl_size = try parse(Int, get(ENV, "RCGE_MIN_CLUSTER_SIZE", "16")) catch; 16 end
+        MAX_LEVELS = try parse(Int, get(ENV, "CGE_MAX_LEVELS", "3")) catch; 3 end
+        KMAX = try parse(Int, get(ENV, "CGE_K_MAX", "32")) catch; 32 end
+        K_SELECT = get(ENV, "CGE_K_SELECT", "modularity")  # or "ncut"
+        min_clusters = try parse(Int, get(ENV, "CGE_MIN_CLUSTERS", "2")) catch; 2 end
+        min_density = try parse(Float64, get(ENV, "CGE_MIN_CLUSTER_DENSITY", "0.01")) catch; 0.01 end
+        min_cl_size = try parse(Int, get(ENV, "CGE_MIN_CLUSTER_SIZE", "16")) catch; 16 end
 
         # Encoder params (used for selection and encoding at each level)
-        params = RCGEParams(L=128, varint=:fibonacci, count_varint=:fibonacci, gap=:fibonacci, degree=:elias_delta, undirected_pairs=false, perm_strategy=:blockpos, membership=:elias_fano, inter_strategy=:lists, intra_ref_enabled=true, intra_ref_window=32, intra_ref_rle=false, intra_block_try=false, positions_mode=:delta, additions_mode=:delta)
+        params = CGEParams(L=128, varint=:fibonacci, count_varint=:fibonacci, gap=:fibonacci, degree=:elias_delta, undirected_pairs=false, perm_strategy=:blockpos, membership=:elias_fano, inter_strategy=:lists, intra_ref_enabled=true, intra_ref_window=32, intra_ref_rle=false, intra_block_try=false, positions_mode=:delta, additions_mode=:delta)
 
         cur = g
         level = 1
@@ -177,7 +192,7 @@ import LightGraphs
             @info "Encoding level with K=2..."
             t_encode = time_ns()
             io = IOBuffer(); w = BitWriter(io)
-            stats = Adjacently.RCGE.RCGEStats()
+            stats = Adjacently.CGE.CGEStats()
             encode_level(w, cur, clusters; params=params, stats=stats)
             flush_bitwriter(w; flush_last_bits=true)
             bytes = take!(io)

@@ -1,6 +1,6 @@
 #
 # Adjacently: Julia Complex Directed Networks Library
-# Copyright (C) 2016-2025 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
+# Copyright (C) 2016-2026 Jimmy Dubuisson <jimmy@dubuisson.ch>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -1030,12 +1030,15 @@ function refine_partition(G::WeightedCoarseGraph, part::Vector{Int})
 end
 
 """
-    auto_select_K(g; max_K=8, min_community_frac=0.005, partition=nothing)
+    auto_select_K(g; max_K=8, min_community_frac=0.005, min_granularity=0.01, partition=nothing)
 
-Automatically select the optimal number of RCGE clusters K.
+Automatically select the optimal number of CGE clusters K.
 
-Uses Leiden community detection to identify natural communities, then selects K
-based on graph size and community structure:
+First runs a cheap single-pass Louvain to estimate community granularity (L/n).
+If the graph has coarse community structure (L/n < `min_granularity`), returns K=1
+immediately without running full Leiden — K=1 with global LLP is preferred for such
+graphs. Otherwise, runs full Leiden and selects K based on graph size and community
+structure:
 - K grows logarithmically with vertex count: `ceil(log2(n / 100_000))`
   (graphs ≤ 100K vertices get K=1; larger graphs benefit from more clusters)
 - K is capped by the number of significant Leiden communities (those with
@@ -1043,13 +1046,35 @@ based on graph size and community structure:
 
 Returns `(K, partition)`:
 - `K`: recommended number of clusters for `leiden_partition_k`
-- `partition`: the Leiden partition vector (for reuse, avoids recomputing)
+- `partition`: the Leiden partition vector (for reuse, avoids recomputing);
+  `nothing` when K=1 (partition not needed for K=1 path)
 """
 function auto_select_K(g::AbstractGraph{T};
         max_K::Int=8,
         min_community_frac::Float64=0.005,
+        min_granularity::Float64=0.01,
         partition::Union{Nothing,Vector{Int}}=nothing) where {T<:Unsigned}
     n = nv(g)
+
+    # Quick granularity check: 2-pass Louvain to estimate community count.
+    # 2 passes converge enough to distinguish fine-grained graphs (many small communities)
+    # from coarse ones (few large communities), while being much cheaper than full Leiden
+    # (2 passes vs 8 passes + refinement + multi-level aggregation).
+    quick_part = louvain_local_move(g; max_passes=2)
+    L_quick = length(Set(quick_part))
+    granularity = L_quick / n
+
+    # Community granularity: L/n = communities per vertex.
+    # Fine-grained (e.g. 0.08–0.10): many small tight communities;
+    #   K>1 splitting groups them effectively and crawl-order locality within clusters is good.
+    # Coarse (e.g. < 0.01): few large communities;
+    #   K>1 splitting is ineffective, K=1 with global LLP is preferred.
+    if granularity < min_granularity
+        @info "auto_select_K: n=$n, ~$L_quick communities (quick), granularity=$(round(granularity, digits=4)) < $(min_granularity) (coarse) → K=1"
+        return 1, nothing
+    end
+
+    # Fine-grained: run full Leiden for accurate partition (needed for K>1 path)
     part = partition !== nothing ? partition : leiden_partition(g; max_passes=8, max_levels=5)
 
     # Count community sizes and sort descending
@@ -1072,7 +1097,7 @@ function auto_select_K(g::AbstractGraph{T};
     # Log top community sizes for diagnostics
     n_show = min(K + 2, length(sorted_labels))
     top_sizes = [counts[sorted_labels[i]] for i in 1:n_show]
-    @info "auto_select_K: n=$n, $L communities, $n_significant significant (≥$(min_size)v), K_base=$K_base → K=$K  top_sizes=$top_sizes"
+    @info "auto_select_K: n=$n, $L communities, granularity=$(round(L / n, digits=4)), $n_significant significant (≥$(min_size)v), K_base=$K_base → K=$K  top_sizes=$top_sizes"
 
     return K, part
 end
