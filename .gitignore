@@ -12,7 +12,7 @@
 
 # Julia package manager artifacts
 
-Manifest.toml
+#Manifest.toml
 
 # Julia REPL history
 
@@ -38,6 +38,7 @@ deps/build.log
 # custom
 
 datasets/webgraph/enwiki-2013/enwiki-2013.csv
+datasets/webgraph/enwiki-2013/enwiki-2013.edges
 
 # =========================
 

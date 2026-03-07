@@ -203,7 +203,7 @@ If an edge from Level t points into Level t-1, we add a reconciliation tuple for
 | Method | Bits/Edge |
 |--------|-----------|
 | WebGraph (Zeta-3, LLP) | 2.90 |
-| RCGE (Leiden + Elias-Fano) | 4.75 |
+| CGE (Leiden + Elias-Fano) | 4.75 |
 | Legacy ASTRA (MGS V2) | 5.11 |
 | ASTRA-L (SCC-in-ball, old) | 450 (broken — see below) |
 | ASTRA-L (full-ball + MGS, new) | 7.55 |
