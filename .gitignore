@@ -35,10 +35,19 @@ coverage/
 build/
 deps/build.log
 
-# custom
+# Webgraph source datasets (large files — see README.md in each subfolder)
 
-datasets/webgraph/enwiki-2013/enwiki-2013.csv
-datasets/webgraph/enwiki-2013/enwiki-2013.edges
+datasets/webgraph/**
+!datasets/webgraph/README.md
+!datasets/webgraph/cnr-2000/
+datasets/webgraph/cnr-2000/**
+!datasets/webgraph/cnr-2000/README.md
+!datasets/webgraph/in-2004/
+datasets/webgraph/in-2004/**
+!datasets/webgraph/in-2004/README.md
+!datasets/webgraph/enwiki-2013/
+datasets/webgraph/enwiki-2013/**
+!datasets/webgraph/enwiki-2013/README.md
 
 # =========================
 
