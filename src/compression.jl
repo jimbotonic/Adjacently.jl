@@ -1,6 +1,6 @@
 #
 # Adjacently: Julia Complex Directed Networks Library
-# Copyright (C) 2016-2025 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
+# Copyright (C) 2016-2026 Jimmy Dubuisson <jimmy@dubuisson.ch>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -1286,7 +1286,7 @@ function write_intervals_and_residuals(w::BitWriter, neighbors::Vector{T}, encod
             if idx == 1 && vertex_id !== nothing
                 # First interval start: zigzag offset from vertex_id
                 offset = Int64(start) - Int64(vertex_id)
-                encoded_start = T(_zigzag_encode(offset) + 1)
+                encoded_start = UInt64(_zigzag_encode(offset) + 1)
                 write_encoded_value(w, encoded_start, encoding)
             else
                 # Delta encode start positions
@@ -1337,8 +1337,8 @@ function read_intervals_and_residuals(r::BitReader, encoding::Symbol, min_interv
         for idx in 1:num_intervals
             if idx == 1 && vertex_id !== nothing
                 # First interval start: zigzag decode from vertex_id
-                raw_start = read_encoded_value(r, encoding, T)
-                start = T(Int64(vertex_id) + _zigzag_decode(UInt64(raw_start - 1)))
+                raw_start = read_encoded_value(r, encoding, UInt64)
+                start = T(Int64(vertex_id) + _zigzag_decode(raw_start - 1))
             else
                 # Read delta-encoded start
                 start_delta = read_encoded_value(r, encoding, T)
@@ -1403,7 +1403,7 @@ function write_delta(w::BitWriter, lst::Vector{T}, encoding::Symbol; vertex_id=n
     if vertex_id !== nothing
         # Relative first-value: zigzag(v₁ - vertex_id) + 1
         offset = Int64(lst[1]) - Int64(vertex_id)
-        encoded_first = T(_zigzag_encode(offset) + 1)
+        encoded_first = UInt64(_zigzag_encode(offset) + 1)
         write_encoded_value(w, encoded_first, encoding)
         @debug "WRITE delta: wrote zigzag first value offset=$offset encoded=$encoded_first"
     else
@@ -1438,10 +1438,10 @@ function read_delta(r::BitReader, encoding::Symbol, ::Type{T}=UInt8; max_element
     # read the first value (not delta encoded)
     # NB: we assume that the first value is not 0
     try
-        raw_first = read_encoded_value(r, encoding, T)
+        raw_first = vertex_id !== nothing ? read_encoded_value(r, encoding, UInt64) : read_encoded_value(r, encoding, T)
         if vertex_id !== nothing
             # Relative first-value: vertex_id + zigzag_decode(raw - 1)
-            first_value = T(Int64(vertex_id) + _zigzag_decode(UInt64(raw_first - 1)))
+            first_value = T(Int64(vertex_id) + _zigzag_decode(raw_first - 1))
             @debug "READ delta: read zigzag first raw=$raw_first decoded=$first_value"
         else
             first_value = raw_first
@@ -1532,12 +1532,12 @@ function write_hybrid_mix_encoded_list(w::BitWriter, delta_list::Vector{T}, enco
         # Relative first-value: zigzag(v₁ - vertex_id) + 1
         # delta_list[1] is the first absolute value from delta_encode_vector
         offset = Int64(delta_list[1]) - Int64(vertex_id)
-        encoded_first = T(_zigzag_encode(offset) + 1)
+        encoded_first = UInt64(_zigzag_encode(offset) + 1)
         write_encoded_value(w, encoded_first, encoding)
     else
         write_encoded_value(w, delta_list[1], encoding)
     end
-    
+
     if !hybrid_active
         # Simple delta mode - write remaining values directly like write_mix_encoded_list
         for i in 2:length(delta_list)
@@ -1632,11 +1632,11 @@ function read_hybrid_mix_encoded_list(r::BitReader, coding_scheme::Symbol, integ
     use_run_length_and_interval = read_bit(r)
 
     # Read the first value (same as read_mix_encoded_list)
-    raw_first = read_encoded_value(r, integer_encoding, T)
+    raw_first = vertex_id !== nothing ? read_encoded_value(r, integer_encoding, UInt64) : read_encoded_value(r, integer_encoding, T)
 
     if vertex_id !== nothing
         # Relative first-value: vertex_id + zigzag_decode(raw - 1)
-        first_value = T(Int64(vertex_id) + _zigzag_decode(UInt64(raw_first - 1)))
+        first_value = T(Int64(vertex_id) + _zigzag_decode(raw_first - 1))
     else
         first_value = raw_first
     end
@@ -1974,7 +1974,7 @@ function estimate_interval_runlength_encoding_cost(neighbors::Vector{T}, integer
     prev_ref = T(0)
     for (idx, (start, len)) in enumerate(intervals)
         if idx == 1 && vertex_id !== nothing
-            encoded_start = T(_zigzag_encode(Int64(start) - Int64(vertex_id)) + 1)
+            encoded_start = UInt64(_zigzag_encode(Int64(start) - Int64(vertex_id)) + 1)
             cost += estimate_encoded_value_cost(encoded_start, integer_encoding)
         else
             # Delta from previous reference point (start or end depending on tight_intervals)
@@ -1991,7 +1991,7 @@ function estimate_interval_runlength_encoding_cost(neighbors::Vector{T}, integer
     if !isempty(residuals)
         residual_deltas = delta_encode_vector(residuals)
         if vertex_id !== nothing
-            encoded_first = T(_zigzag_encode(Int64(residuals[1]) - Int64(vertex_id)) + 1)
+            encoded_first = UInt64(_zigzag_encode(Int64(residuals[1]) - Int64(vertex_id)) + 1)
             cost += estimate_encoded_value_cost(encoded_first, integer_encoding)
         else
             cost += estimate_encoded_value_cost(residual_deltas[1], integer_encoding)
@@ -2721,6 +2721,11 @@ const MIL_OPTIONS = [2, 3, 4, 5]
 # Default encoding for greedy-compressed streams
 const _FIXED_ENCODING = :fibonacci
 
+# Total bits written so far (bytes flushed to IO + buffered bits)
+@inline function _total_bits(w::BitWriter)
+    return Int(position(w.io)) * 8 + (w.index - 1)
+end
+
 # Flattened Encoding Options (Type, MIL)
 const ENCODING_OPTIONS = vcat(
     [(:interval, mil) for mil in MIL_OPTIONS],
@@ -2898,6 +2903,14 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
     vs = length(keys(neighbor_lists))
     ie = integer_encoding
 
+    # In index mode, override stop_deltas and empty_prefix (redundant with offset table)
+    idx_mode = coding_scheme == :index
+    if idx_mode
+        stop_deltas = false
+        empty_prefix = false
+        adaptive_deltas = false
+    end
+
     reference_window = T[]
     function add_to_ref_window!(vertex::T)
         push!(reference_window, vertex)
@@ -2910,29 +2923,25 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
     ref_dist_bits = fixwidth_ref ? ceil(Int, log2(max(2, ref_window_size))) : 0
 
     # Header: Coding scheme (1) + Encoding (3)
-    write_bit(w, coding_scheme == :index)
+    write_bit(w, idx_mode)
     _write_encoding_tag(w, get(ENCODING_TAGS, ie, ENC_TAG_FIBONACCI))
 
-    if coding_scheme == :index
-        for v_idx in 1:vs
-            write_encoded_value(w, T(length(get(neighbor_lists, T(v_idx), T[])) + 1), ie)
-        end
-    end
-
-    # Unified Data section
-    for v_idx in 1:vs
-        v = T(v_idx)
-
-        current_neighbors = sort(get(neighbor_lists, v, T[]))
-
-        # Empty-prefix optimization: 1-bit flag per vertex (0=empty, 1=non-empty)
+    # --- Helper: encode one vertex's data into a BitWriter ---
+    function _encode_vertex!(wr, v::T, current_neighbors::Vector{T})
+        # Empty-prefix optimization (children mode only)
         if empty_prefix
             if isempty(current_neighbors)
-                write_bit(w, false)  # empty vertex
+                write_bit(wr, false)  # empty vertex
                 add_to_ref_window!(v)
-                continue
+                return
             end
-            write_bit(w, true)  # non-empty vertex
+            write_bit(wr, true)  # non-empty vertex
+        end
+
+        # In index mode, skip empty vertices entirely (nothing between their offsets)
+        if idx_mode && isempty(current_neighbors)
+            add_to_ref_window!(v)
+            return
         end
 
         actual_ref_mode = :none
@@ -2944,7 +2953,7 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         _, actual_ref_mode, mil, ref_result, enc_type, use_stop, res_enc_type, res_mil = _greedy_vertex_search(current_neighbors, neighbor_lists, reference_window, ie; vertex_id=v, copy_blocks=copy_blocks, adaptive_copy=adaptive_copy, fixwidth_ref=fixwidth_ref, ref_dist_bits=ref_dist_bits, stop_deltas=stop_deltas, adaptive_deltas=adaptive_deltas, split_residual=split_residual, bv_blocks=bv_blocks, compact_copy=compact_copy, tight_intervals=tight_intervals, vlc2=vlc2)
 
         # Write VLC vertex header
-        _write_vertex_header_vlc(w, actual_ref_mode, enc_type, mil; vlc2=vlc2)
+        _write_vertex_header_vlc(wr, actual_ref_mode, enc_type, mil; vlc2=vlc2)
 
         # Collect action statistics if requested
         if stats !== nothing
@@ -2960,24 +2969,24 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
             if fixwidth_ref
                 local d = Int(ref_distance) - 1
                 for b in (ref_dist_bits-1):-1:0
-                    write_bit(w, ((d >> b) & 1) == 1)
+                    write_bit(wr, ((d >> b) & 1) == 1)
                 end
             else
-                write_encoded_value(w, T(ref_distance), ie)
+                write_encoded_value(wr, T(ref_distance), ie)
             end
             if adaptive_copy && copy_blocks
-                _write_adaptive_copy(w, copy_bitmap, ie; bv_blocks=bv_blocks, compact_copy=compact_copy)
+                _write_adaptive_copy(wr, copy_bitmap, ie; bv_blocks=bv_blocks, compact_copy=compact_copy)
             elseif copy_blocks
-                _write_copy_blocks(w, copy_bitmap, ie)
+                _write_copy_blocks(wr, copy_bitmap, ie)
             else
-                write_bitmap_adaptive(w, copy_bitmap, ie)
+                write_bitmap_adaptive(wr, copy_bitmap, ie)
             end
             # Split residual encoding: signal if residuals use a different enc_type
             if split_residual
                 same_enc = (res_enc_type == enc_type && (res_mil == mil || res_enc_type == :delta))
-                write_bit(w, !same_enc)  # 0 = same, 1 = different
+                write_bit(wr, !same_enc)  # 0 = same, 1 = different
                 if !same_enc
-                    _write_enc_opt_tag(w, res_enc_type, res_mil)
+                    _write_enc_opt_tag(wr, res_enc_type, res_mil)
                 end
             end
             target_list = residuals
@@ -2987,32 +2996,71 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
 
         # Encode target_list
         if write_enc == :interval
-            write_intervals_and_residuals(w, target_list, ie, write_mil; vertex_id=v, tight_intervals=tight_intervals)
+            write_intervals_and_residuals(wr, target_list, ie, write_mil; vertex_id=v, tight_intervals=tight_intervals)
         elseif write_enc == :delta
             # Determine delta format: adaptive (per-vertex) or global
             vertex_stop = adaptive_deltas ? use_stop : stop_deltas
             if adaptive_deltas
-                write_bit(w, vertex_stop)  # 1-bit flag: true=stop, false=count
+                write_bit(wr, vertex_stop)  # 1-bit flag: true=stop, false=count
             end
             if vertex_stop
-                _write_stop_delta(w, target_list, ie; vertex_id=v)
+                _write_stop_delta(wr, target_list, ie; vertex_id=v)
             else
                 # Self-delimiting delta: count + values
-                write_encoded_value(w, T(length(target_list) + 1), ie)
+                write_encoded_value(wr, T(length(target_list) + 1), ie)
                 if !isempty(target_list)
-                    write_delta(w, target_list, ie; vertex_id=v)
+                    write_delta(wr, target_list, ie; vertex_id=v)
                 end
             end
         elseif write_enc == :rle
             # Self-delimiting RLE: count + hybrid
-            write_encoded_value(w, T(length(target_list) + 1), ie)
+            write_encoded_value(wr, T(length(target_list) + 1), ie)
             if !isempty(target_list)
                 deltas = delta_encode_vector(target_list)
-                write_hybrid_mix_encoded_list(w, deltas, ie, true, write_mil, false; vertex_id=v)
+                write_hybrid_mix_encoded_list(wr, deltas, ie, true, write_mil, false; vertex_id=v)
             end
         end
-        
+
         add_to_ref_window!(v)
+    end
+
+    if idx_mode
+        # Two-pass encoding: encode per-vertex data to buffer, then write offset table + data
+        buf_io = IOBuffer()
+        buf_bw = BitWriter(buf_io)
+        vertex_offsets = Vector{Int}(undef, vs + 1)
+
+        for v_idx in 1:vs
+            v = T(v_idx)
+            vertex_offsets[v_idx] = _total_bits(buf_bw)
+            current_neighbors = sort(get(neighbor_lists, v, T[]))
+            _encode_vertex!(buf_bw, v, current_neighbors)
+        end
+        flush_bitwriter(buf_bw; flush_last_bits=true)
+        vertex_offsets[vs + 1] = Int(position(buf_io)) * 8
+
+        # Compute entry width
+        max_offset = vertex_offsets[vs + 1]
+        entry_width = max_offset > 0 ? max(Int(ceil(log2(max_offset + 1))), 1) : 1
+
+        # Write offset table: 6-bit entry_width + (N+1) entries
+        write_value(w, UInt64(entry_width), 6)
+        for i in 1:(vs + 1)
+            write_value(w, UInt64(vertex_offsets[i]), entry_width)
+        end
+
+        # Write buffered encoded data
+        seekstart(buf_io)
+        buf_data = take!(buf_io)
+        write_bytes(w, buf_data)
+    else
+        # Children mode: legacy degree-count index table (not used) + sequential encoding
+        # Unified Data section
+        for v_idx in 1:vs
+            v = T(v_idx)
+            current_neighbors = sort(get(neighbor_lists, v, T[]))
+            _encode_vertex!(w, v, current_neighbors)
+        end
     end
 end
 
@@ -3031,11 +3079,19 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
     enc_tag = _read_encoding_tag(r)
     ie = get(TAG_ENCODINGS, enc_tag, :fibonacci)
 
-    out_degrees = T[]
+    # In index mode, override stop_deltas and empty_prefix
     if is_index_mode
-        out_degrees = Vector{T}(undef, Int(vs))
-        for v in 1:Int(vs)
-            out_degrees[v] = read_encoded_value(r, ie, T) - T(1)
+        stop_deltas = false
+        empty_prefix = false
+        adaptive_deltas = false
+    end
+
+    # Read offset table or legacy degree array
+    vertex_offsets = Int[]
+    if is_index_mode
+        entry_width = Int(read_value(r, 6, UInt64))
+        for _ in 1:(Int(vs) + 1)
+            push!(vertex_offsets, Int(read_value(r, entry_width, UInt64)))
         end
     end
 
@@ -3047,60 +3103,48 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
         end
     end
 
-    # Unified Data loop
-    for v_idx in 1:Int(vs)
-        v = T(v_idx)
-
-        # Empty-prefix optimization: 1-bit flag per vertex (0=empty, 1=non-empty)
-        if empty_prefix
-            if !read_bit(r)  # empty vertex
-                neighbor_lists[v] = T[]
-                add_to_ref_window!(v)
-                continue
-            end
-        end
-
-        # Read VLC vertex header
-        ref_mode, enc_type, mil = _read_vertex_header_vlc(r; vlc2=vlc2)
-
-        current_neighbors = T[]
-        is_ref = ref_mode != :none
-        
-        # Helper to read encoded list based on type
-        function read_encoded_list_body(read_et::Symbol=enc_type, read_m::Int=mil)
-            if read_et == :interval
-                return read_intervals_and_residuals(r, ie, read_m, T; vertex_id=v, tight_intervals=tight_intervals)
-            elseif read_et == :delta
-                # Determine delta format: adaptive (per-vertex) or global
-                vertex_stop = adaptive_deltas ? read_bit(r) : stop_deltas
-                if vertex_stop
-                    return _read_stop_delta(r, ie, T; vertex_id=v)
-                else
-                    count = read_encoded_value(r, ie, T) - T(1)
-                    if count > 0
-                        return read_delta(r, ie, T; max_elements=Int(count), vertex_id=v)
-                    end
-                    return T[]
-                end
-            elseif read_et == :rle
-                count = read_encoded_value(r, ie, T) - T(1)
+    # Helper to read encoded list based on type (using captured ie, tight_intervals, etc.)
+    function _read_encoded_list_body(r_in::BitReader, v::T, enc_type::Symbol, mil::Int)
+        if enc_type == :interval
+            return read_intervals_and_residuals(r_in, ie, mil, T; vertex_id=v, tight_intervals=tight_intervals)
+        elseif enc_type == :delta
+            # Determine delta format: adaptive (per-vertex) or global
+            vertex_stop = adaptive_deltas ? read_bit(r_in) : stop_deltas
+            if vertex_stop
+                return _read_stop_delta(r_in, ie, T; vertex_id=v)
+            else
+                count = read_encoded_value(r_in, ie, T) - T(1)
                 if count > 0
-                    return read_hybrid_mix_encoded_list(r, :index, ie, T; max_elements=Int(count), vertex_id=v)
+                    return read_delta(r_in, ie, T; max_elements=Int(count), vertex_id=v)
                 end
                 return T[]
             end
+        elseif enc_type == :rle
+            count = read_encoded_value(r_in, ie, T) - T(1)
+            if count > 0
+                return read_hybrid_mix_encoded_list(r_in, :index, ie, T; max_elements=Int(count), vertex_id=v)
+            end
             return T[]
         end
+        return T[]
+    end
+
+    function _decode_vertex!(r_in::BitReader, v::T)
+        # Read VLC vertex header
+        ref_mode, enc_type, mil = _read_vertex_header_vlc(r_in; vlc2=vlc2)
+
+        current_neighbors = T[]
+        is_ref = ref_mode != :none
 
         if is_ref
             if fixwidth_ref
                 local d = 0
                 for _ in 1:ref_dist_bits
-                    d = (d << 1) | Int(read_bit(r))
+                    d = (d << 1) | Int(read_bit(r_in))
                 end
                 distance = T(d + 1)
             else
-                distance = read_encoded_value(r, ie, T)
+                distance = read_encoded_value(r_in, ie, T)
             end
             if adaptive_copy && copy_blocks
                 # 3-way nested mode: need ref_len before reading copy mode
@@ -3111,26 +3155,26 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
                     ref_nbs = get(neighbor_lists, ref_v, T[])
                 end
                 ref_len = length(ref_nbs)
-                copy_bitmap = _read_adaptive_copy(r, ref_len, ie, T; bv_blocks=bv_blocks, compact_copy=compact_copy)
+                copy_bitmap = _read_adaptive_copy(r_in, ref_len, ie, T; bv_blocks=bv_blocks, compact_copy=compact_copy)
                 # Split residual: read residual encoding if different from header
                 res_et, res_m = enc_type, mil
                 if split_residual
-                    if read_bit(r)  # 1 = different encoding
-                        res_et, res_m = _read_enc_opt_tag(r)
+                    if read_bit(r_in)  # 1 = different encoding
+                        res_et, res_m = _read_enc_opt_tag(r_in)
                     end
                 end
-                residuals = read_encoded_list_body(res_et, res_m)
+                residuals = _read_encoded_list_body(r_in, v, res_et, res_m)
                 current_neighbors = reconstruct_from_reference(ref_nbs, copy_bitmap, residuals)
             elseif copy_blocks
-                copy_positions = _read_copy_blocks(r, ie, T)
+                copy_positions = _read_copy_blocks(r_in, ie, T)
                 # Split residual: read residual encoding if different from header
                 res_et, res_m = enc_type, mil
                 if split_residual
-                    if read_bit(r)  # 1 = different encoding
-                        res_et, res_m = _read_enc_opt_tag(r)
+                    if read_bit(r_in)  # 1 = different encoding
+                        res_et, res_m = _read_enc_opt_tag(r_in)
                     end
                 end
-                residuals = read_encoded_list_body(res_et, res_m)
+                residuals = _read_encoded_list_body(r_in, v, res_et, res_m)
                 ref_idx = length(reference_window) - Int(distance) + 1
                 if 1 <= ref_idx <= length(reference_window)
                     ref_v = reference_window[ref_idx]
@@ -3140,15 +3184,15 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
                     current_neighbors = residuals
                 end
             else
-                copy_bitmap = read_bitmap_adaptive(r, ie)
+                copy_bitmap = read_bitmap_adaptive(r_in, ie)
                 # Split residual: read residual encoding if different from header
                 res_et, res_m = enc_type, mil
                 if split_residual
-                    if read_bit(r)  # 1 = different encoding
-                        res_et, res_m = _read_enc_opt_tag(r)
+                    if read_bit(r_in)  # 1 = different encoding
+                        res_et, res_m = _read_enc_opt_tag(r_in)
                     end
                 end
-                residuals = read_encoded_list_body(res_et, res_m)
+                residuals = _read_encoded_list_body(r_in, v, res_et, res_m)
                 ref_idx = length(reference_window) - Int(distance) + 1
                 if 1 <= ref_idx <= length(reference_window)
                     ref_v = reference_window[ref_idx]
@@ -3159,8 +3203,35 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
                 end
             end
         else
-            current_neighbors = read_encoded_list_body()
+            current_neighbors = _read_encoded_list_body(r_in, v, enc_type, mil)
         end
+
+        return current_neighbors
+    end
+
+    # Unified Data loop
+    for v_idx in 1:Int(vs)
+        v = T(v_idx)
+
+        if is_index_mode
+            # Index mode: empty vertex = offset[v] == offset[v+1]
+            if vertex_offsets[v_idx] == vertex_offsets[v_idx + 1]
+                neighbor_lists[v] = T[]
+                add_to_ref_window!(v)
+                continue
+            end
+        else
+            # Empty-prefix optimization: 1-bit flag per vertex (0=empty, 1=non-empty)
+            if empty_prefix
+                if !read_bit(r)  # empty vertex
+                    neighbor_lists[v] = T[]
+                    add_to_ref_window!(v)
+                    continue
+                end
+            end
+        end
+
+        current_neighbors = _decode_vertex!(r, v)
 
         neighbor_lists[v] = current_neighbors
         add_to_ref_window!(v)
@@ -3483,7 +3554,7 @@ function _write_stop_delta(w::BitWriter, sorted_vals::Vector{T}, ie::Symbol; ver
     write_bit(w, true)
     if vertex_id !== nothing
         offset = Int64(sorted_vals[1]) - Int64(vertex_id)
-        write_encoded_value(w, T(_zigzag_encode(offset) + 1), ie)
+        write_encoded_value(w, UInt64(_zigzag_encode(offset) + 1), ie)
     else
         write_encoded_value(w, sorted_vals[1], ie)
     end
@@ -3500,12 +3571,12 @@ function _read_stop_delta(r::BitReader, ie::Symbol, ::Type{T}; vertex_id=nothing
     first = true
     prev = zero(T)
     while read_bit(r)  # '1' = more values, '0' = STOP
-        raw = read_encoded_value(r, ie, T)
         if first
             if vertex_id !== nothing
-                val = T(Int64(vertex_id) + _zigzag_decode(UInt64(raw - 1)))
+                raw64 = read_encoded_value(r, ie, UInt64)
+                val = T(Int64(vertex_id) + _zigzag_decode(raw64 - 1))
             else
-                val = raw
+                val = read_encoded_value(r, ie, T)
             end
             first = false
         else
@@ -3523,7 +3594,7 @@ function _estimate_stop_delta_cost(sorted_vals::Vector{T}, ie::Symbol; vertex_id
     # First value
     if vertex_id !== nothing
         offset = Int64(sorted_vals[1]) - Int64(vertex_id)
-        cost += 1 + estimate_encoded_value_cost(T(_zigzag_encode(offset) + 1), ie)
+        cost += 1 + estimate_encoded_value_cost(UInt64(_zigzag_encode(offset) + 1), ie)
     else
         cost += 1 + estimate_encoded_value_cost(sorted_vals[1], ie)
     end
@@ -3564,7 +3635,7 @@ function _estimate_delta_cost(neighbors::Vector{T}, ie::Symbol; vertex_id=nothin
     deltas = delta_encode_vector(neighbors)
     cost = 0
     if vertex_id !== nothing
-        encoded_first = T(_zigzag_encode(Int64(neighbors[1]) - Int64(vertex_id)) + 1)
+        encoded_first = UInt64(_zigzag_encode(Int64(neighbors[1]) - Int64(vertex_id)) + 1)
         cost += estimate_encoded_value_cost(encoded_first, ie)
     else
         cost += estimate_encoded_value_cost(deltas[1], ie)
@@ -3580,7 +3651,7 @@ function _estimate_rle_cost(neighbors::Vector{T}, ie::Symbol, mil::Int; vertex_i
     deltas = delta_encode_vector(neighbors)
     cost = 1 # hybrid flag
     if vertex_id !== nothing
-        encoded_first = T(_zigzag_encode(Int64(neighbors[1]) - Int64(vertex_id)) + 1)
+        encoded_first = UInt64(_zigzag_encode(Int64(neighbors[1]) - Int64(vertex_id)) + 1)
         cost += estimate_encoded_value_cost(encoded_first, ie)
     else
         cost += estimate_encoded_value_cost(deltas[1], ie)
@@ -3942,6 +4013,7 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
 
     vs = length(keys(neighbor_lists))
     ie = integer_encoding
+    idx_mode = coding_scheme == :index
 
     reference_window = T[]
     function add_to_ref_window!(vertex::T)
@@ -3952,25 +4024,18 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
     end
 
     # Header: Coding scheme (1) + Encoding (3)
-    write_bit(w, coding_scheme == :index)
+    write_bit(w, idx_mode)
     _write_encoding_tag(w, get(ENCODING_TAGS, ie, ENC_TAG_FIBONACCI))
 
-    if coding_scheme == :index
-        for v_idx in 1:vs
-            write_encoded_value(w, T(length(get(neighbor_lists, T(v_idx), T[])) + 1), ie)
-        end
-    end
-
-    # Per-vertex loop
-    for v_idx in 1:vs
-        v = T(v_idx)
-        current_neighbors = sort(get(neighbor_lists, v, T[]))
-
-        # Empty vertex → CS header encodes it directly
+    # --- Helper: encode one vertex's data into a BitWriter ---
+    function _encode_cs_vertex!(wr, v::T, current_neighbors::Vector{T})
+        # In index mode, skip empty vertices entirely (nothing between their offsets)
         if isempty(current_neighbors)
-            _write_cs_header(w, :none, :delta, 0, true)
+            if !idx_mode
+                _write_cs_header(wr, :none, :delta, 0, true)
+            end
             add_to_ref_window!(v)
-            continue
+            return
         end
 
         # Greedy search with CS headers
@@ -3979,31 +4044,77 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
             vertex_id=v, compact_copy=compact_copy, tight_intervals=tight_intervals)
 
         # Write CS header
-        _write_cs_header(w, ref_mode, enc_type, mil, false)
+        _write_cs_header(wr, ref_mode, enc_type, mil, false)
 
         target_list = current_neighbors
         if ref_mode != :none && ref_result !== nothing
             ref_distance, copy_bitmap, residuals = ref_result
-            write_encoded_value(w, T(ref_distance), ie)
-            _write_adaptive_copy(w, copy_bitmap, ie; compact_copy=compact_copy)
+            write_encoded_value(wr, T(ref_distance), ie)
+            _write_adaptive_copy(wr, copy_bitmap, ie; compact_copy=compact_copy)
             target_list = residuals
         end
 
         # Encode target_list
         if enc_type == :interval
-            write_intervals_and_residuals(w, target_list, ie, mil; vertex_id=v, tight_intervals=tight_intervals)
+            write_intervals_and_residuals(wr, target_list, ie, mil; vertex_id=v, tight_intervals=tight_intervals)
         elseif enc_type == :delta
-            # CS always uses stop_deltas for :delta
-            _write_stop_delta(w, target_list, ie; vertex_id=v)
+            if idx_mode
+                # Index mode: count-prefixed delta (no stop terminators)
+                write_encoded_value(wr, T(length(target_list) + 1), ie)
+                if !isempty(target_list)
+                    write_delta(wr, target_list, ie; vertex_id=v)
+                end
+            else
+                # CS children mode: always uses stop_deltas for :delta
+                _write_stop_delta(wr, target_list, ie; vertex_id=v)
+            end
         elseif enc_type == :rle
-            write_encoded_value(w, T(length(target_list) + 1), ie)
+            write_encoded_value(wr, T(length(target_list) + 1), ie)
             if !isempty(target_list)
                 deltas = delta_encode_vector(target_list)
-                write_hybrid_mix_encoded_list(w, deltas, ie, true, mil, false; vertex_id=v)
+                write_hybrid_mix_encoded_list(wr, deltas, ie, true, mil, false; vertex_id=v)
             end
         end
 
         add_to_ref_window!(v)
+    end
+
+    if idx_mode
+        # Two-pass encoding: encode per-vertex data to buffer, then write offset table + data
+        buf_io = IOBuffer()
+        buf_bw = BitWriter(buf_io)
+        vertex_offsets = Vector{Int}(undef, vs + 1)
+
+        for v_idx in 1:vs
+            v = T(v_idx)
+            vertex_offsets[v_idx] = _total_bits(buf_bw)
+            current_neighbors = sort(get(neighbor_lists, v, T[]))
+            _encode_cs_vertex!(buf_bw, v, current_neighbors)
+        end
+        flush_bitwriter(buf_bw; flush_last_bits=true)
+        vertex_offsets[vs + 1] = Int(position(buf_io)) * 8
+
+        # Compute entry width
+        max_offset = vertex_offsets[vs + 1]
+        entry_width = max_offset > 0 ? max(Int(ceil(log2(max_offset + 1))), 1) : 1
+
+        # Write offset table: 6-bit entry_width + (N+1) entries
+        write_value(w, UInt64(entry_width), 6)
+        for i in 1:(vs + 1)
+            write_value(w, UInt64(vertex_offsets[i]), entry_width)
+        end
+
+        # Write buffered encoded data
+        seekstart(buf_io)
+        buf_data = take!(buf_io)
+        write_bytes(w, buf_data)
+    else
+        # Children mode: sequential encoding
+        for v_idx in 1:vs
+            v = T(v_idx)
+            current_neighbors = sort(get(neighbor_lists, v, T[]))
+            _encode_cs_vertex!(w, v, current_neighbors)
+        end
     end
 end
 
@@ -4018,11 +4129,12 @@ function read_cmdstream_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, :
     enc_tag = _read_encoding_tag(r)
     ie = get(TAG_ENCODINGS, enc_tag, :fibonacci)
 
-    out_degrees = T[]
+    # Read offset table (index mode) or skip legacy degree array
+    vertex_offsets = Int[]
     if is_index_mode
-        out_degrees = Vector{T}(undef, Int(vs))
-        for v in 1:Int(vs)
-            out_degrees[v] = read_encoded_value(r, ie, T) - T(1)
+        entry_width = Int(read_value(r, 6, UInt64))
+        for _ in 1:(Int(vs) + 1)
+            push!(vertex_offsets, Int(read_value(r, entry_width, UInt64)))
         end
     end
 
@@ -4034,8 +4146,43 @@ function read_cmdstream_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, :
         end
     end
 
+    # Helper to read encoded list body
+    function _read_cs_body(r_in::BitReader, v::T, enc_type::Symbol, mil::Int)
+        if enc_type == :interval
+            return read_intervals_and_residuals(r_in, ie, mil, T; vertex_id=v, tight_intervals=tight_intervals)
+        elseif enc_type == :delta
+            if is_index_mode
+                # Index mode: count-prefixed delta (no stop terminators)
+                count = read_encoded_value(r_in, ie, T) - T(1)
+                if count > 0
+                    return read_delta(r_in, ie, T; max_elements=Int(count), vertex_id=v)
+                end
+                return T[]
+            else
+                # CS children mode: always uses stop_deltas
+                return _read_stop_delta(r_in, ie, T; vertex_id=v)
+            end
+        elseif enc_type == :rle
+            count = read_encoded_value(r_in, ie, T) - T(1)
+            if count > 0
+                return read_hybrid_mix_encoded_list(r_in, :index, ie, T; max_elements=Int(count), vertex_id=v)
+            end
+            return T[]
+        end
+        return T[]
+    end
+
     for v_idx in 1:Int(vs)
         v = T(v_idx)
+
+        if is_index_mode
+            # Index mode: empty vertex = offset[v] == offset[v+1]
+            if vertex_offsets[v_idx] == vertex_offsets[v_idx + 1]
+                neighbor_lists[v] = T[]
+                add_to_ref_window!(v)
+                continue
+            end
+        end
 
         # Read CS header
         is_empty, ref_mode, enc_type, mil = _read_cs_header(r)
@@ -4049,23 +4196,6 @@ function read_cmdstream_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, :
         current_neighbors = T[]
         is_ref = ref_mode != :none
 
-        # Helper to read encoded list based on type
-        function read_body(read_et::Symbol=enc_type, read_m::Int=mil)
-            if read_et == :interval
-                return read_intervals_and_residuals(r, ie, read_m, T; vertex_id=v, tight_intervals=tight_intervals)
-            elseif read_et == :delta
-                # CS always uses stop_deltas for :delta
-                return _read_stop_delta(r, ie, T; vertex_id=v)
-            elseif read_et == :rle
-                count = read_encoded_value(r, ie, T) - T(1)
-                if count > 0
-                    return read_hybrid_mix_encoded_list(r, :index, ie, T; max_elements=Int(count), vertex_id=v)
-                end
-                return T[]
-            end
-            return T[]
-        end
-
         if is_ref
             distance = read_encoded_value(r, ie, T)
             ref_idx = length(reference_window) - Int(distance) + 1
@@ -4076,10 +4206,10 @@ function read_cmdstream_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, :
             end
             ref_len = length(ref_nbs)
             copy_bitmap = _read_adaptive_copy(r, ref_len, ie, T; compact_copy=compact_copy)
-            residuals = read_body()
+            residuals = _read_cs_body(r, v, enc_type, mil)
             current_neighbors = reconstruct_from_reference(ref_nbs, copy_bitmap, residuals)
         else
-            current_neighbors = read_body()
+            current_neighbors = _read_cs_body(r, v, enc_type, mil)
         end
 
         neighbor_lists[v] = current_neighbors
@@ -5171,13 +5301,13 @@ end
 # Submodules
 # -----------------------------------------------------------------------------
 
-# RCGE (Recursive Compression for Graph Edges)
-include("compression/rcge.jl")
-using .RCGE
-export RCGE
+# CGE (Clustered Graph Encoding)
+include("compression/cge.jl")
+using .CGE
+export CGE
 
 # InterEncoding
-include("compression/rcge/inter_encoding.jl")
+include("compression/cge/inter_encoding.jl")
 using .InterEncoding
 export InterEncoding
 

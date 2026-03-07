@@ -1,3 +1,18 @@
+#
+# Adjacently: Julia Complex Directed Networks Library
+# Copyright (C) 2016-2026 Jimmy Dubuisson <jimmy@dubuisson.ch>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+
 #!/usr/bin/env julia
 
 #
@@ -7,7 +22,7 @@
 #
 # Baseline (config 8 from greedy_benchmark_cnr2000.jl):
 #   Leiden+LLP + local-window + Fib w=64 (copy-blocks)
-# Technique from RCGE:
+# Technique from CGE:
 #   3-way adaptive copy (bitmap/copy-blocks/complement) — same nested-bit scheme
 #
 
@@ -34,7 +49,7 @@ const PROJECT_ROOT = normpath(joinpath(@__DIR__, ".."))
 const CNR_CSV = joinpath(PROJECT_ROOT, "datasets", "webgraph", "cnr-2000", "cnr-2000.csv")
 const OUTPUT_DIR = joinpath(PROJECT_ROOT, "datasets", "webgraph", "cnr-2000")
 
-# Two-step relabeling: Leiden K=1 + per-group LLP (mirrors RCGE approach)
+# Two-step relabeling: Leiden K=1 + per-group LLP (mirrors CGE approach)
 function relabel_leiden_k1_llp(g; leiden_max_passes::Int=8, leiden_max_levels::Int=5,
                                    llp_passes::Int=5)
     T = eltype(g)
@@ -175,7 +190,7 @@ for (name, nbytes, bpe, ok) in results
 end
 println()
 println("  Reference: WebGraph BV                         2.897 BPE")
-println("  RCGE best (3-way adaptive, Leiden K=1):        2.4341 BPE")
+println("  CGE best (3-way adaptive, Leiden K=1):        2.4341 BPE")
 best_bpe = minimum(r[3] for r in results)
 println("  Best this run:                                 $(round(best_bpe, digits=4)) BPE")
 println("=" ^ 70)

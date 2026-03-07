@@ -1,0 +1,406 @@
+{
+  "cnr-2000": {
+    "params": {
+      "K": 2,
+      "intra_ref_window": 64,
+      "intra_intervals": false,
+      "intra_lr_split": false,
+      "intra_mil": 4,
+      "intra_adapt_mil": 4,
+      "intra_zigzag": true,
+      "intra_stop_deltas": true,
+      "intra_copy_blocks": true,
+      "intra_copy_adaptive": true,
+      "intra_ref_fixwidth": true,
+      "intra_ref_vlc": false,
+      "intra_add_adaptive": true,
+      "intra_raw_adaptive": true,
+      "intra_ref_enabled": true,
+      "varint": "fibonacci",
+      "count_varint": "fibonacci",
+      "gap": "fibonacci",
+      "degree": "elias_delta",
+      "membership": "implicit_ranges",
+      "llp": false
+    },
+    "graph": {
+      "nv": 325557,
+      "ne": 3216152,
+      "average_degree": 9.879,
+      "max_indegree": 18235,
+      "max_outdegree": 2716,
+      "dangling_nodes_pct": 23.98,
+      "largest_scc": 112023,
+      "average_distance": 17.45,
+      "reachable_pairs_pct": 35.38,
+      "harmonic_diameter": 40.53
+    },
+    "compression": {
+      "coding_scheme": "children",
+      "best_bpe": 2.3191,
+      "index_bpe": {
+        "std": 4.8297,
+        "cs": 4.8351,
+        "cge_k2": 4.6246
+      },
+      "webgraph_bv_bpe": 2.448
+    }
+  },
+  "in-2004": {
+    "params": {
+      "K": 1,
+      "intra_ref_window": 8,
+      "intra_intervals": false,
+      "intra_lr_split": false,
+      "intra_mil": 4,
+      "intra_adapt_mil": 4,
+      "intra_zigzag": true,
+      "intra_stop_deltas": true,
+      "intra_copy_blocks": true,
+      "intra_copy_adaptive": true,
+      "intra_ref_fixwidth": true,
+      "intra_ref_vlc": false,
+      "intra_add_adaptive": true,
+      "intra_raw_adaptive": true,
+      "intra_ref_enabled": true,
+      "varint": "fibonacci",
+      "count_varint": "fibonacci",
+      "gap": "fibonacci",
+      "degree": "elias_delta",
+      "membership": "implicit_ranges",
+      "llp": false
+    },
+    "graph": {
+      "nv": 1382908,
+      "ne": 16917053,
+      "average_degree": 12.233,
+      "max_indegree": 21866,
+      "max_outdegree": 7753,
+      "dangling_nodes_pct": 20.41,
+      "largest_scc": 593687,
+      "average_distance": 15.34,
+      "reachable_pairs_pct": 43.30,
+      "harmonic_diameter": 32.26
+    },
+    "compression": {
+      "coding_scheme": "children",
+      "best_bpe": 1.7513,
+      "webgraph_bv_bpe": 1.767
+    }
+  },
+  "enwiki-2013": {
+    "params": {
+      "K": 1,
+      "intra_ref_window": 64,
+      "intra_intervals": true,
+      "intra_lr_split": true,
+      "intra_mil": 4,
+      "intra_adapt_mil": 4,
+      "intra_zigzag": true,
+      "intra_stop_deltas": true,
+      "intra_copy_blocks": true,
+      "intra_copy_adaptive": true,
+      "intra_ref_fixwidth": true,
+      "intra_ref_vlc": false,
+      "intra_add_adaptive": true,
+      "intra_raw_adaptive": true,
+      "intra_ref_enabled": true,
+      "varint": "fibonacci",
+      "count_varint": "fibonacci",
+      "gap": "fibonacci",
+      "degree": "elias_delta",
+      "membership": "implicit_ranges",
+      "llp": true
+    },
+    "graph": {
+      "nv": 4206785,
+      "ne": 101355853,
+      "average_degree": 24.093,
+      "max_indegree": 431795,
+      "max_outdegree": 8104,
+      "dangling_nodes_pct": 0.19,
+      "largest_scc": 3744228,
+      "average_distance": 4.87,
+      "reachable_pairs_pct": 89.88,
+      "harmonic_diameter": 5.24
+    },
+    "compression": {
+      "coding_scheme": "children",
+      "best_bpe": 12.4854,
+      "webgraph_bv_bpe": 12.639
+    }
+  },
+  "web-google-core": {
+    "params": {
+      "K": 2,
+      "intra_ref_window": 64,
+      "intra_intervals": false,
+      "intra_lr_split": false,
+      "intra_mil": 2,
+      "intra_adapt_mil": 2,
+      "intra_zigzag": true,
+      "intra_stop_deltas": true,
+      "intra_copy_blocks": true,
+      "intra_copy_adaptive": true,
+      "intra_ref_fixwidth": true,
+      "intra_ref_vlc": false,
+      "intra_add_adaptive": true,
+      "intra_raw_adaptive": true,
+      "intra_ref_enabled": true,
+      "varint": "fibonacci",
+      "count_varint": "fibonacci",
+      "gap": "fibonacci",
+      "degree": "elias_delta",
+      "membership": "implicit_ranges",
+      "llp": false
+    },
+    "graph": {
+      "nv": 434818,
+      "ne": 3419124,
+      "average_degree": 7.863
+    },
+    "compression": {
+      "coding_scheme": "children",
+      "best_bpe": 6.0977
+    }
+  },
+  "web-google-rcore": {
+    "params": {
+      "K": 2,
+      "intra_ref_window": 8,
+      "intra_intervals": false,
+      "intra_lr_split": false,
+      "intra_mil": 4,
+      "intra_adapt_mil": 4,
+      "intra_zigzag": true,
+      "intra_stop_deltas": true,
+      "intra_copy_blocks": true,
+      "intra_copy_adaptive": true,
+      "intra_ref_fixwidth": true,
+      "intra_ref_vlc": false,
+      "intra_add_adaptive": true,
+      "intra_raw_adaptive": true,
+      "intra_ref_enabled": true,
+      "varint": "fibonacci",
+      "count_varint": "fibonacci",
+      "gap": "fibonacci",
+      "degree": "elias_delta",
+      "membership": "implicit_ranges",
+      "llp": false
+    },
+    "graph": {
+      "nv": 434818,
+      "ne": 3419124,
+      "average_degree": 7.863
+    },
+    "compression": {
+      "coding_scheme": "children",
+      "best_bpe": 5.6661
+    }
+  },
+  "eat-core": {
+    "params": {
+      "K": 1,
+      "intra_ref_window": 64,
+      "intra_intervals": true,
+      "intra_lr_split": true,
+      "intra_mil": 5,
+      "intra_adapt_mil": 5,
+      "intra_zigzag": true,
+      "intra_stop_deltas": true,
+      "intra_copy_blocks": true,
+      "intra_copy_adaptive": true,
+      "intra_ref_fixwidth": true,
+      "intra_ref_vlc": false,
+      "intra_add_adaptive": true,
+      "intra_raw_adaptive": true,
+      "intra_ref_enabled": true,
+      "varint": "fibonacci",
+      "count_varint": "fibonacci",
+      "gap": "fibonacci",
+      "degree": "elias_delta",
+      "membership": "implicit_ranges",
+      "llp": false
+    },
+    "graph": {
+      "nv": 7754,
+      "ne": 247172,
+      "average_degree": 31.877
+    },
+    "compression": {
+      "coding_scheme": "children",
+      "best_bpe": 10.7452
+    }
+  },
+  "eat-rcore": {
+    "params": {
+      "K": 1,
+      "intra_ref_window": 64,
+      "intra_intervals": false,
+      "intra_lr_split": false,
+      "intra_mil": 5,
+      "intra_adapt_mil": 5,
+      "intra_zigzag": true,
+      "intra_stop_deltas": true,
+      "intra_copy_blocks": true,
+      "intra_copy_adaptive": true,
+      "intra_ref_fixwidth": true,
+      "intra_ref_vlc": false,
+      "intra_add_adaptive": true,
+      "intra_raw_adaptive": true,
+      "intra_ref_enabled": true,
+      "varint": "fibonacci",
+      "count_varint": "fibonacci",
+      "gap": "fibonacci",
+      "degree": "elias_delta",
+      "membership": "implicit_ranges",
+      "llp": false
+    },
+    "graph": {
+      "nv": 7754,
+      "ne": 247172,
+      "average_degree": 31.877
+    },
+    "compression": {
+      "coding_scheme": "children",
+      "best_bpe": 9.644
+    }
+  },
+  "arxiv-hep-ph-core": {
+    "params": {
+      "K": 1,
+      "intra_ref_window": 64,
+      "intra_intervals": false,
+      "intra_lr_split": false,
+      "intra_mil": 5,
+      "intra_adapt_mil": 5,
+      "intra_zigzag": true,
+      "intra_stop_deltas": true,
+      "intra_copy_blocks": true,
+      "intra_copy_adaptive": true,
+      "intra_ref_fixwidth": true,
+      "intra_ref_vlc": false,
+      "intra_add_adaptive": true,
+      "intra_raw_adaptive": true,
+      "intra_ref_enabled": true,
+      "varint": "fibonacci",
+      "count_varint": "fibonacci",
+      "gap": "fibonacci",
+      "degree": "elias_delta",
+      "membership": "implicit_ranges",
+      "llp": false
+    },
+    "graph": {
+      "nv": 34546,
+      "ne": 421578,
+      "average_degree": 12.203,
+      "note": "file contains full graph (34546v), not core subgraph (12711v)"
+    },
+    "compression": {
+      "coding_scheme": "children",
+      "best_bpe": 10.2155
+    }
+  },
+  "arxiv-hep-ph-rcore": {
+    "params": {
+      "K": 1,
+      "intra_ref_window": 64,
+      "intra_intervals": false,
+      "intra_lr_split": false,
+      "intra_mil": 4,
+      "intra_adapt_mil": 4,
+      "intra_zigzag": true,
+      "intra_stop_deltas": true,
+      "intra_copy_blocks": true,
+      "intra_copy_adaptive": true,
+      "intra_ref_fixwidth": true,
+      "intra_ref_vlc": false,
+      "intra_add_adaptive": true,
+      "intra_raw_adaptive": true,
+      "intra_ref_enabled": true,
+      "varint": "fibonacci",
+      "count_varint": "fibonacci",
+      "gap": "fibonacci",
+      "degree": "elias_delta",
+      "membership": "implicit_ranges",
+      "llp": false
+    },
+    "graph": {
+      "nv": 12711,
+      "ne": 139981,
+      "average_degree": 11.013
+    },
+    "compression": {
+      "coding_scheme": "children",
+      "best_bpe": 9.2296
+    }
+  },
+  "amazon-0601-core": {
+    "params": {
+      "K": 1,
+      "intra_ref_window": 8,
+      "intra_intervals": true,
+      "intra_lr_split": true,
+      "intra_mil": 3,
+      "intra_adapt_mil": 3,
+      "intra_zigzag": true,
+      "intra_stop_deltas": true,
+      "intra_copy_blocks": true,
+      "intra_copy_adaptive": true,
+      "intra_ref_fixwidth": true,
+      "intra_ref_vlc": false,
+      "intra_add_adaptive": true,
+      "intra_raw_adaptive": true,
+      "intra_ref_enabled": true,
+      "varint": "fibonacci",
+      "count_varint": "fibonacci",
+      "gap": "fibonacci",
+      "degree": "elias_delta",
+      "membership": "implicit_ranges",
+      "llp": false
+    },
+    "graph": {
+      "nv": 395234,
+      "ne": 3301092,
+      "average_degree": 8.352
+    },
+    "compression": {
+      "coding_scheme": "children",
+      "best_bpe": 12.3529
+    }
+  },
+  "amazon-0601-rcore": {
+    "params": {
+      "K": 2,
+      "intra_ref_window": 8,
+      "intra_intervals": false,
+      "intra_lr_split": false,
+      "intra_mil": 3,
+      "intra_adapt_mil": 3,
+      "intra_zigzag": true,
+      "intra_stop_deltas": true,
+      "intra_copy_blocks": true,
+      "intra_copy_adaptive": true,
+      "intra_ref_fixwidth": true,
+      "intra_ref_vlc": false,
+      "intra_add_adaptive": true,
+      "intra_raw_adaptive": true,
+      "intra_ref_enabled": true,
+      "varint": "fibonacci",
+      "count_varint": "fibonacci",
+      "gap": "fibonacci",
+      "degree": "elias_delta",
+      "membership": "implicit_ranges",
+      "llp": false
+    },
+    "graph": {
+      "nv": 395234,
+      "ne": 3301092,
+      "average_degree": 8.352
+    },
+    "compression": {
+      "coding_scheme": "children",
+      "best_bpe": 12.0462
+    }
+  }
+}

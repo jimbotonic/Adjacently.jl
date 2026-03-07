@@ -1,0 +1,131 @@
+
+
+# =========================
+
+# Julia
+
+# =========================
+
+# Compiled files
+
+*.ji
+
+# Julia package manager artifacts
+
+Manifest.toml
+
+# Julia REPL history
+
+.julia_history
+
+# =========================
+
+# Build / coverage
+
+# =========================
+
+# coverage
+
+coverage/
+*.cov
+*.lcov
+
+# build artifacts
+
+build/
+deps/build.log
+
+# custom
+
+datasets/webgraph/enwiki-2013/enwiki-2013.csv
+
+# =========================
+
+# Temporary files
+
+# =========================
+
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+
+# =========================
+
+# Notebooks
+
+# =========================
+
+.ipynb_checkpoints
+
+# =========================
+
+# Data / generated files
+
+# =========================
+
+data/
+#datasets/
+outputs/
+results/
+plots/
+figures/
+
+# =========================
+
+# Package development
+
+# =========================
+
+# Local dev environments
+
+dev/
+compiled/
+
+# =========================
+
+# VSCode
+
+# =========================
+
+.vscode/
+
+# =========================
+
+# JetBrains IDEs
+
+# =========================
+
+.idea/
+
+# =========================
+
+# OS files
+
+# =========================
+
+.DS_Store
+Thumbs.db
+
+# =========================
+
+# Python interop (PyCall etc.)
+
+# =========================
+
+**pycache**/
+*.pyc
+*.pyo
+
+# =========================
+
+# Docker / environment
+
+# =========================
+
+.env
+.env.local
+

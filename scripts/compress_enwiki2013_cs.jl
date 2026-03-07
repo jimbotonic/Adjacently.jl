@@ -1,3 +1,18 @@
+#
+# Adjacently: Julia Complex Directed Networks Library
+# Copyright (C) 2016-2026 Jimmy Dubuisson <jimmy@dubuisson.ch>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+
 #!/usr/bin/env julia
 #
 # Compress enwiki-2013 with CS (Command Stream) — Leiden K=1 + LLP reordering
@@ -112,7 +127,7 @@ println("SUMMARY — $DS CS (Leiden+LLP)")
 println("=" ^ 70)
 println("  CS w=8 LLP:  $bpe BPE  ($(filesize(cs_mgz)) bytes)")
 println("  CS w=8 nat:  16.6219 BPE (no reordering)")
-println("  RCGE K=1:    16.5337 BPE (no reordering)")
+println("  CGE K=1:    16.5337 BPE (no reordering)")
 println("  WebGraph BV: 12.639 BPE (reference)")
 println("  Encode time: $(dt_enc)s")
 println("  Decode time: $(dt_dec)s")

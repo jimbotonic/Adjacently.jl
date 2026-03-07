@@ -1,3 +1,18 @@
+#
+# Adjacently: Julia Complex Directed Networks Library
+# Copyright (C) 2016-2026 Jimmy Dubuisson <jimmy@dubuisson.ch>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+
 #!/usr/bin/env julia
 #
 # Benchmark STD and CS on IN-2004 with ref_window_size=8
@@ -141,6 +156,6 @@ println("SUMMARY — $DS window=8")
 println("=" ^ 60)
 println("  STD w=8:   $bpe_std BPE")
 println("  CS  w=8:   $bpe_cs BPE")
-println("  RCGE K=4:  1.7623 BPE  (best known)")
+println("  CGE K=1:  1.7513 BPE  (best known)")
 println("  WebGraph:  1.767 BPE   (reference)")
 println("=" ^ 60)

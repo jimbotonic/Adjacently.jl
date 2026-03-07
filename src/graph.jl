@@ -1,6 +1,6 @@
 #
 # Adjacently: Julia Complex Directed Networks Library
-# Copyright (C) 2016-2025 Jimmy Dubuisson <jimmy.dubuisson@gmail.com>
+# Copyright (C) 2016-2026 Jimmy Dubuisson <jimmy@dubuisson.ch>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -18,7 +18,7 @@ module Graph
 using LightGraphs, DataStructures, SparseArrays, LinearAlgebra, Logging
 using ..CustomTypes: UInt24, UInt40
 using ..CustomLightGraphs: SimpleDiGraph, SimpleGraph, SimpleEdge
-using ..Util: infer_uint_custom_type
+using ..Util: infer_uint_custom_type, infer_uint_std_type
 using ..Algo: pearce_iterative
 using ..RandomWalks: RW, RW_aggregated
 using ..PageRank: PR
@@ -729,7 +729,10 @@ function get_sparse_P_matrix(g::AbstractGraph{T}; column_stochastic::Bool=true) 
 	end
 
 	Pint = sparse(I_idx, J_idx, V_vals, n, n)
-	return SparseMatrixCSC{Float64, T}(Pint)
+	# Use standard unsigned type to avoid overflow with custom types (e.g. UInt24)
+	n_bits = UInt8(ceil(log2(max(Int(n), length(V_vals)) + 1)))
+	ST = infer_uint_std_type(n_bits)
+	return SparseMatrixCSC{Float64, ST}(Pint)
 end
 
 """ 

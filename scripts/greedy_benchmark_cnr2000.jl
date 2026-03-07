@@ -1,3 +1,18 @@
+#
+# Adjacently: Julia Complex Directed Networks Library
+# Copyright (C) 2016-2026 Jimmy Dubuisson <jimmy@dubuisson.ch>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+
 #!/usr/bin/env julia
 
 # Greedy compression benchmark on CNR-2000.
@@ -103,7 +118,7 @@ function compute_bpe(mgz_path, num_edges)
 end
 
 # Two-step relabeling: Leiden community detection → per-group LLP on induced subgraphs.
-# Mirrors the RCGE K=1 approach: the top Leiden cluster forms group 1, all other
+# Mirrors the CGE K=1 approach: the top Leiden cluster forms group 1, all other
 # vertices form group 2. LLP is then applied to each group's induced subgraph.
 # This gives 80–90% intra-group neighbor overlap vs ~40% with global LLP.
 function relabel_leiden_k1_llp(g; leiden_max_passes::Int=8, leiden_max_levels::Int=5,
@@ -342,7 +357,7 @@ function main()
     println("  [7] Leiden+LLP + local w=7  + Fib (copy-blocks):     BPE = $(round(bpe7, digits=4)),  RT=$(ok7 ? "OK" : "FAIL")")
     println("  [8] Leiden+LLP + local w=64 + Fib (copy-blocks):     BPE = $(round(bpe8, digits=4)),  RT=$(ok8 ? "OK" : "FAIL")")
     println("  WebGraph reference:                                    BPE = 2.897")
-    println("  RCGE FW64 K=1 (best):                                 BPE = 2.887")
+    println("  CGE FW64 K=1 (best):                                 BPE = 2.887")
     println("=" ^ 70)
 end
 
