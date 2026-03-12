@@ -140,6 +140,7 @@ end
         t4 = time(); encode_level(w, g, clusters; params=params); flush_bitwriter(w; flush_last_bits=true); bytes = take!(io); t5 = time()
         @info "CGE encode: size=$(length(bytes)) bytes, time=$(round(t5-t4,digits=3))s"
         @test length(bytes) > 0
+    end
     finally
         global_logger(prev_logger)
     end

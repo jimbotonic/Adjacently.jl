@@ -93,9 +93,8 @@ const RUN_CGE = METHOD in ("all", "cge")
 const DATASET_PARAMS = Dict(
     "cnr-2000" => (
         std_write = (coding_scheme=:children, integer_encoding=:fibonacci,
-                     ref_window_size=64, copy_blocks=true, adaptive_copy=true,
-                     stop_deltas=true, empty_prefix=true, compact_copy=true,
-                     tight_intervals=true, vlc2=true),
+                     ref_window_size=64, copy_blocks=true,
+                     stop_deltas=true, lr_split=true, multi_ref=true),
         cs_write  = (coding_scheme=:children, integer_encoding=:fibonacci,
                      ref_window_size=64, compact_copy=true, tight_intervals=true),
         cge_params = CGEParams(
@@ -120,9 +119,8 @@ const DATASET_PARAMS = Dict(
     ),
     "in-2004" => (
         std_write = (coding_scheme=:children, integer_encoding=:fibonacci,
-                     ref_window_size=64, copy_blocks=true, adaptive_copy=true,
-                     stop_deltas=true, empty_prefix=true, compact_copy=true,
-                     tight_intervals=true, vlc2=true),
+                     ref_window_size=64, copy_blocks=true,
+                     stop_deltas=true, lr_split=true, multi_ref=true),
         cs_write  = (coding_scheme=:children, integer_encoding=:fibonacci,
                      ref_window_size=64, compact_copy=true, tight_intervals=true),
         cge_params = CGEParams(
@@ -147,9 +145,8 @@ const DATASET_PARAMS = Dict(
     ),
     "enwiki-2013" => (
         std_write = (coding_scheme=:children, integer_encoding=:zeta,
-                     ref_window_size=8, copy_blocks=true, adaptive_copy=true,
-                     stop_deltas=true, empty_prefix=true, compact_copy=true,
-                     tight_intervals=true, vlc2=true),
+                     ref_window_size=8, copy_blocks=true,
+                     stop_deltas=true, lr_split=true, multi_ref=true),
         cs_write  = (coding_scheme=:children, integer_encoding=:zeta,
                      ref_window_size=8, compact_copy=true, tight_intervals=true),
         cge_params = CGEParams(

@@ -87,8 +87,8 @@ nls = extract_neighbor_lists(g)
     write_std_mgs3_graph(g, std_base;
         coding_scheme=:index, integer_encoding=:fibonacci,
         ref_window_size=64, copy_blocks=true, adaptive_copy=true,
-        stop_deltas=true, empty_prefix=true, compact_copy=true,
-        tight_intervals=true, vlc2=true)
+        stop_deltas=true, compact_copy=true,
+        tight_intervals=true)
     dt_enc = round(time() - t_enc, digits=2)
 
     @test isfile(std_mgz)

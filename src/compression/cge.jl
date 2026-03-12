@@ -149,6 +149,7 @@ Base.@kwdef struct CGEParams
     intra_raw_adaptive::Bool = false  # Per-vertex adaptive raw: pick cheaper of STOP-delta vs intervals (requires intra_stop_deltas=true)
     intra_adapt_mil::Int = 2          # MIL for adaptive interval encoding (2=most aggressive)
     intra_lr_split::Bool = false       # Left/right residual split: split residuals at vertex_id after interval extraction
+    intra_tight_deltas::Bool = false  # Skip +1 shift on delta gaps in LR residuals (gaps are always ≥ 1 for sorted unique lists)
 end
 
 # --------------------------
@@ -257,7 +258,7 @@ smaller first values than zigzag encoding of the full list.
 Format: intervals (zigzag first start) | num_residuals | left_count | left_dists | right_dists
 """
 function _write_ir_lr(w::BitWriter, neighbors::Vector{T}, encoding::Symbol,
-                       mil::Int, vertex_id) where {T<:Unsigned}
+                       mil::Int, vertex_id; tight_deltas::Bool=false) where {T<:Unsigned}
     if vertex_id === nothing || isempty(neighbors)
         Compression.write_intervals_and_residuals(w, neighbors, encoding, mil; vertex_id=vertex_id)
         return
@@ -308,7 +309,7 @@ function _write_ir_lr(w::BitWriter, neighbors::Vector{T}, encoding::Symbol,
             @inbounds for i in 1:n_left
                 left_dists[i] = vid - residuals[n_left - i + 1]
             end
-            write_delta(w, left_dists, encoding)
+            write_delta(w, left_dists, encoding; positive_gaps=tight_deltas)
         end
 
         # Right residuals: distances from vertex_id (+1 to handle val==vid edge case)
@@ -317,7 +318,7 @@ function _write_ir_lr(w::BitWriter, neighbors::Vector{T}, encoding::Symbol,
             @inbounds for i in 1:n_right
                 right_dists[i] = residuals[n_left + i] - vid + T(1)
             end
-            write_delta(w, right_dists, encoding)
+            write_delta(w, right_dists, encoding; positive_gaps=tight_deltas)
         end
     end
 end
@@ -328,7 +329,7 @@ end
 Read neighbor list written by `_write_ir_lr`.
 """
 function _read_ir_lr(r::BitReader, encoding::Symbol, mil::Int,
-                      ::Type{T}, vertex_id) where {T<:Unsigned}
+                      ::Type{T}, vertex_id; tight_deltas::Bool=false) where {T<:Unsigned}
     if vertex_id === nothing
         return read_intervals_and_residuals(r, encoding, mil, T; vertex_id=vertex_id)
     end
@@ -365,7 +366,7 @@ function _read_ir_lr(r::BitReader, encoding::Symbol, mil::Int,
 
         # Read left distances → reconstruct left values
         if n_left > 0
-            left_dists = read_delta(r, encoding, T; max_elements=n_left)
+            left_dists = read_delta(r, encoding, T; max_elements=n_left, positive_gaps=tight_deltas)
             # Reverse distances back to ascending original values
             for i in n_left:-1:1
                 push!(neighbors, vid - left_dists[i])
@@ -374,7 +375,7 @@ function _read_ir_lr(r::BitReader, encoding::Symbol, mil::Int,
 
         # Read right distances → reconstruct right values
         if n_right > 0
-            right_dists = read_delta(r, encoding, T; max_elements=n_right)
+            right_dists = read_delta(r, encoding, T; max_elements=n_right, positive_gaps=tight_deltas)
             for d in right_dists
                 push!(neighbors, vid + d - T(1))
             end
@@ -754,6 +755,7 @@ end
 # Minimum number of reference candidates to use threaded search
 const MIN_CANDIDATES_FOR_THREADING = 8
 
+
 """
     _estimate_raw_cost(buf, nl, params, T, idx_local, _zz_vid) → Int
 
@@ -765,7 +767,7 @@ function _estimate_raw_cost(buf::CostBuffer, nl::Vector{Int},
                             idx_local::Int, _zz_vid) where {T<:Unsigned}
     _reset!(buf.io1, buf.w1)
     if params.intra_intervals && params.intra_lr_split
-        _write_ir_lr(buf.w1, T.(nl), :fibonacci, params.intra_mil, _zz_vid)
+        _write_ir_lr(buf.w1, T.(nl), :fibonacci, params.intra_mil, _zz_vid; tight_deltas=params.intra_tight_deltas)
     elseif params.intra_intervals
         Compression.write_intervals_and_residuals(buf.w1, T.(nl), :fibonacci, params.intra_mil; vertex_id=_zz_vid)
     elseif params.intra_stop_deltas
@@ -858,7 +860,7 @@ function _evaluate_candidate(buf::CostBuffer, nl::Vector{Int}, ref::Vector{Int},
     local add_bits::Int
     if params.intra_intervals && params.intra_lr_split
         _reset!(buf.io2, buf.w2)
-        _write_ir_lr(buf.w2, T.(buf.adds), :fibonacci, params.intra_mil, _zz_vid)
+        _write_ir_lr(buf.w2, T.(buf.adds), :fibonacci, params.intra_mil, _zz_vid; tight_deltas=params.intra_tight_deltas)
         add_bits = _total_bits(buf.w2)
     elseif params.intra_intervals
         _reset!(buf.io2, buf.w2)
@@ -934,7 +936,7 @@ function _evaluate_candidate_greedy(buf::CostBuffer, nl::Vector{Int}, ref::Vecto
     for mil in mil_options
         _reset!(buf.io2, buf.w2)
         if params.intra_lr_split
-            _write_ir_lr(buf.w2, adds_T, :fibonacci, mil, _zz_vid)
+            _write_ir_lr(buf.w2, adds_T, :fibonacci, mil, _zz_vid; tight_deltas=params.intra_tight_deltas)
         else
             Compression.write_intervals_and_residuals(buf.w2, adds_T, :fibonacci, mil; vertex_id=_zz_vid)
         end
@@ -1159,7 +1161,7 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                     for mil in _mil_options
                         _reset!(buf0.io1, buf0.w1)
                         if params.intra_lr_split
-                            _write_ir_lr(buf0.w1, nl_T, :fibonacci, mil, _zz_vid)
+                            _write_ir_lr(buf0.w1, nl_T, :fibonacci, mil, _zz_vid; tight_deltas=params.intra_tight_deltas)
                         else
                             Compression.write_intervals_and_residuals(buf0.w1, nl_T, :fibonacci, mil; vertex_id=_zz_vid)
                         end
@@ -1457,7 +1459,7 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                     # additions: MGS intervals, custom intervals, or plain delta
                     local ah0 = _total_bits(pw)
                     if (params.intra_intervals || params.intra_greedy_mil) && params.intra_lr_split
-                        _write_ir_lr(pw, T.(additions), :fibonacci, mil_vec[idx_local], _zz_vid)
+                        _write_ir_lr(pw, T.(additions), :fibonacci, mil_vec[idx_local], _zz_vid; tight_deltas=params.intra_tight_deltas)
                     elseif params.intra_intervals || params.intra_greedy_mil
                         Compression.write_intervals_and_residuals(pw, T.(additions), :fibonacci, mil_vec[idx_local]; vertex_id=_zz_vid)
                     elseif params.additions_mode == :intervals
@@ -1528,7 +1530,7 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                     nl = raw_lists[idx_local]
                     local rb0 = _total_bits(pw)
                     if (params.intra_intervals || params.intra_greedy_mil) && params.intra_lr_split
-                        _write_ir_lr(pw, T.(nl), :fibonacci, mil_vec[idx_local], _zz_vid)
+                        _write_ir_lr(pw, T.(nl), :fibonacci, mil_vec[idx_local], _zz_vid; tight_deltas=params.intra_tight_deltas)
                     elseif params.intra_intervals || params.intra_greedy_mil
                         Compression.write_intervals_and_residuals(pw, T.(nl), :fibonacci, mil_vec[idx_local]; vertex_id=_zz_vid)
                     elseif params.intra_raw_adaptive && params.intra_stop_deltas
@@ -1944,7 +1946,7 @@ function decode_level(r::BitReader, params::CGEParams; T::Type{<:Unsigned}=UInt3
                     # Read additions
                     local additions::Vector{Int}
                     if (params.intra_intervals || params.intra_greedy_mil) && params.intra_lr_split
-                        additions = Int.(_read_ir_lr(r, :fibonacci, mil_vec[idx_local], T, _zz_vid))
+                        additions = Int.(_read_ir_lr(r, :fibonacci, mil_vec[idx_local], T, _zz_vid; tight_deltas=params.intra_tight_deltas))
                     elseif params.intra_intervals || params.intra_greedy_mil
                         additions = Int.(read_intervals_and_residuals(r, :fibonacci, mil_vec[idx_local], T; vertex_id=_zz_vid))
                     elseif params.additions_mode == :intervals
@@ -1987,7 +1989,7 @@ function decode_level(r::BitReader, params::CGEParams; T::Type{<:Unsigned}=UInt3
                 else
                     # Raw mode
                     if (params.intra_intervals || params.intra_greedy_mil) && params.intra_lr_split
-                        nl_local = Int.(_read_ir_lr(r, :fibonacci, mil_vec[idx_local], T, _zz_vid))
+                        nl_local = Int.(_read_ir_lr(r, :fibonacci, mil_vec[idx_local], T, _zz_vid; tight_deltas=params.intra_tight_deltas))
                     elseif params.intra_intervals || params.intra_greedy_mil
                         nl_local = Int.(read_intervals_and_residuals(r, :fibonacci, mil_vec[idx_local], T; vertex_id=_zz_vid))
                     elseif params.intra_raw_adaptive && params.intra_stop_deltas

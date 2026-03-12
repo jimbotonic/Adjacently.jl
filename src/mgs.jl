@@ -60,7 +60,7 @@ const INT_ENCODING_FED = 0x4
 const INT_ENCODING_ZETA = 0x5
 const INT_ENCODING_FIBONACCI = 0x6
 #
-# ── v3.1 self-describing byte 2 layout ──────────────────────────────────────
+# ── Self-describing byte 2 layout ───────────────────────────────────────────
 # Algorithm IDs (0x00–0x0F): no additional params needed
 const ALG_LEGACY_MGS = 0x00
 const ALG_HUFFMAN    = 0x01
@@ -89,20 +89,17 @@ const CS_WINDOW_TO_IDX = Dict(4 => 0, 8 => 1, 16 => 2, 32 => 3, 64 => 4, 128 => 
 # ── CGE window + membership + interval lookup tables ────────────────────────
 const CGE_WINDOW_SIZES = [8, 16, 32, 64, 128, 256]  # 6 values, index 0–5
 const CGE_WINDOW_TO_IDX = Dict(8 => 0, 16 => 1, 32 => 2, 64 => 3, 128 => 4, 256 => 5)
-const CGE_MEMBERSHIP_ORDER = [:stop, :implicit_ranges, :elias_fano, :delta]  # 4 values
-const CGE_MEMBERSHIP_TO_IDX = Dict(:stop => 0, :implicit_ranges => 1, :elias_fano => 2, :delta => 3)
-const CGE_INTER_STRATEGY_ORDER = [:perm, :lists]  # 2 values
-const CGE_INTER_TO_IDX = Dict(:perm => 0, :lists => 1)
-# interval_mode: 0=none, 1=intervals, 2=intervals+lr_split
+# interval_mode: 0=none, 1=intervals, 2=intervals+lr_split, 3=intervals+lr_split+tight_deltas
 
-# ── CGE v3.2 encoding: adds mil, drops inter_strategy ────────────────────────
-# v3.2 mixed-radix: membership(2) × window(6) × interval_mode(3) × mil(4) = 144
+# ── CGE parameter encoding ───────────────────────────────────────────────────
+# Mixed-radix: membership(2) × window(6) × interval_mode(4) × mil(3) = 144
+# varint is stored in the header's integer_encoding field (byte 1, 4 bits)
 # membership: 0=:implicit_ranges, 1=:stop
 const CGE_V32_MEMBERSHIP_ORDER = [:implicit_ranges, :stop]
 const CGE_V32_MEMBERSHIP_TO_IDX = Dict(:implicit_ranges => 0, :stop => 1)
-# mil: 0=2, 1=3, 2=4, 3=5
-const CGE_MIL_SIZES = [2, 3, 4, 5]
-const CGE_MIL_TO_IDX = Dict(2 => 0, 3 => 1, 4 => 2, 5 => 3)
+# mil: 0=3, 1=4, 2=5
+const CGE_MIL_SIZES = [3, 4, 5]
+const CGE_MIL_TO_IDX = Dict(3 => 0, 4 => 1, 5 => 2)
 
 # maximum number of vertices
 MGS_MAX_SIZE = 0xffffffffff
@@ -174,36 +171,38 @@ function decode_header_flags(byte1::UInt8, byte2::UInt8)
     return (graph_type, coding_scheme, integer_encoding, option_flags)
 end
 
-# ── v3.1 parameter encode/decode ─────────────────────────────────────────────
+# ── STD parameter encode/decode (v3.2) ───────────────────────────────────────
 
 """
-    encode_std_params(; ref_window_size, copy_blocks, stop_deltas, compact_tight, vlc2) → UInt8
+    encode_std_params(; ref_window_size, copy_blocks, stop_deltas,
+                       lr_split, exact_costing) → UInt8
 
-Encode STD compression params into a single v3.1 byte2 value (range 0x10–0x4F).
+Encode STD params into byte2 value (range 0x10–0x4F).
 Bit layout (6 bits, offset = byte2 − 0x10):
-  Bit 5-4: ref_window_size  (0=8, 1=16, 2=32, 3=64)
-  Bit 3:   copy_blocks      (adaptive_copy derived = same)
-  Bit 2:   stop_deltas      (empty_prefix derived = same)
-  Bit 1:   compact_copy + tight_intervals  (1=both on)
-  Bit 0:   vlc2
+  Bits 5-4: window (2 bits: 8/16/32/64)
+  Bit 3:    copy_blocks
+  Bit 2:    stop_deltas
+  Bit 1:    lr_split
+  Bit 0:    adaptive_header
 """
 function encode_std_params(; ref_window_size::Int=64, copy_blocks::Bool=true,
-		stop_deltas::Bool=true, compact_tight::Bool=true, vlc2::Bool=true)
-	# Map window to 2-bit index (legacy window=7 maps to 8)
+		stop_deltas::Bool=true, lr_split::Bool=false, adaptive_header::Bool=false)
 	w = ref_window_size <= 8 ? 8 : ref_window_size
 	haskey(STD_WINDOW_TO_IDX, w) || error("Unsupported STD window size: $ref_window_size (must be 8/16/32/64)")
 	widx = STD_WINDOW_TO_IDX[w]
 	offset = (widx << 4) | (copy_blocks ? 0x08 : 0x00) |
 	         (stop_deltas ? 0x04 : 0x00) |
-	         (compact_tight ? 0x02 : 0x00) |
-	         (vlc2 ? 0x01 : 0x00)
+	         (lr_split ? 0x02 : 0x00) |
+	         (adaptive_header ? 0x01 : 0x00)
 	return UInt8(PARAM_STD_BASE + offset)
 end
 
 """
     decode_std_params(byte2::UInt8) → NamedTuple
 
-Decode STD params from a v3.1 byte2 value. Returns all params needed by the loader.
+Decode STD params from byte2 value. Returns all params needed by the loader.
+Hardcoded defaults: compact_copy=true, tight_intervals=true.
+When lr_split=true: implies fixwidth_ref=true.
 """
 function decode_std_params(byte2::UInt8)
 	offset = Int(byte2) - PARAM_STD_BASE
@@ -211,140 +210,104 @@ function decode_std_params(byte2::UInt8)
 	ref_window_size = STD_WINDOW_SIZES[widx + 1]
 	copy_blocks = (offset & 0x08) != 0
 	stop_deltas = (offset & 0x04) != 0
-	compact_tight = (offset & 0x02) != 0
-	vlc2 = (offset & 0x01) != 0
+	lr_split = (offset & 0x02) != 0
+	adaptive_header = (offset & 0x01) != 0
 	return (ref_window_size=ref_window_size, copy_blocks=copy_blocks,
 	        adaptive_copy=copy_blocks, stop_deltas=stop_deltas,
-	        empty_prefix=stop_deltas, fixwidth_ref=false,
-	        compact_copy=compact_tight, tight_intervals=compact_tight,
-	        vlc2=vlc2)
+	        fixwidth_ref=lr_split,
+	        compact_copy=true, tight_intervals=true,
+	        lr_split=lr_split, adaptive_header=adaptive_header)
 end
 
 """
-    encode_cs_params(; ref_window_size, compact_copy, tight_intervals) → UInt8
+    encode_cs_params(; ref_window_size, compact_copy, tight_intervals, lr_split) → UInt8
 
-Encode CS params into a v3.1 byte2 value (range 0x50–0x6F).
+Encode CS params into a v3.2 byte2 value (range 0x50–0x6F).
 Bit layout (5 bits, offset = byte2 − 0x50):
   Bit 4-2: ref_window_size  (3 bits → 0=4, 1=8, …, 7=512)
-  Bit 1:   compact_copy
-  Bit 0:   tight_intervals
+  Bit 1:   lr_split
+  Bit 0:   (reserved, must be 0)
+Implied: compact_copy=true, tight_intervals=true (always active).
 """
 function encode_cs_params(; ref_window_size::Int=64, compact_copy::Bool=true,
-		tight_intervals::Bool=true)
+		tight_intervals::Bool=true, lr_split::Bool=false)
 	haskey(CS_WINDOW_TO_IDX, ref_window_size) || error("Unsupported CS window size: $ref_window_size")
 	widx = CS_WINDOW_TO_IDX[ref_window_size]
-	offset = (widx << 2) | (compact_copy ? 0x02 : 0x00) | (tight_intervals ? 0x01 : 0x00)
+	offset = (widx << 2) | (lr_split ? 0x02 : 0x00)
 	return UInt8(PARAM_CS_BASE + offset)
 end
 
 """
     decode_cs_params(byte2::UInt8) → NamedTuple
 
-Decode CS params from a v3.1 byte2 value.
+Decode CS params from byte2 value.
+v3.2: bit 1 = lr_split, compact_copy=true, tight_intervals=true (hardcoded).
 """
 function decode_cs_params(byte2::UInt8)
 	offset = Int(byte2) - PARAM_CS_BASE
 	widx = (offset >> 2) & 0x07
 	ref_window_size = CS_WINDOW_SIZES[widx + 1]
-	compact_copy = (offset & 0x02) != 0
-	tight_intervals = (offset & 0x01) != 0
-	return (ref_window_size=ref_window_size, compact_copy=compact_copy,
-	        tight_intervals=tight_intervals)
+	lr_split = (offset & 0x02) != 0
+	return (ref_window_size=ref_window_size, compact_copy=true,
+	        tight_intervals=true, lr_split=lr_split)
 end
 
 """
     encode_cge_params(params::CGEParams) → UInt8
 
-Encode the 5 variable CGE params into a v3.1 byte2 value (range 0x70–0xFF).
-Mixed-radix: offset = membership×36 + inter_strategy×18 + window_idx×3 + interval_mode
+Encode CGE params into byte2 value (range 0x70–0xFF).
+Mixed-radix: membership(2) × window(6) × interval_mode(4) × mil(3) = 144.
+varint is stored separately in the header's integer_encoding field.
 """
 function encode_cge_params(params::CGEParams)
-	# v3.2 encoding: membership(2) × window(6) × interval_mode(3) × mil(4) = 144
-	haskey(CGE_V32_MEMBERSHIP_TO_IDX, params.membership) || error("Unsupported CGE membership for v3.2: $(params.membership) (only :implicit_ranges, :stop)")
+	haskey(CGE_V32_MEMBERSHIP_TO_IDX, params.membership) || error("Unsupported CGE membership: $(params.membership) (only :implicit_ranges, :stop)")
 	haskey(CGE_WINDOW_TO_IDX, params.intra_ref_window) || error("Unsupported CGE window: $(params.intra_ref_window)")
 	mil = params.intra_adapt_mil  # encode adapt_mil (= intra_mil in practice)
-	haskey(CGE_MIL_TO_IDX, mil) || error("Unsupported CGE mil: $mil (must be 2, 3, 4, or 5)")
+	haskey(CGE_MIL_TO_IDX, mil) || error("Unsupported CGE mil: $mil (must be 3, 4, or 5)")
 
 	midx = CGE_V32_MEMBERSHIP_TO_IDX[params.membership]
 	widx = CGE_WINDOW_TO_IDX[params.intra_ref_window]
 	milidx = CGE_MIL_TO_IDX[mil]
 	interval_mode = if !params.intra_intervals
 		0
+	elseif params.intra_lr_split && params.intra_tight_deltas
+		3
 	elseif params.intra_lr_split
 		2
 	else
 		1
 	end
-	offset = midx * 72 + widx * 12 + interval_mode * 4 + milidx
+	offset = midx * 72 + widx * 12 + interval_mode * 3 + milidx
 	@assert offset <= 143 "CGE param offset $offset exceeds max 143"
 	return UInt8(PARAM_CGE_BASE + offset)
 end
 
 """
-    decode_cge_params_v31(byte2::UInt8) → CGEParams
+    decode_cge_params(byte2::UInt8; varint::Symbol=:fibonacci) → CGEParams
 
-Decode CGE params from a v3.1 byte2 value (legacy). Uses old mixed-radix:
-membership(4) × inter(2) × window(6) × interval_mode(3) = 144.
-mil is not encoded; hardcoded to 4 (intra_mil) and 2 (intra_adapt_mil).
+Decode CGE params from byte2 value. Mixed-radix:
+membership(2) × window(6) × interval_mode(4) × mil(3) = 144.
+varint is passed from the header's integer_encoding field.
 """
-function decode_cge_params_v31(byte2::UInt8)
-	offset = Int(byte2) - PARAM_CGE_BASE
-
-	membership_idx = div(offset, 36)
-	rem1 = offset - membership_idx * 36
-	inter_idx = div(rem1, 18)
-	rem2 = rem1 - inter_idx * 18
-	window_idx = div(rem2, 3)
-	interval_mode = rem2 - window_idx * 3
-
-	membership = CGE_MEMBERSHIP_ORDER[membership_idx + 1]
-	inter_strategy = CGE_INTER_STRATEGY_ORDER[inter_idx + 1]
-	intra_ref_window = CGE_WINDOW_SIZES[window_idx + 1]
-	intra_intervals = interval_mode >= 1
-	intra_lr_split = interval_mode == 2
-
-	return CGEParams(
-		L=128, varint=:fibonacci, count_varint=:fibonacci, gap=:fibonacci,
-		degree=:elias_delta, perm_strategy=:blockpos, undirected_pairs=false,
-		membership=membership, inter_strategy=inter_strategy,
-		intra_ref_enabled=true, intra_ref_window=intra_ref_window,
-		intra_ref_rle=false, intra_block_try=false,
-		positions_mode=:delta, additions_mode=:auto,
-		min_cluster_density=0.0,
-		intra_intervals=intra_intervals, intra_mil=4, intra_greedy_mil=false,
-		intra_mgs=false, intra_zigzag=true, intra_stop_deltas=true,
-		intra_copy_blocks=true, intra_copy_adaptive=true,
-		intra_ref_fixwidth=true, intra_ref_vlc=false,
-		intra_add_adaptive=true, intra_raw_adaptive=true,
-		intra_adapt_mil=2, intra_lr_split=intra_lr_split,
-	)
-end
-
-"""
-    decode_cge_params(byte2::UInt8) → CGEParams
-
-Decode CGE params from a v3.2+ byte2 value. Uses new mixed-radix:
-membership(2) × window(6) × interval_mode(3) × mil(4) = 144.
-Both intra_mil and intra_adapt_mil are set to the decoded mil value.
-"""
-function decode_cge_params(byte2::UInt8)
+function decode_cge_params(byte2::UInt8; varint::Symbol=:fibonacci)
 	offset = Int(byte2) - PARAM_CGE_BASE
 
 	membership_idx = div(offset, 72)
 	rem1 = offset - membership_idx * 72
 	window_idx = div(rem1, 12)
 	rem2 = rem1 - window_idx * 12
-	interval_mode = div(rem2, 4)
-	mil_idx = rem2 - interval_mode * 4
+	interval_mode = div(rem2, 3)
+	mil_idx = rem2 - interval_mode * 3
 
 	membership = CGE_V32_MEMBERSHIP_ORDER[membership_idx + 1]
 	intra_ref_window = CGE_WINDOW_SIZES[window_idx + 1]
 	intra_intervals = interval_mode >= 1
-	intra_lr_split = interval_mode == 2
+	intra_lr_split = interval_mode >= 2
+	intra_tight_deltas = interval_mode == 3
 	mil = CGE_MIL_SIZES[mil_idx + 1]
 
 	return CGEParams(
-		L=128, varint=:fibonacci, count_varint=:fibonacci, gap=:fibonacci,
+		L=128, varint=varint, count_varint=:fibonacci, gap=:fibonacci,
 		degree=:elias_delta, perm_strategy=:blockpos, undirected_pairs=false,
 		membership=membership, inter_strategy=:lists,
 		intra_ref_enabled=true, intra_ref_window=intra_ref_window,
@@ -357,6 +320,7 @@ function decode_cge_params(byte2::UInt8)
 		intra_ref_fixwidth=true, intra_ref_vlc=false,
 		intra_add_adaptive=true, intra_raw_adaptive=true,
 		intra_adapt_mil=mil, intra_lr_split=intra_lr_split,
+		intra_tight_deltas=intra_tight_deltas,
 	)
 end
 
@@ -374,7 +338,7 @@ _std_default_params() = decode_std_params(UInt8(PARAM_STD_BASE + 0x3F))
 Hardcoded recommended CS defaults (matching ALG_CS = 0x03).
 Equivalent to: window=64, compact_copy=true, tight_intervals=true.
 """
-_cs_default_params() = decode_cs_params(encode_cs_params(ref_window_size=64, compact_copy=true, tight_intervals=true))
+_cs_default_params() = decode_cs_params(encode_cs_params(ref_window_size=64, compact_copy=true, tight_intervals=true, lr_split=false))
 
 """
     _cge_default_params() → CGEParams
@@ -467,8 +431,8 @@ function write_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, encodin
 	header_bytes = UInt8[
 		# 'MGS' signature (3 bytes)
 		0x4d, 0x47, 0x53,
-		# Major version = 3, Minor version = 1 (2 bytes)
-		0x03, 0x01,
+		# Major version = 3, Minor version = 2 (2 bytes)
+		0x03, 0x02,
 		# Flag bytes (2 bytes)
 		flag_byte1, flag_byte2,
 		# Number of vertices (5 bytes, little-endian UInt40)
@@ -776,8 +740,8 @@ function write_huffman_compressed_mgs3_graph(g::AbstractGraph{T}, filename::Abst
 	header_bytes = UInt8[
 		# 'MGS' signature (3 bytes)
 		0x4d, 0x47, 0x53,
-		# Major version = 3, Minor version = 1 (2 bytes)
-		0x03, 0x01,
+		# Major version = 3, Minor version = 2 (2 bytes)
+		0x03, 0x02,
 		# Flag bytes (2 bytes)
 		flag_byte1, flag_byte2,
 		# Number of vertices (5 bytes, little-endian UInt40)
@@ -951,8 +915,8 @@ function write_complex_encoded_compressed_mgs3_graph(g::AbstractGraph{T}, filena
 	header_bytes = UInt8[
 		# 'MGS' signature (3 bytes)
 		0x4d, 0x47, 0x53,
-		# Major version = 3, Minor version = 1 (2 bytes)
-		0x03, 0x01,
+		# Major version = 3, Minor version = 2 (2 bytes)
+		0x03, 0x02,
 		# Flag bytes (2 bytes) 
 		flag_byte1, flag_byte2,
 		# Number of vertices (5 bytes, little-endian UInt40)
@@ -999,9 +963,11 @@ Produces a `.mgz` file with v3.1 header (params encoded in byte2).
 """
 function write_std_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString;
 		coding_scheme::Symbol=:children, integer_encoding::Symbol=:fibonacci,
-		ref_window_size::Int=64, copy_blocks::Bool=true, adaptive_copy::Bool=true,
-		stop_deltas::Bool=true, empty_prefix::Bool=true, compact_copy::Bool=true,
-		tight_intervals::Bool=true, vlc2::Bool=true) where {T<:Unsigned}
+		ref_window_size::Int=64, copy_blocks::Bool=true,
+		stop_deltas::Bool=true,
+		lr_split::Bool=false, exact_costing::Bool=false,
+		multi_ref::Bool=false,
+		adaptive_header::Bool=false) where {T<:Unsigned}
 	vs = vertices(g)
 	gs = convert(UInt64, length(vs))
 
@@ -1012,15 +978,14 @@ function write_std_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString;
 	n_bits_v = convert(UInt8, ceil(log(2, gs)))
 	V = infer_uint_custom_type(n_bits_v)
 
-	# v3.1: encode params into byte2
-	compact_tight = compact_copy && tight_intervals
-	option_flags = encode_std_params(ref_window_size=ref_window_size, copy_blocks=copy_blocks,
-		stop_deltas=stop_deltas, compact_tight=compact_tight, vlc2=vlc2)
+	option_flags = encode_std_params(ref_window_size=ref_window_size,
+		copy_blocks=copy_blocks, stop_deltas=stop_deltas,
+		lr_split=lr_split, adaptive_header=adaptive_header)
 	flag_byte1, flag_byte2 = create_header_flags(:directed, coding_scheme, integer_encoding, option_flags)
 
 	header_bytes = UInt8[
 		0x4d, 0x47, 0x53,
-		0x03, 0x01,             # v3.1
+		0x03, 0x02,  # v3.2
 		flag_byte1, flag_byte2,
 		(gs & 0xff), ((gs >> 8) & 0xff), ((gs >> 16) & 0xff), ((gs >> 24) & 0xff), ((gs >> 32) & 0xff)
 	]
@@ -1039,9 +1004,11 @@ function write_std_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString;
 	@info("writing STD compressed graph data")
 	write_greedy_graph_data(bw, nls, coding_scheme, ref_window_size;
 		integer_encoding=integer_encoding, copy_blocks=copy_blocks,
-		adaptive_copy=adaptive_copy, stop_deltas=stop_deltas,
-		empty_prefix=empty_prefix, compact_copy=compact_copy,
-		tight_intervals=tight_intervals, vlc2=vlc2)
+		adaptive_copy=copy_blocks, stop_deltas=stop_deltas,
+		compact_copy=true,
+		tight_intervals=true, fixwidth_ref=lr_split,
+		exact_costing=exact_costing, lr_split=lr_split,
+		multi_ref=multi_ref, adaptive_header=adaptive_header)
 
 	flush_bitwriter(bw; flush_last_bits=true)
 	close(f)
@@ -1060,7 +1027,7 @@ Produces a `.mgz` file with v3.1 header (params encoded in byte2).
 function write_cs_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString;
 		coding_scheme::Symbol=:children, integer_encoding::Symbol=:fibonacci,
 		ref_window_size::Int=64, compact_copy::Bool=true,
-		tight_intervals::Bool=true) where {T<:Unsigned}
+		tight_intervals::Bool=true, lr_split::Bool=false) where {T<:Unsigned}
 	vs = vertices(g)
 	gs = convert(UInt64, length(vs))
 
@@ -1071,14 +1038,14 @@ function write_cs_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString;
 	n_bits_v = convert(UInt8, ceil(log(2, gs)))
 	V = infer_uint_custom_type(n_bits_v)
 
-	# v3.1: encode params into byte2
+	# v3.2: encode params into byte2
 	option_flags = encode_cs_params(ref_window_size=ref_window_size, compact_copy=compact_copy,
-		tight_intervals=tight_intervals)
+		tight_intervals=tight_intervals, lr_split=lr_split)
 	flag_byte1, flag_byte2 = create_header_flags(:directed, coding_scheme, integer_encoding, option_flags)
 
 	header_bytes = UInt8[
 		0x4d, 0x47, 0x53,
-		0x03, 0x01,             # v3.1
+		0x03, 0x02,             # v3.2
 		flag_byte1, flag_byte2,
 		(gs & 0xff), ((gs >> 8) & 0xff), ((gs >> 16) & 0xff), ((gs >> 24) & 0xff), ((gs >> 32) & 0xff)
 	]
@@ -1097,7 +1064,7 @@ function write_cs_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString;
 	@info("writing CS compressed graph data")
 	write_cmdstream_graph_data(bw, nls, coding_scheme, ref_window_size;
 		integer_encoding=integer_encoding, compact_copy=compact_copy,
-		tight_intervals=tight_intervals)
+		tight_intervals=tight_intervals, lr_split=lr_split)
 
 	flush_bitwriter(bw; flush_last_bits=true)
 	close(f)
@@ -1111,17 +1078,17 @@ end
     write_cge_mgs3_graph(g, filename, clusters; ...)
 
 Write graph in MGS v3 format with CGE compression.
-Produces a `.mgz` file with v3.1 header (params encoded in byte2).
+Produces a `.mgz` file with self-describing header (params in byte2, varint in integer_encoding).
 
 Parameters:
 - g: Input graph
 - filename: Output filename (without .mgz extension)
 - clusters: Partition as Vector{Vector{T}} of vertex clusters
-- params: CGEParams encoding parameters
+- params: CGEParams encoding parameters (varint stored in header integer_encoding field)
 """
 function write_cge_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString,
 		clusters::Vector{Vector{T}};
-		coding_scheme::Symbol=:children, integer_encoding::Symbol=:fibonacci,
+		coding_scheme::Symbol=:children,
 		params::CGEParams=CGEParams(),
 		progress::Union{Nothing,Function}=nothing) where {T<:Unsigned}
 	vs = vertices(g)
@@ -1130,14 +1097,12 @@ function write_cge_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString,
 	if gs > MGS_MAX_SIZE
 		error("Input graph cannot have more than 2^40-1 vertices")
 	end
-
-	# v3.2: encode params into byte2 (includes mil)
 	option_flags = encode_cge_params(params)
-	flag_byte1, flag_byte2 = create_header_flags(:directed, coding_scheme, integer_encoding, option_flags)
+	flag_byte1, flag_byte2 = create_header_flags(:directed, coding_scheme, params.varint, option_flags)
 
 	header_bytes = UInt8[
 		0x4d, 0x47, 0x53,
-		0x03, 0x02,             # v3.2 (CGE with mil encoding)
+		0x03, 0x02,             # v3.2
 		flag_byte1, flag_byte2,
 		(gs & 0xff), ((gs >> 8) & 0xff), ((gs >> 16) & 0xff), ((gs >> 24) & 0xff), ((gs >> 32) & 0xff)
 	]
@@ -1266,14 +1231,14 @@ function load_compressed_mgs3_graph(filename::AbstractString)
 		load_greedy_mgs3_graph(f, graph_type, encoding, gs, compression;
 			copy_blocks=p.copy_blocks, adaptive_copy=p.adaptive_copy,
 			ref_window_size=p.ref_window_size, fixwidth_ref=p.fixwidth_ref,
-			stop_deltas=p.stop_deltas, empty_prefix=p.empty_prefix,
+			stop_deltas=p.stop_deltas,
 			compact_copy=p.compact_copy, tight_intervals=p.tight_intervals,
-			vlc2=p.vlc2)
+			lr_split=p.lr_split, adaptive_header=p.adaptive_header)
 	elseif byte2 == ALG_CS
 		p = _cs_default_params()
 		load_cs_mgs3_graph(f, graph_type, encoding, gs, compression;
 			compact_copy=p.compact_copy, tight_intervals=p.tight_intervals,
-			ref_window_size=p.ref_window_size)
+			ref_window_size=p.ref_window_size, lr_split=p.lr_split)
 	elseif byte2 == ALG_CGE
 		load_cge_mgs3_graph(f, graph_type, gs; params=_cge_default_params(), coding_scheme=encoding)
 	elseif byte2 == ALG_ASTRA
@@ -1286,17 +1251,16 @@ function load_compressed_mgs3_graph(filename::AbstractString)
 		load_greedy_mgs3_graph(f, graph_type, encoding, gs, compression;
 			copy_blocks=p.copy_blocks, adaptive_copy=p.adaptive_copy,
 			ref_window_size=p.ref_window_size, fixwidth_ref=p.fixwidth_ref,
-			stop_deltas=p.stop_deltas, empty_prefix=p.empty_prefix,
+			stop_deltas=p.stop_deltas,
 			compact_copy=p.compact_copy, tight_intervals=p.tight_intervals,
-			vlc2=p.vlc2)
+			lr_split=p.lr_split, adaptive_header=p.adaptive_header)
 	elseif PARAM_CS_BASE <= byte2 <= PARAM_CS_MAX
 		p = decode_cs_params(byte2)
 		load_cs_mgs3_graph(f, graph_type, encoding, gs, compression;
 			compact_copy=p.compact_copy, tight_intervals=p.tight_intervals,
-			ref_window_size=p.ref_window_size)
+			ref_window_size=p.ref_window_size, lr_split=p.lr_split)
 	elseif PARAM_CGE_BASE <= byte2 <= PARAM_CGE_MAX
-		minor_version = header_bytes[5]
-		p = minor_version >= 0x02 ? decode_cge_params(byte2) : decode_cge_params_v31(byte2)
+		p = decode_cge_params(byte2; varint=compression)
 		load_cge_mgs3_graph(f, graph_type, gs; params=p, coding_scheme=encoding)
 	else
 		error("Unknown byte2: 0x$(string(byte2, base=16, pad=2))")
@@ -1491,8 +1455,10 @@ Load graph from greedy-compressed MGS v3 format. The data stream is self-describ
 function load_greedy_mgs3_graph(io::IO, graph_type::Symbol, coding_scheme::Symbol, gs::UInt64,
 		integer_encoding::Symbol=:fibonacci; copy_blocks::Bool=false, adaptive_copy::Bool=false,
 		ref_window_size::Int=7, fixwidth_ref::Bool=false, stop_deltas::Bool=false,
-		adaptive_deltas::Bool=false, empty_prefix::Bool=false, split_residual::Bool=false,
-		compact_copy::Bool=false, tight_intervals::Bool=false, vlc2::Bool=false)
+		adaptive_deltas::Bool=false, split_residual::Bool=false,
+		compact_copy::Bool=false, tight_intervals::Bool=false,
+		lr_split::Bool=false, multi_ref::Bool=false,
+		adaptive_header::Bool=false)
 	n_bits_v = convert(UInt8, ceil(log(2, gs)))
 	V = infer_uint_custom_type(n_bits_v)
 
@@ -1509,9 +1475,11 @@ function load_greedy_mgs3_graph(io::IO, graph_type::Symbol, coding_scheme::Symbo
 		integer_encoding=integer_encoding, copy_blocks=copy_blocks,
 		adaptive_copy=adaptive_copy, ref_window_size=ref_window_size,
 		fixwidth_ref=fixwidth_ref, stop_deltas=stop_deltas,
-		adaptive_deltas=adaptive_deltas, empty_prefix=empty_prefix,
+		adaptive_deltas=adaptive_deltas,
 		split_residual=split_residual, compact_copy=compact_copy,
-		tight_intervals=tight_intervals, vlc2=vlc2)
+		tight_intervals=tight_intervals,
+		lr_split=lr_split, multi_ref=multi_ref,
+		adaptive_header=adaptive_header)
 
 	@info("building graph from neighbor lists")
 	for (source_vertex, neighbors) in neighbor_lists
@@ -1535,7 +1503,8 @@ Load graph from CS (Command Stream) compressed MGS v3 format.
 """
 function load_cs_mgs3_graph(io::IO, graph_type::Symbol, coding_scheme::Symbol, gs::UInt64,
 		integer_encoding::Symbol=:fibonacci;
-		compact_copy::Bool=false, tight_intervals::Bool=false, ref_window_size::Int=64)
+		compact_copy::Bool=true, tight_intervals::Bool=true, ref_window_size::Int=64,
+		lr_split::Bool=false)
 	n_bits_v = convert(UInt8, ceil(log(2, gs)))
 	V = infer_uint_custom_type(n_bits_v)
 
@@ -1549,7 +1518,8 @@ function load_cs_mgs3_graph(io::IO, graph_type::Symbol, coding_scheme::Symbol, g
 	@info("reading CS-compressed graph data")
 	neighbor_lists = read_cmdstream_graph_data(reader, V(gs), coding_scheme, V;
 		integer_encoding=integer_encoding, compact_copy=compact_copy,
-		tight_intervals=tight_intervals, ref_window_size=ref_window_size)
+		tight_intervals=tight_intervals, ref_window_size=ref_window_size,
+		lr_split=lr_split)
 
 	@info("building graph from neighbor lists")
 	for (source_vertex, neighbors) in neighbor_lists

@@ -75,6 +75,10 @@ include("compression.jl")
 using .Compression
 export Compression
 
+include("clustering.jl")
+using .Clustering
+export Clustering
+
 include("relabeling.jl")
 using .Relabeling
 export Relabeling
@@ -90,10 +94,6 @@ export MGS
 include("distribution.jl")
 using .Distribution
 export Distribution
-
-include("clustering.jl")
-using .Clustering
-export Clustering
 
 include("param_prediction.jl")
 using .ParamPrediction

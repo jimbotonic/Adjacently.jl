@@ -95,6 +95,26 @@ end
 
 RefBuildWorkspace{T}() where {T<:Unsigned} = RefBuildWorkspace{T}(Bool[], T[])
 
+# Pre-allocated buffers for exact bit-counting in STD greedy reference search.
+# Avoids creating IOBuffer/BitWriter pairs per candidate per vertex.
+mutable struct GreedyCostBuffer
+    io1::IOBuffer; w1::BitWriter   # copy encoding trial
+    io2::IOBuffer; w2::BitWriter   # stop-delta / residual trial
+    io3::IOBuffer; w3::BitWriter   # intervals trial
+end
+
+function GreedyCostBuffer()
+    io1 = IOBuffer(); io2 = IOBuffer(); io3 = IOBuffer()
+    GreedyCostBuffer(io1, BitWriter(io1), io2, BitWriter(io2), io3, BitWriter(io3))
+end
+
+@inline function _greedy_reset!(io::IOBuffer, w::BitWriter)
+    truncate(io, 0)
+    seek(io, 0)
+    w.index = 1
+    w.bit_count = 0
+end
+
 ################################################################################
 # Basic encoding / decoding
 ################################################################################
@@ -1391,7 +1411,7 @@ Write a list of values to the bitwriter, using delta encoding.
 @param lst::Vector{T}: the list of values to write
 @param encoding::Symbol: the compression coding to use (:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta)
 """
-function write_delta(w::BitWriter, lst::Vector{T}, encoding::Symbol; vertex_id=nothing) where {T<:Unsigned}
+function write_delta(w::BitWriter, lst::Vector{T}, encoding::Symbol; vertex_id=nothing, positive_gaps::Bool=false) where {T<:Unsigned}
     # if the list is empty, return
     isempty(lst) && return
 
@@ -1413,10 +1433,17 @@ function write_delta(w::BitWriter, lst::Vector{T}, encoding::Symbol; vertex_id=n
     end
 
     # write the rest of the values
-    for i in 2:length(delta_lst)
-        # NB: we shift by 1 to avoid zeros
-        write_encoded_value(w, delta_lst[i] + T(1), encoding)
-        @debug "WRITE delta: wrote delta_lst[$i]=$(delta_lst[i]) + 1"
+    if positive_gaps
+        # Caller guarantees all gaps ≥ 1 (sorted unique list) — encode directly without +1 shift
+        for i in 2:length(delta_lst)
+            write_encoded_value(w, delta_lst[i], encoding)
+        end
+    else
+        for i in 2:length(delta_lst)
+            # NB: we shift by 1 to avoid zeros
+            write_encoded_value(w, delta_lst[i] + T(1), encoding)
+            @debug "WRITE delta: wrote delta_lst[$i]=$(delta_lst[i]) + 1"
+        end
     end
 end
 
@@ -1431,7 +1458,7 @@ Read a list of values from the bit reader, using delta encoding.
 
 @return::Vector{T}: the decoded list
 """
-function read_delta(r::BitReader, encoding::Symbol, ::Type{T}=UInt8; max_elements::Union{Nothing,Int}=nothing, stop_value::Union{Nothing,T}=nothing, vertex_id=nothing) where {T<:Unsigned}
+function read_delta(r::BitReader, encoding::Symbol, ::Type{T}=UInt8; max_elements::Union{Nothing,Int}=nothing, stop_value::Union{Nothing,T}=nothing, vertex_id=nothing, positive_gaps::Bool=false) where {T<:Unsigned}
     lst = T[]
     @debug "READ delta: starting, max_elements=$max_elements, stop_value=$stop_value"
 
@@ -1483,8 +1510,8 @@ function read_delta(r::BitReader, encoding::Symbol, ::Type{T}=UInt8; max_element
             break
         end
 
-        # NB: shift back by 1
-        push!(lst, lst[end] + value - T(1))
+        # Shift back by 1 unless positive_gaps mode (gaps already ≥ 1, no shift applied)
+        push!(lst, lst[end] + value - (positive_gaps ? T(0) : T(1)))
     end
     return lst
 end
@@ -2733,6 +2760,12 @@ const ENCODING_OPTIONS = vcat(
     [(:delta, 0)]
 )
 
+# Fixed MIL for adaptive header mode (intervals path)
+const ADAPTIVE_MIL = 4
+
+# Encoding options for adaptive header mode: only STOP-delta and intervals(ADAPTIVE_MIL)
+const ADAPTIVE_ENCODING_OPTIONS = [(:delta, 0), (:interval, ADAPTIVE_MIL)]
+
 function _write_enc_opt_tag(w, enc_type::Symbol, mil::Int)
     tuple = (enc_type, mil)
     if enc_type == :delta; tuple = (:delta, 0); end
@@ -2769,8 +2802,21 @@ _zigzag_decode(v::UInt64)::Int64 = iseven(v) ? Int64(v >> 1) : -Int64((v >> 1) +
 # ===========================================================================
 # Variable-Length Coded (VLC) vertex headers
 #
-# The top 4 action combos cover ~97% of vertices in well-ordered web graphs.
-# We assign short prefix codes to them, with an escape for the remaining ~3%.
+# VLC v1/v2: The top 4 action combos cover ~97% of vertices in well-ordered
+# web graphs. Short prefix codes for them, escape (9-10 bits) for the rest.
+# VLC v3: All interval mils get equal cost (no escape penalty for mil≠2).
+#
+#   === VLC v3 ===
+#   Code         Bits  Meaning
+#   ----         ----  -------
+#   0             1    reference + delta
+#   10            2    none      + delta
+#   110  + mm     5    none      + interval (mm = mil index, 2 bits)
+#   1110 + mm     6    reference + interval (mm = mil index, 2 bits)
+#   11110 + mm    7    none      + rle      (mm = mil index, 2 bits)
+#   11111 + mm    7    reference + rle      (mm = mil index, 2 bits)
+#
+#   === VLC v1/v2 ===
 #
 #   Code   Bits  Meaning
 #   ----   ----  -------
@@ -2783,82 +2829,88 @@ _zigzag_decode(v::UInt64)::Int64 = iseven(v) ? Int64(v >> 1) : -Int64((v >> 1) +
 # Expected average: ~2.3 bits/vertex (vs 6.0 fixed), a ~62% reduction.
 # ===========================================================================
 
-# VLC v1 (vlc2=false): 00=noref+delta, 01=noref+int2, 10=ref+delta, 110=ref+int2, 111+6b=escape
-# VLC v2 (vlc2=true):  0=ref+delta, 10=noref+delta, 110=noref+int2, 1110=ref+int2, 1111+6b=escape
-function _write_vertex_header_vlc(w, ref_mode::Symbol, enc_type::Symbol, mil::Int; vlc2::Bool=false)
-    if vlc2
-        if ref_mode == :reference && enc_type == :delta
-            write_bit(w, false)                                                   # 0
-        elseif ref_mode == :none && enc_type == :delta
-            write_bit(w, true); write_bit(w, false)                               # 10
-        elseif ref_mode == :none && enc_type == :interval && mil == 2
-            write_bit(w, true); write_bit(w, true); write_bit(w, false)           # 110
-        elseif ref_mode == :reference && enc_type == :interval && mil == 2
-            write_bit(w, true); write_bit(w, true); write_bit(w, true); write_bit(w, false)  # 1110
-        else
-            write_bit(w, true); write_bit(w, true); write_bit(w, true); write_bit(w, true)  # 1111 escape
-            _write_ref_mode_tag(w, get(REF_MODE_TAGS, ref_mode, REF_NONE))
-            _write_enc_opt_tag(w, enc_type, mil)
-        end
-    else
-        if ref_mode == :none && enc_type == :delta
-            write_bit(w, false); write_bit(w, false)                              # 00
-        elseif ref_mode == :none && enc_type == :interval && mil == 2
-            write_bit(w, false); write_bit(w, true)                               # 01
-        elseif ref_mode == :reference && enc_type == :delta
-            write_bit(w, true); write_bit(w, false)                               # 10
-        elseif ref_mode == :reference && enc_type == :interval && mil == 2
-            write_bit(w, true); write_bit(w, true); write_bit(w, false)           # 110
-        else
-            write_bit(w, true); write_bit(w, true); write_bit(w, true)            # 111 escape
-            _write_ref_mode_tag(w, get(REF_MODE_TAGS, ref_mode, REF_NONE))
-            _write_enc_opt_tag(w, enc_type, mil)
-        end
+# VLC v3: all interval/rle mils have equal cost, no expensive escape.
+# VLC vertex header prefix codes with merged empty (see FORMAT_SPECS_STD.md).
+# Codes:
+#   0            (1)  ref + delta
+#   10           (2)  none + delta
+#   110          (3)  empty (no neighbors)
+#   1110+mm      (6)  none + interval
+#   11110+mm     (7)  ref + interval
+#   111110+mm    (8)  none + rle
+#   1111110+mm   (9)  ref + rle
+#   11111110     (8)  multi-ref + delta
+#   111111110+mm (11) multi-ref + interval
+#   111111111+mm (11) multi-ref + rle
+function _write_vertex_header_vlc(w, ref_mode::Symbol, enc_type::Symbol, mil::Int; adaptive::Bool=false)
+    if adaptive
+        # Adaptive header: 2 bits — ref_flag + adaptive_flag (0=STOP-delta, 1=intervals)
+        write_bit(w, ref_mode == :reference)
+        write_bit(w, enc_type == :interval)
+        return
+    end
+    if ref_mode == :reference && enc_type == :delta
+        write_bit(w, false)                                                           # 0
+    elseif ref_mode == :none && enc_type == :delta
+        write_bit(w, true); write_bit(w, false)                                       # 10
+    elseif ref_mode == :empty
+        write_bit(w, true); write_bit(w, true); write_bit(w, false)                   # 110
+    elseif ref_mode == :none && enc_type == :interval
+        write_bit(w, true); write_bit(w, true); write_bit(w, true); write_bit(w, false)  # 1110
+        _write_mil_tag(w, mil)
+    elseif ref_mode == :reference && enc_type == :interval
+        for _ in 1:4; write_bit(w, true); end; write_bit(w, false)                    # 11110
+        _write_mil_tag(w, mil)
+    elseif ref_mode == :none && enc_type == :rle
+        for _ in 1:5; write_bit(w, true); end; write_bit(w, false)                    # 111110
+        _write_mil_tag(w, mil)
+    elseif ref_mode == :reference && enc_type == :rle
+        for _ in 1:6; write_bit(w, true); end; write_bit(w, false)                    # 1111110
+        _write_mil_tag(w, mil)
+    elseif ref_mode == :multi_ref && enc_type == :delta
+        for _ in 1:7; write_bit(w, true); end; write_bit(w, false)                    # 11111110
+    elseif ref_mode == :multi_ref && enc_type == :interval
+        for _ in 1:8; write_bit(w, true); end; write_bit(w, false)                    # 111111110
+        _write_mil_tag(w, mil)
+    else  # multi_ref + rle
+        for _ in 1:8; write_bit(w, true); end; write_bit(w, true)                     # 111111111
+        _write_mil_tag(w, mil)
     end
 end
 
-function _read_vertex_header_vlc(r; vlc2::Bool=false)
-    if vlc2
-        if !read_bit(r)
-            return (:reference, :delta, 0)            # 0
-        elseif !read_bit(r)
-            return (:none, :delta, 0)                 # 10
-        elseif !read_bit(r)
-            return (:none, :interval, 2)              # 110
-        elseif !read_bit(r)
-            return (:reference, :interval, 2)         # 1110
-        else
-            # 1111 escape → read full 6-bit header
-            ref_mode = get(TAG_REF_MODES, _read_ref_mode_tag(r), :none)
-            enc_type, mil = _read_enc_opt_tag(r)
-            return (ref_mode, enc_type, mil)
-        end
-    else
-        b0 = read_bit(r)
-        if !b0
-            b1 = read_bit(r)
-            if !b1
-                return (:none, :delta, 0)            # 00
-            else
-                return (:none, :interval, 2)          # 01
-            end
-        else
-            b1 = read_bit(r)
-            if !b1
-                return (:reference, :delta, 0)        # 10
-            else
-                b2 = read_bit(r)
-                if !b2
-                    return (:reference, :interval, 2) # 110
-                else
-                    # 111 escape → read full 6-bit header
-                    ref_mode = get(TAG_REF_MODES, _read_ref_mode_tag(r), :none)
-                    enc_type, mil = _read_enc_opt_tag(r)
-                    return (ref_mode, enc_type, mil)
-                end
-            end
-        end
+function _read_vertex_header_vlc(r; adaptive::Bool=false)
+    if adaptive
+        # Adaptive header: 2 bits — ref_flag + adaptive_flag
+        ref_flag = read_bit(r)
+        interval_flag = read_bit(r)
+        ref_mode = ref_flag ? :reference : :none
+        enc_type = interval_flag ? :interval : :delta
+        return (ref_mode, enc_type, interval_flag ? ADAPTIVE_MIL : 0)
     end
+    if !read_bit(r);                           return (:reference, :delta, 0); end      # 0
+    if !read_bit(r);                           return (:none, :delta, 0); end            # 10
+    if !read_bit(r);                           return (:empty, :delta, 0); end           # 110
+    if !read_bit(r); mil = _read_mil_tag(r);   return (:none, :interval, mil); end       # 1110+mm
+    if !read_bit(r); mil = _read_mil_tag(r);   return (:reference, :interval, mil); end  # 11110+mm
+    if !read_bit(r); mil = _read_mil_tag(r);   return (:none, :rle, mil); end            # 111110+mm
+    if !read_bit(r); mil = _read_mil_tag(r);   return (:reference, :rle, mil); end       # 1111110+mm
+    if !read_bit(r);                           return (:multi_ref, :delta, 0); end       # 11111110
+    if !read_bit(r); mil = _read_mil_tag(r);   return (:multi_ref, :interval, mil); end  # 111111110+mm
+    mil = _read_mil_tag(r);                    return (:multi_ref, :rle, mil)             # 111111111+mm
+end
+
+@inline function _vlc_header_cost(ref_mode::Symbol, enc_type::Symbol, mil::Int; adaptive::Bool=false)::Int
+    if adaptive; return 2; end  # Always 2 bits: ref_flag + adaptive_flag
+    if ref_mode == :reference && enc_type == :delta;    return 1; end   # 0
+    if ref_mode == :none && enc_type == :delta;         return 2; end   # 10
+    if ref_mode == :empty;                              return 3; end   # 110
+    if ref_mode == :none && enc_type == :interval;      return 6; end   # 1110+mm
+    if ref_mode == :reference && enc_type == :interval;  return 7; end  # 11110+mm
+    if ref_mode == :none && enc_type == :rle;            return 8; end  # 111110+mm
+    if ref_mode == :reference && enc_type == :rle;       return 9; end  # 1111110+mm
+    if ref_mode == :multi_ref && enc_type == :delta;     return 8; end  # 11111110
+    if ref_mode == :multi_ref && enc_type == :interval;  return 11; end # 111111110+mm
+    return 11  # multi_ref + rle: 111111111+mm
 end
 
 """
@@ -2893,23 +2945,27 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         fixwidth_ref::Bool=false,
         stop_deltas::Bool=false,
         adaptive_deltas::Bool=false,
-        empty_prefix::Bool=false,
         split_residual::Bool=false,
         bv_blocks::Bool=false,
         compact_copy::Bool=false,
         tight_intervals::Bool=false,
-        vlc2::Bool=false) where {T<:Unsigned}
+        exact_costing::Bool=false,
+        lr_split::Bool=false,
+        multi_ref::Bool=false,
+        adaptive_header::Bool=false) where {T<:Unsigned}
 
     vs = length(keys(neighbor_lists))
     ie = integer_encoding
 
-    # In index mode, override stop_deltas and empty_prefix (redundant with offset table)
+    # In index mode, override stop_deltas (redundant with offset table)
     idx_mode = coding_scheme == :index
     if idx_mode
         stop_deltas = false
-        empty_prefix = false
         adaptive_deltas = false
     end
+
+    # Create cost buffer for exact bit-counting when requested
+    gcb = exact_costing ? GreedyCostBuffer() : nothing
 
     reference_window = T[]
     function add_to_ref_window!(vertex::T)
@@ -2928,17 +2984,24 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
 
     # --- Helper: encode one vertex's data into a BitWriter ---
     function _encode_vertex!(wr, v::T, current_neighbors::Vector{T})
-        # Empty-prefix optimization (children mode only)
-        if empty_prefix
-            if isempty(current_neighbors)
-                write_bit(wr, false)  # empty vertex
-                add_to_ref_window!(v)
-                return
+        # Empty vertex handling
+        if isempty(current_neighbors)
+            if !idx_mode
+                if adaptive_header
+                    # Adaptive: ref_flag(0) + adaptive(0) → STOP-delta handles empty naturally
+                    _write_vertex_header_vlc(wr, :none, :delta, 0; adaptive=true)
+                    write_bit(wr, false)  # STOP terminator (0 elements)
+                else
+                    # VLC: write merged empty code
+                    _write_vertex_header_vlc(wr, :empty, :delta, 0)
+                end
             end
-            write_bit(wr, true)  # non-empty vertex
+            # Index mode: nothing written (empty = offset[v] == offset[v+1])
+            add_to_ref_window!(v)
+            return
         end
 
-        # In index mode, skip empty vertices entirely (nothing between their offsets)
+        # Safety: shouldn't reach here with empty neighbors, but guard anyway
         if idx_mode && isempty(current_neighbors)
             add_to_ref_window!(v)
             return
@@ -2950,10 +3013,10 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         enc_type = :interval
 
         # Greedy search
-        _, actual_ref_mode, mil, ref_result, enc_type, use_stop, res_enc_type, res_mil = _greedy_vertex_search(current_neighbors, neighbor_lists, reference_window, ie; vertex_id=v, copy_blocks=copy_blocks, adaptive_copy=adaptive_copy, fixwidth_ref=fixwidth_ref, ref_dist_bits=ref_dist_bits, stop_deltas=stop_deltas, adaptive_deltas=adaptive_deltas, split_residual=split_residual, bv_blocks=bv_blocks, compact_copy=compact_copy, tight_intervals=tight_intervals, vlc2=vlc2)
+        _, actual_ref_mode, mil, ref_result, enc_type, use_stop, res_enc_type, res_mil = _greedy_vertex_search(current_neighbors, neighbor_lists, reference_window, ie; vertex_id=v, copy_blocks=copy_blocks, adaptive_copy=adaptive_copy, fixwidth_ref=fixwidth_ref, ref_dist_bits=ref_dist_bits, stop_deltas=stop_deltas, adaptive_deltas=adaptive_deltas, split_residual=split_residual, bv_blocks=bv_blocks, compact_copy=compact_copy, tight_intervals=tight_intervals, buf=gcb, lr_split=lr_split, multi_ref=multi_ref, adaptive_header=adaptive_header)
 
-        # Write VLC vertex header
-        _write_vertex_header_vlc(wr, actual_ref_mode, enc_type, mil; vlc2=vlc2)
+        # Write vertex header
+        _write_vertex_header_vlc(wr, actual_ref_mode, enc_type, mil; adaptive=adaptive_header)
 
         # Collect action statistics if requested
         if stats !== nothing
@@ -2964,23 +3027,35 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         target_list = current_neighbors
         write_enc = enc_type
         write_mil = mil
-        if actual_ref_mode != :none && ref_result !== nothing
-            ref_distance, copy_bitmap, residuals = ref_result
+
+        # Helper: write one reference (distance + copy bitmap)
+        function _write_one_ref!(wr_out, ref_dist, copy_bmp)
             if fixwidth_ref
-                local d = Int(ref_distance) - 1
+                local d = Int(ref_dist) - 1
                 for b in (ref_dist_bits-1):-1:0
-                    write_bit(wr, ((d >> b) & 1) == 1)
+                    write_bit(wr_out, ((d >> b) & 1) == 1)
                 end
             else
-                write_encoded_value(wr, T(ref_distance), ie)
+                write_encoded_value(wr_out, T(ref_dist), ie)
             end
             if adaptive_copy && copy_blocks
-                _write_adaptive_copy(wr, copy_bitmap, ie; bv_blocks=bv_blocks, compact_copy=compact_copy)
+                _write_adaptive_copy(wr_out, copy_bmp, ie; bv_blocks=bv_blocks, compact_copy=compact_copy)
             elseif copy_blocks
-                _write_copy_blocks(wr, copy_bitmap, ie)
+                _write_copy_blocks(wr_out, copy_bmp, ie)
             else
-                write_bitmap_adaptive(wr, copy_bitmap, ie)
+                write_bitmap_adaptive(wr_out, copy_bmp, ie)
             end
+        end
+
+        if actual_ref_mode == :multi_ref && ref_result !== nothing
+            # Multi-reference: ref_result = (dist1, bmp1, dist2, bmp2, residuals)
+            ref_dist1, copy_bmp1, ref_dist2, copy_bmp2, residuals = ref_result
+            _write_one_ref!(wr, ref_dist1, copy_bmp1)
+            _write_one_ref!(wr, ref_dist2, copy_bmp2)
+            target_list = residuals
+        elseif actual_ref_mode == :reference && ref_result !== nothing
+            ref_distance, copy_bitmap, residuals = ref_result
+            _write_one_ref!(wr, ref_distance, copy_bitmap)
             # Split residual encoding: signal if residuals use a different enc_type
             if split_residual
                 same_enc = (res_enc_type == enc_type && (res_mil == mil || res_enc_type == :delta))
@@ -2996,7 +3071,11 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
 
         # Encode target_list
         if write_enc == :interval
-            write_intervals_and_residuals(wr, target_list, ie, write_mil; vertex_id=v, tight_intervals=tight_intervals)
+            if lr_split
+                _write_intervals_lr(wr, target_list, ie, write_mil; vertex_id=v, tight_intervals=tight_intervals)
+            else
+                write_intervals_and_residuals(wr, target_list, ie, write_mil; vertex_id=v, tight_intervals=tight_intervals)
+            end
         elseif write_enc == :delta
             # Determine delta format: adaptive (per-vertex) or global
             vertex_stop = adaptive_deltas ? use_stop : stop_deltas
@@ -3067,9 +3146,12 @@ end
 function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Type{T};
         integer_encoding::Symbol=:fibonacci, copy_blocks::Bool=false, adaptive_copy::Bool=false,
         ref_window_size::Int=7, fixwidth_ref::Bool=false, stop_deltas::Bool=false,
-        adaptive_deltas::Bool=false, empty_prefix::Bool=false,
+        adaptive_deltas::Bool=false,
         split_residual::Bool=false, bv_blocks::Bool=false, compact_copy::Bool=false,
-        tight_intervals::Bool=false, vlc2::Bool=false) where {T<:Unsigned}
+        tight_intervals::Bool=false,
+        lr_split::Bool=false,
+        multi_ref::Bool=false,
+        adaptive_header::Bool=false) where {T<:Unsigned}
 
     neighbor_lists = Dict{T,Vector{T}}()
     ref_dist_bits = fixwidth_ref ? ceil(Int, log2(max(2, ref_window_size))) : 0
@@ -3079,10 +3161,9 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
     enc_tag = _read_encoding_tag(r)
     ie = get(TAG_ENCODINGS, enc_tag, :fibonacci)
 
-    # In index mode, override stop_deltas and empty_prefix
+    # In index mode, override stop_deltas
     if is_index_mode
         stop_deltas = false
-        empty_prefix = false
         adaptive_deltas = false
     end
 
@@ -3106,7 +3187,11 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
     # Helper to read encoded list based on type (using captured ie, tight_intervals, etc.)
     function _read_encoded_list_body(r_in::BitReader, v::T, enc_type::Symbol, mil::Int)
         if enc_type == :interval
-            return read_intervals_and_residuals(r_in, ie, mil, T; vertex_id=v, tight_intervals=tight_intervals)
+            if lr_split
+                return _read_intervals_lr(r_in, ie, mil, T; vertex_id=v, tight_intervals=tight_intervals)
+            else
+                return read_intervals_and_residuals(r_in, ie, mil, T; vertex_id=v, tight_intervals=tight_intervals)
+            end
         elseif enc_type == :delta
             # Determine delta format: adaptive (per-vertex) or global
             vertex_stop = adaptive_deltas ? read_bit(r_in) : stop_deltas
@@ -3129,14 +3214,56 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
         return T[]
     end
 
+    # Helper: read one reference distance + copy bitmap, return copied neighbors
+    function _read_one_ref(r_in::BitReader)
+        if fixwidth_ref
+            local d = 0
+            for _ in 1:ref_dist_bits
+                d = (d << 1) | Int(read_bit(r_in))
+            end
+            distance = T(d + 1)
+        else
+            distance = read_encoded_value(r_in, ie, T)
+        end
+        ref_idx = length(reference_window) - Int(distance) + 1
+        ref_nbs = T[]
+        if 1 <= ref_idx <= length(reference_window)
+            ref_v = reference_window[ref_idx]
+            ref_nbs = get(neighbor_lists, ref_v, T[])
+        end
+        if adaptive_copy && copy_blocks
+            ref_len = length(ref_nbs)
+            copy_bitmap = _read_adaptive_copy(r_in, ref_len, ie, T; bv_blocks=bv_blocks, compact_copy=compact_copy)
+            copied = reconstruct_from_reference(ref_nbs, copy_bitmap, T[])
+        elseif copy_blocks
+            copy_positions = _read_copy_blocks(r_in, ie, T)
+            copied = reconstruct_from_copy_positions(ref_nbs, copy_positions, T[])
+        else
+            copy_bitmap = read_bitmap_adaptive(r_in, ie)
+            copied = reconstruct_from_reference(ref_nbs, copy_bitmap, T[])
+        end
+        return copied
+    end
+
     function _decode_vertex!(r_in::BitReader, v::T)
-        # Read VLC vertex header
-        ref_mode, enc_type, mil = _read_vertex_header_vlc(r_in; vlc2=vlc2)
+        # Read vertex header
+        ref_mode, enc_type, mil = _read_vertex_header_vlc(r_in; adaptive=adaptive_header)
+
+        # Empty vertex (merged VLC code)
+        if ref_mode == :empty
+            return T[]
+        end
 
         current_neighbors = T[]
-        is_ref = ref_mode != :none
 
-        if is_ref
+        if ref_mode == :multi_ref
+            # Multi-reference: read two ref+copy pairs, then residuals
+            copied1 = _read_one_ref(r_in)
+            copied2 = _read_one_ref(r_in)
+            residuals = _read_encoded_list_body(r_in, v, enc_type, mil)
+            # Union all three sets
+            current_neighbors = sort!(unique!(vcat(copied1, copied2, residuals)))
+        elseif ref_mode == :reference
             if fixwidth_ref
                 local d = 0
                 for _ in 1:ref_dist_bits
@@ -3147,7 +3274,6 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
                 distance = read_encoded_value(r_in, ie, T)
             end
             if adaptive_copy && copy_blocks
-                # 3-way nested mode: need ref_len before reading copy mode
                 ref_idx = length(reference_window) - Int(distance) + 1
                 ref_nbs = T[]
                 if 1 <= ref_idx <= length(reference_window)
@@ -3156,10 +3282,9 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
                 end
                 ref_len = length(ref_nbs)
                 copy_bitmap = _read_adaptive_copy(r_in, ref_len, ie, T; bv_blocks=bv_blocks, compact_copy=compact_copy)
-                # Split residual: read residual encoding if different from header
                 res_et, res_m = enc_type, mil
                 if split_residual
-                    if read_bit(r_in)  # 1 = different encoding
+                    if read_bit(r_in)
                         res_et, res_m = _read_enc_opt_tag(r_in)
                     end
                 end
@@ -3167,10 +3292,9 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
                 current_neighbors = reconstruct_from_reference(ref_nbs, copy_bitmap, residuals)
             elseif copy_blocks
                 copy_positions = _read_copy_blocks(r_in, ie, T)
-                # Split residual: read residual encoding if different from header
                 res_et, res_m = enc_type, mil
                 if split_residual
-                    if read_bit(r_in)  # 1 = different encoding
+                    if read_bit(r_in)
                         res_et, res_m = _read_enc_opt_tag(r_in)
                     end
                 end
@@ -3185,10 +3309,9 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
                 end
             else
                 copy_bitmap = read_bitmap_adaptive(r_in, ie)
-                # Split residual: read residual encoding if different from header
                 res_et, res_m = enc_type, mil
                 if split_residual
-                    if read_bit(r_in)  # 1 = different encoding
+                    if read_bit(r_in)
                         res_et, res_m = _read_enc_opt_tag(r_in)
                     end
                 end
@@ -3219,15 +3342,6 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
                 neighbor_lists[v] = T[]
                 add_to_ref_window!(v)
                 continue
-            end
-        else
-            # Empty-prefix optimization: 1-bit flag per vertex (0=empty, 1=non-empty)
-            if empty_prefix
-                if !read_bit(r)  # empty vertex
-                    neighbor_lists[v] = T[]
-                    add_to_ref_window!(v)
-                    continue
-                end
             end
         end
 
@@ -3580,7 +3694,7 @@ function _read_stop_delta(r::BitReader, ie::Symbol, ::Type{T}; vertex_id=nothing
             end
             first = false
         else
-            val = prev + raw
+            val = prev + read_encoded_value(r, ie, T)
         end
         push!(result, val)
         prev = val
@@ -3602,6 +3716,194 @@ function _estimate_stop_delta_cost(sorted_vals::Vector{T}, ie::Symbol; vertex_id
     for i in 2:length(sorted_vals)
         cost += 1 + estimate_encoded_value_cost(sorted_vals[i] - sorted_vals[i-1], ie)
     end
+    return cost
+end
+
+# --- LR-split interval encoding ---
+# Intervals encoded as standard; residuals split at vertex_id into left (< vid) and
+# right (>= vid) halves, each encoded as ascending distances from vertex_id.
+# Produces smaller first-values than zigzag, saving ~0.1–0.4 BPE on web graphs.
+
+function _write_intervals_lr(w::BitWriter, neighbors::Vector{T}, encoding::Symbol,
+                              mil::Int; vertex_id=nothing, tight_intervals::Bool=false) where {T<:Unsigned}
+    if vertex_id === nothing || isempty(neighbors)
+        write_intervals_and_residuals(w, neighbors, encoding, mil; vertex_id=vertex_id, tight_intervals=tight_intervals)
+        return
+    end
+    vid = T(vertex_id)
+
+    intervals, residuals = compress_intervals(neighbors, mil)
+
+    # Write intervals (same format as standard)
+    write_encoded_value(w, T(length(intervals)) + T(1), encoding)
+    if !isempty(intervals)
+        prev_ref = T(0)
+        for (idx, (start, len)) in enumerate(intervals)
+            if idx == 1
+                offset = Int64(start) - Int64(vid)
+                write_encoded_value(w, UInt64(_zigzag_encode(offset) + 1), encoding)
+            else
+                write_encoded_value(w, start - prev_ref, encoding)
+            end
+            write_encoded_value(w, len - T(mil) + T(1), encoding)
+            prev_ref = tight_intervals ? (start + T(len)) : start
+        end
+    end
+
+    # Write residual count
+    write_encoded_value(w, T(length(residuals)) + T(1), encoding)
+    if !isempty(residuals)
+        # Split at vertex_id
+        split_idx = 0
+        @inbounds for i in 1:length(residuals)
+            if residuals[i] < vid
+                split_idx = i
+            else
+                break
+            end
+        end
+        n_left = split_idx
+        n_right = length(residuals) - n_left
+
+        # Left count (decoder derives right = total - left)
+        write_encoded_value(w, T(n_left) + T(1), encoding)
+
+        # Left residuals: reversed to ascending distances from vid
+        if n_left > 0
+            left_dists = Vector{T}(undef, n_left)
+            @inbounds for i in 1:n_left
+                left_dists[i] = vid - residuals[n_left - i + 1]
+            end
+            write_delta(w, left_dists, encoding)
+        end
+
+        # Right residuals: distances from vid (+1 to handle val==vid)
+        if n_right > 0
+            right_dists = Vector{T}(undef, n_right)
+            @inbounds for i in 1:n_right
+                right_dists[i] = residuals[n_left + i] - vid + T(1)
+            end
+            write_delta(w, right_dists, encoding)
+        end
+    end
+end
+
+function _read_intervals_lr(r::BitReader, encoding::Symbol, mil::Int,
+                             ::Type{T}; vertex_id=nothing, tight_intervals::Bool=false) where {T<:Unsigned}
+    if vertex_id === nothing
+        return read_intervals_and_residuals(r, encoding, mil, T; vertex_id=vertex_id, tight_intervals=tight_intervals)
+    end
+    vid = T(vertex_id)
+
+    # Read intervals (same format as standard)
+    num_intervals = Int(read_encoded_value(r, encoding, T)) - 1
+    neighbors = T[]
+
+    if num_intervals > 0
+        prev_ref = T(0)
+        for idx in 1:num_intervals
+            if idx == 1
+                raw_start = read_encoded_value(r, encoding, UInt64)
+                start = T(Int64(vid) + _zigzag_decode(raw_start - 1))
+            else
+                start = prev_ref + read_encoded_value(r, encoding, T)
+            end
+            len = Int(read_encoded_value(r, encoding, T)) - 1 + mil
+            for j in 0:(len-1)
+                push!(neighbors, start + T(j))
+            end
+            prev_ref = tight_intervals ? (start + T(len)) : start
+        end
+    end
+
+    # Read residuals
+    num_residuals = Int(read_encoded_value(r, encoding, T)) - 1
+    if num_residuals > 0
+        n_left = Int(read_encoded_value(r, encoding, T)) - 1
+        n_right = num_residuals - n_left
+
+        if n_left > 0
+            left_dists = read_delta(r, encoding, T; max_elements=n_left)
+            for i in n_left:-1:1
+                push!(neighbors, vid - left_dists[i])
+            end
+        end
+
+        if n_right > 0
+            right_dists = read_delta(r, encoding, T; max_elements=n_right)
+            for d in right_dists
+                push!(neighbors, vid + d - T(1))
+            end
+        end
+    end
+
+    sort!(neighbors)
+    return neighbors
+end
+
+function _estimate_intervals_lr_cost(neighbors::Vector{T}, ie::Symbol, mil::Int;
+                                      vertex_id=nothing, tight_intervals::Bool=false) where {T<:Unsigned}
+    if vertex_id === nothing || isempty(neighbors)
+        return estimate_interval_runlength_encoding_cost(neighbors, ie, mil, 3; vertex_id=vertex_id, tight_intervals=tight_intervals)
+    end
+    vid = T(vertex_id)
+    intervals, residuals = compress_intervals(neighbors, mil)
+    cost = 0
+
+    # Interval count
+    cost += estimate_encoded_value_cost(T(length(intervals)) + T(1), ie)
+
+    # Intervals (same as standard)
+    prev_ref = T(0)
+    for (idx, (start, len)) in enumerate(intervals)
+        if idx == 1
+            encoded_start = UInt64(_zigzag_encode(Int64(start) - Int64(vid)) + 1)
+            cost += estimate_encoded_value_cost(encoded_start, ie)
+        else
+            cost += estimate_encoded_value_cost(start - prev_ref, ie)
+        end
+        cost += estimate_encoded_value_cost(T(len - mil + 1), ie)
+        prev_ref = tight_intervals ? (start + T(len)) : start
+    end
+
+    # Residual count
+    cost += estimate_encoded_value_cost(T(length(residuals)) + T(1), ie)
+
+    if !isempty(residuals)
+        # Split at vid
+        split_idx = 0
+        @inbounds for i in 1:length(residuals)
+            residuals[i] < vid ? (split_idx = i) : break
+        end
+        n_left = split_idx
+        n_right = length(residuals) - n_left
+
+        # Left count
+        cost += estimate_encoded_value_cost(T(n_left) + T(1), ie)
+
+        # Left distances (ascending from vid)
+        if n_left > 0
+            prev = T(0)
+            for i in 1:n_left
+                d = vid - residuals[n_left - i + 1]
+                gap = i == 1 ? d : (d - prev + T(1))
+                cost += estimate_encoded_value_cost(gap, ie)
+                prev = d
+            end
+        end
+
+        # Right distances (ascending from vid, +1 shift)
+        if n_right > 0
+            prev = T(0)
+            for i in 1:n_right
+                d = residuals[n_left + i] - vid + T(1)
+                gap = i == 1 ? d : (d - prev + T(1))
+                cost += estimate_encoded_value_cost(gap, ie)
+                prev = d
+            end
+        end
+    end
+
     return cost
 end
 
@@ -3680,8 +3982,11 @@ function _estimate_rle_cost(neighbors::Vector{T}, ie::Symbol, mil::Int; vertex_i
     return cost
 end
 
-function _estimate_base_cost(target::Vector{T}, ie::Symbol, mil::Int, enc_type::Symbol; vertex_id=nothing, stop_deltas::Bool=false, tight_intervals::Bool=false) where {T<:Unsigned}
+function _estimate_base_cost(target::Vector{T}, ie::Symbol, mil::Int, enc_type::Symbol; vertex_id=nothing, stop_deltas::Bool=false, tight_intervals::Bool=false, lr_split::Bool=false) where {T<:Unsigned}
     if enc_type == :interval
+        if lr_split
+            return _estimate_intervals_lr_cost(target, ie, mil; vertex_id=vertex_id, tight_intervals=tight_intervals)
+        end
         return estimate_interval_runlength_encoding_cost(target, ie, mil, 3; vertex_id=vertex_id, tight_intervals=tight_intervals)
     elseif enc_type == :delta
         if stop_deltas
@@ -3698,14 +4003,12 @@ function _estimate_base_cost(target::Vector{T}, ie::Symbol, mil::Int, enc_type::
 end
 
 function _try_find_reference(neighbors::Vector{T}, neighbor_lists::Dict{T,Vector{T}},
-                                ref_window::Vector{T}, ie::Symbol, mil::Int, enc_type::Symbol= :interval; vertex_id=nothing, copy_blocks::Bool=false, adaptive_copy::Bool=false, fixwidth_ref::Bool=false, ref_dist_bits::Int=0, stop_deltas::Bool=false, bv_blocks::Bool=false, compact_copy::Bool=false, tight_intervals::Bool=false) where {T<:Unsigned}
+                                ref_window::Vector{T}, ie::Symbol, mil::Int, enc_type::Symbol= :interval; vertex_id=nothing, copy_blocks::Bool=false, adaptive_copy::Bool=false, fixwidth_ref::Bool=false, ref_dist_bits::Int=0, stop_deltas::Bool=false, bv_blocks::Bool=false, compact_copy::Bool=false, tight_intervals::Bool=false, buf::Union{GreedyCostBuffer,Nothing}=nothing, lr_split::Bool=false) where {T<:Unsigned}
     ns = Set(neighbors)
     best_cost = nothing
     best_distance = nothing
     best_bitmap = Bool[]
     best_residuals = T[]
-
-    # We don't need noref_cost here, we just need to return the best reference cost
 
     for (i, ref_v) in enumerate(ref_window)
         ref_nl = get(neighbor_lists, ref_v, T[])
@@ -3713,23 +4016,62 @@ function _try_find_reference(neighbors::Vector{T}, neighbor_lists::Dict{T,Vector
 
         ref_neighbors_set = Set(ref_nl)
         overlap = length(intersect(ns, ref_neighbors_set))
-        overlap < 3 && continue
+        overlap < 1 && continue
 
         copy_bitmap = Bool[n in ns for n in ref_nl]
         residuals = sort(T[n for n in neighbors if !(n in ref_neighbors_set)])
 
         distance = T(length(ref_window) - i + 1)
         ref_cost = fixwidth_ref ? ref_dist_bits : estimate_encoded_value_cost(distance, ie)
-        if adaptive_copy && copy_blocks
-            ref_cost += _estimate_adaptive_copy_cost(copy_bitmap, ie; bv_blocks=bv_blocks, compact_copy=compact_copy)
-        elseif copy_blocks
-            ref_cost += _estimate_copy_blocks_cost(copy_bitmap, ie)
-        else
-            ref_cost += _estimate_adaptive_bitmap_cost(copy_bitmap, ie)
-        end
 
-        if !isempty(residuals)
-            ref_cost += _estimate_base_cost(residuals, ie, mil, enc_type; vertex_id=vertex_id, stop_deltas=stop_deltas, tight_intervals=tight_intervals)
+        if buf !== nothing
+            # Exact bit-counting: trial-encode copy to buffer, measure bits
+            _greedy_reset!(buf.io1, buf.w1)
+            if adaptive_copy && copy_blocks
+                _write_adaptive_copy(buf.w1, copy_bitmap, ie; bv_blocks=bv_blocks, compact_copy=compact_copy)
+            elseif copy_blocks
+                _write_copy_blocks(buf.w1, copy_bitmap, ie)
+            else
+                write_bitmap_adaptive(buf.w1, copy_bitmap, ie)
+            end
+            ref_cost += _total_bits(buf.w1)
+
+            # Exact residual cost
+            if !isempty(residuals)
+                _greedy_reset!(buf.io2, buf.w2)
+                if enc_type == :interval
+                    if lr_split
+                        _write_intervals_lr(buf.w2, residuals, ie, mil; vertex_id=vertex_id, tight_intervals=tight_intervals)
+                    else
+                        write_intervals_and_residuals(buf.w2, residuals, ie, mil; vertex_id=vertex_id, tight_intervals=tight_intervals)
+                    end
+                elseif enc_type == :delta
+                    if stop_deltas
+                        _write_stop_delta(buf.w2, residuals, ie; vertex_id=vertex_id)
+                    else
+                        write_encoded_value(buf.w2, T(length(residuals) + 1), ie)
+                        write_delta(buf.w2, residuals, ie; vertex_id=vertex_id)
+                    end
+                elseif enc_type == :rle
+                    write_encoded_value(buf.w2, T(length(residuals) + 1), ie)
+                    deltas = delta_encode_vector(residuals)
+                    write_hybrid_mix_encoded_list(buf.w2, deltas, ie, true, mil, false; vertex_id=vertex_id)
+                end
+                ref_cost += _total_bits(buf.w2)
+            end
+        else
+            # Estimation-based costing (original path)
+            if adaptive_copy && copy_blocks
+                ref_cost += _estimate_adaptive_copy_cost(copy_bitmap, ie; bv_blocks=bv_blocks, compact_copy=compact_copy)
+            elseif copy_blocks
+                ref_cost += _estimate_copy_blocks_cost(copy_bitmap, ie)
+            else
+                ref_cost += _estimate_adaptive_bitmap_cost(copy_bitmap, ie)
+            end
+
+            if !isempty(residuals)
+                ref_cost += _estimate_base_cost(residuals, ie, mil, enc_type; vertex_id=vertex_id, stop_deltas=stop_deltas, tight_intervals=tight_intervals, lr_split=lr_split)
+            end
         end
 
         if best_cost === nothing || ref_cost < best_cost
@@ -3746,26 +4088,9 @@ function _try_find_reference(neighbors::Vector{T}, neighbor_lists::Dict{T,Vector
     return (best_distance, best_bitmap, best_residuals)
 end
 
-# VLC header bit cost for a given (ref_mode, enc_type, mil) combination.
-# Must match _write_vertex_header_vlc exactly.
-@inline function _vlc_header_cost(ref_mode::Symbol, enc_type::Symbol, mil::Int; vlc2::Bool=false)::Int
-    if vlc2
-        if ref_mode == :reference && enc_type == :delta;                 return 1; end  # 0
-        if ref_mode == :none && enc_type == :delta;                      return 2; end  # 10
-        if ref_mode == :none && enc_type == :interval && mil == 2;       return 3; end  # 110
-        if ref_mode == :reference && enc_type == :interval && mil == 2;  return 4; end  # 1110
-        return 10  # 1111 escape: 4 + 2 (ref_mode) + 4 (enc_opt)
-    else
-        if ref_mode == :none && enc_type == :delta;                      return 2; end  # 00
-        if ref_mode == :none && enc_type == :interval && mil == 2;       return 2; end  # 01
-        if ref_mode == :reference && enc_type == :delta;                 return 2; end  # 10
-        if ref_mode == :reference && enc_type == :interval && mil == 2;  return 3; end  # 110
-        return 9  # 111 escape: 3 + 2 (ref_mode) + 4 (enc_opt)
-    end
-end
 
 function _greedy_vertex_search(neighbors::Vector{T}, neighbor_lists::Dict{T,Vector{T}},
-                                   ref_window::Vector{T}, ie::Symbol; vertex_id=nothing, copy_blocks::Bool=false, adaptive_copy::Bool=false, fixwidth_ref::Bool=false, ref_dist_bits::Int=0, stop_deltas::Bool=false, adaptive_deltas::Bool=false, split_residual::Bool=false, bv_blocks::Bool=false, compact_copy::Bool=false, tight_intervals::Bool=false, vlc2::Bool=false) where {T<:Unsigned}
+                                   ref_window::Vector{T}, ie::Symbol; vertex_id=nothing, copy_blocks::Bool=false, adaptive_copy::Bool=false, fixwidth_ref::Bool=false, ref_dist_bits::Int=0, stop_deltas::Bool=false, adaptive_deltas::Bool=false, split_residual::Bool=false, bv_blocks::Bool=false, compact_copy::Bool=false, tight_intervals::Bool=false, buf::Union{GreedyCostBuffer,Nothing}=nothing, lr_split::Bool=false, multi_ref::Bool=false, adaptive_header::Bool=false) where {T<:Unsigned}
     if isempty(neighbors)
         return (ie, :none, MIL_OPTIONS[1], nothing, :interval, false, :interval, MIL_OPTIONS[1])
     end
@@ -3779,78 +4104,221 @@ function _greedy_vertex_search(neighbors::Vector{T}, neighbor_lists::Dict{T,Vect
     best_res_enc_type = :interval
     best_res_mil = MIL_OPTIONS[1]
 
-    for (enc_type, mil) in ENCODING_OPTIONS
-        # When adaptive_deltas is enabled and enc_type is :delta, evaluate both formats
-        delta_variants = if adaptive_deltas && enc_type == :delta
-            [(false, true), (true, true)]  # (use_stop, is_adaptive) — +1 bit flag cost each
+    # Helper: compute exact or estimated cost for a target list
+    @inline function _cost_for_list(target::Vector{T}, mil::Int, enc_type::Symbol, use_stop::Bool)
+        if buf !== nothing
+            # Exact bit-counting via trial encoding
+            _greedy_reset!(buf.io2, buf.w2)
+            if enc_type == :interval
+                if lr_split
+                    _write_intervals_lr(buf.w2, target, ie, mil; vertex_id=vertex_id, tight_intervals=tight_intervals)
+                else
+                    write_intervals_and_residuals(buf.w2, target, ie, mil; vertex_id=vertex_id, tight_intervals=tight_intervals)
+                end
+            elseif enc_type == :delta
+                if use_stop
+                    _write_stop_delta(buf.w2, target, ie; vertex_id=vertex_id)
+                else
+                    write_encoded_value(buf.w2, T(length(target) + 1), ie)
+                    if !isempty(target)
+                        write_delta(buf.w2, target, ie; vertex_id=vertex_id)
+                    end
+                end
+            elseif enc_type == :rle
+                write_encoded_value(buf.w2, T(length(target) + 1), ie)
+                if !isempty(target)
+                    deltas = delta_encode_vector(target)
+                    write_hybrid_mix_encoded_list(buf.w2, deltas, ie, true, mil, false; vertex_id=vertex_id)
+                end
+            end
+            return _total_bits(buf.w2)
         else
-            [(stop_deltas, false)]  # (use_stop, is_adaptive) — no flag bit
+            return _estimate_base_cost(target, ie, mil, enc_type; vertex_id=vertex_id, stop_deltas=use_stop, tight_intervals=tight_intervals, lr_split=lr_split)
         end
+    end
 
-        for (use_stop, is_adaptive) in delta_variants
-            flag_cost = is_adaptive ? 1 : 0
-
-            # Base cost (no reference) — include VLC header cost
-            noref_header = _vlc_header_cost(:none, enc_type, mil; vlc2=vlc2)
-            base_cost = noref_header + _estimate_base_cost(neighbors, ie, mil, enc_type; vertex_id=vertex_id, stop_deltas=use_stop, tight_intervals=tight_intervals) + flag_cost
-
-            if base_cost < best_cost
-                best_cost = base_cost
-                best_ref_mode = :none
-                best_mil = mil
-                best_enc_type = enc_type
-                best_ref_result = nothing
-                best_use_stop = use_stop
-                best_res_enc_type = enc_type
-                best_res_mil = mil
+    # Standard encoding options loop (always runs)
+    # In adaptive header mode, only evaluate STOP-delta and intervals(ADAPTIVE_MIL)
+    _enc_options = adaptive_header ? ADAPTIVE_ENCODING_OPTIONS : ENCODING_OPTIONS
+    for (enc_type, mil) in _enc_options
+            delta_variants = if adaptive_deltas && enc_type == :delta
+                [(false, true), (true, true)]
+            else
+                [(stop_deltas, false)]
             end
 
-            # Reference cost — include VLC header cost
-            if !isempty(ref_window) && length(neighbors) >= 3
-                ref_header = _vlc_header_cost(:reference, enc_type, mil; vlc2=vlc2)
-                ref_res = _try_find_reference(neighbors, neighbor_lists, ref_window, ie, mil, enc_type; vertex_id=vertex_id, copy_blocks=copy_blocks, adaptive_copy=adaptive_copy, fixwidth_ref=fixwidth_ref, ref_dist_bits=ref_dist_bits, stop_deltas=use_stop, bv_blocks=bv_blocks, compact_copy=compact_copy, tight_intervals=tight_intervals)
-                if ref_res !== nothing
-                    dist, bmp, res = ref_res
-                    base_ref_c = ref_header + (fixwidth_ref ? ref_dist_bits : estimate_encoded_value_cost(dist, ie))
-                    if adaptive_copy && copy_blocks
-                        base_ref_c += _estimate_adaptive_copy_cost(bmp, ie; bv_blocks=bv_blocks, compact_copy=compact_copy)
-                    elseif copy_blocks
-                        base_ref_c += _estimate_copy_blocks_cost(bmp, ie)
-                    else
-                        base_ref_c += _estimate_adaptive_bitmap_cost(bmp, ie)
-                    end
+            for (use_stop, is_adaptive) in delta_variants
+                flag_cost = is_adaptive ? 1 : 0
 
-                    # Evaluate residual encodings
-                    res_options = split_residual ? ENCODING_OPTIONS : [(enc_type, mil)]
-                    for (res_et, res_mil) in res_options
-                        res_use_stop = res_et == :delta ? use_stop : false
-                        res_c = base_ref_c
-                        if !isempty(res)
-                            res_c += _estimate_base_cost(res, ie, res_mil, res_et; vertex_id=vertex_id, stop_deltas=res_use_stop, tight_intervals=tight_intervals)
-                        end
-                        # Signal cost for split residual encoding
-                        if split_residual
-                            if res_et == enc_type && (res_mil == mil || res_et == :delta)
-                                res_c += 1  # "same" flag bit
+                noref_header = _vlc_header_cost(:none, enc_type, mil; adaptive=adaptive_header)
+                # In adaptive mode, force STOP-delta for delta encoding
+                actual_stop = adaptive_header ? true : use_stop
+                base_cost = noref_header + _cost_for_list(neighbors, mil, enc_type, actual_stop) + flag_cost
+
+                if base_cost < best_cost
+                    best_cost = base_cost
+                    best_ref_mode = :none
+                    best_mil = mil
+                    best_enc_type = enc_type
+                    best_ref_result = nothing
+                    best_use_stop = use_stop
+                    best_res_enc_type = enc_type
+                    best_res_mil = mil
+                end
+
+                if !isempty(ref_window) && length(neighbors) >= 1
+                    ref_header = _vlc_header_cost(:reference, enc_type, mil; adaptive=adaptive_header)
+                    ref_res = _try_find_reference(neighbors, neighbor_lists, ref_window, ie, mil, enc_type; vertex_id=vertex_id, copy_blocks=copy_blocks, adaptive_copy=adaptive_copy, fixwidth_ref=fixwidth_ref, ref_dist_bits=ref_dist_bits, stop_deltas=use_stop, bv_blocks=bv_blocks, compact_copy=compact_copy, tight_intervals=tight_intervals, buf=buf, lr_split=lr_split)
+                    if ref_res !== nothing
+                        dist, bmp, res = ref_res
+                        base_ref_c = ref_header + (fixwidth_ref ? ref_dist_bits : estimate_encoded_value_cost(dist, ie))
+                        if buf !== nothing
+                            _greedy_reset!(buf.io1, buf.w1)
+                            if adaptive_copy && copy_blocks
+                                _write_adaptive_copy(buf.w1, bmp, ie; bv_blocks=bv_blocks, compact_copy=compact_copy)
+                            elseif copy_blocks
+                                _write_copy_blocks(buf.w1, bmp, ie)
                             else
-                                res_c += 5  # "different" flag bit + 4-bit enc_opt tag
+                                write_bitmap_adaptive(buf.w1, bmp, ie)
+                            end
+                            base_ref_c += _total_bits(buf.w1)
+                        else
+                            if adaptive_copy && copy_blocks
+                                base_ref_c += _estimate_adaptive_copy_cost(bmp, ie; bv_blocks=bv_blocks, compact_copy=compact_copy)
+                            elseif copy_blocks
+                                base_ref_c += _estimate_copy_blocks_cost(bmp, ie)
+                            else
+                                base_ref_c += _estimate_adaptive_bitmap_cost(bmp, ie)
                             end
                         end
-                        res_c += flag_cost
 
-                        if res_c < best_cost
-                            best_cost = res_c
-                            best_ref_mode = :reference
-                            best_mil = mil
-                            best_enc_type = enc_type
-                            best_ref_result = ref_res
-                            best_use_stop = use_stop
-                            best_res_enc_type = res_et
-                            best_res_mil = res_mil
+                        res_options = split_residual ? ENCODING_OPTIONS : [(enc_type, mil)]
+                        for (res_et, res_mil) in res_options
+                            res_use_stop = res_et == :delta ? use_stop : false
+                            res_c = base_ref_c
+                            if !isempty(res)
+                                res_c += _cost_for_list(res, res_mil, res_et, res_use_stop)
+                            end
+                            if split_residual
+                                if res_et == enc_type && (res_mil == mil || res_et == :delta)
+                                    res_c += 1
+                                else
+                                    res_c += 5
+                                end
+                            end
+                            res_c += flag_cost
+
+                            if res_c < best_cost
+                                best_cost = res_c
+                                best_ref_mode = :reference
+                                best_mil = mil
+                                best_enc_type = enc_type
+                                best_ref_result = ref_res
+                                best_use_stop = use_stop
+                                best_res_enc_type = res_et
+                                best_res_mil = res_mil
+                            end
                         end
                     end
                 end
             end
+        end
+
+    # ── Multi-reference search ─────────────────────────────────────────────
+    # Try all top-K ref1 candidates paired with all window ref2 candidates.
+    # The optimal (ref1, ref2) pair may not include the best single ref.
+    if multi_ref && !adaptive_header && !isempty(ref_window) && length(neighbors) >= 6
+        ns = Set(neighbors)
+
+        # Helper: estimate copy cost for a bitmap
+        @inline function _copy_cost_est(bmp::Vector{Bool})
+            if adaptive_copy && copy_blocks
+                return _estimate_adaptive_copy_cost(bmp, ie; bv_blocks=bv_blocks, compact_copy=compact_copy)
+            elseif copy_blocks
+                return _estimate_copy_blocks_cost(bmp, ie)
+            else
+                return _estimate_adaptive_bitmap_cost(bmp, ie)
+            end
+        end
+
+        # Collect ref1 candidates: (distance, bitmap, residuals, overlap, ref1_base_cost)
+        ref1_candidates = Vector{Tuple{T, Vector{Bool}, Vector{T}, Int, Int}}()
+
+        for (i, ref_v) in enumerate(ref_window)
+            ref_nl = get(neighbor_lists, ref_v, T[])
+            isempty(ref_nl) && continue
+            ref_set = Set(ref_nl)
+            overlap = length(intersect(ns, ref_set))
+            overlap < 1 && continue
+
+            copy_bitmap = Bool[n in ns for n in ref_nl]
+            residuals = sort(T[n for n in neighbors if !(n in ref_set)])
+            distance = T(length(ref_window) - i + 1)
+
+            dist_cost = fixwidth_ref ? ref_dist_bits : estimate_encoded_value_cost(distance, ie)
+            ref1_base = dist_cost + _copy_cost_est(copy_bitmap)
+
+            push!(ref1_candidates, (distance, copy_bitmap, residuals, overlap, ref1_base))
+        end
+
+        # Sort by overlap descending, take top-K
+        sort!(ref1_candidates, by=x -> x[4], rev=true)
+        top_k = min(length(ref1_candidates), 5)
+
+        best_multi_cost = best_cost  # must beat current best (single-ref or no-ref)
+        best_multi_result = nothing
+        best_multi_enc_type = best_enc_type
+        best_multi_mil = best_mil
+        best_multi_use_stop = best_use_stop
+
+        for k in 1:top_k
+            dist1, bmp1, res1, _, ref1_base = ref1_candidates[k]
+            length(res1) < 3 && continue
+            ns_res = Set(res1)
+
+            for (j, ref2_v) in enumerate(ref_window)
+                ref2_nl = get(neighbor_lists, ref2_v, T[])
+                isempty(ref2_nl) && continue
+                ref2_set = Set(ref2_nl)
+                overlap2 = length(intersect(ns_res, ref2_set))
+                overlap2 < 3 && continue
+
+                copy_bmp2 = Bool[n in ns_res for n in ref2_nl]
+                residuals2 = sort(T[n for n in res1 if !(n in ref2_set)])
+                dist2 = T(length(ref_window) - j + 1)
+
+                ref2_dist_cost = fixwidth_ref ? ref_dist_bits : estimate_encoded_value_cost(dist2, ie)
+                ref2_copy_cost = _copy_cost_est(copy_bmp2)
+
+                # Try each encoding for residuals
+                for (enc_type, mil) in ENCODING_OPTIONS
+                    use_stop = (enc_type == :delta) ? stop_deltas : false
+                    multi_header = _vlc_header_cost(:multi_ref, enc_type, mil)
+                    total = multi_header + ref1_base + ref2_dist_cost + ref2_copy_cost
+                    if !isempty(residuals2)
+                        total += _cost_for_list(residuals2, mil, enc_type, use_stop)
+                    end
+
+                    if total < best_multi_cost
+                        best_multi_cost = total
+                        best_multi_result = (dist1, bmp1, dist2, copy_bmp2, residuals2)
+                        best_multi_enc_type = enc_type
+                        best_multi_mil = mil
+                        best_multi_use_stop = use_stop
+                    end
+                end
+            end
+        end
+
+        if best_multi_result !== nothing
+            best_cost = best_multi_cost
+            best_ref_mode = :multi_ref
+            best_ref_result = best_multi_result
+            best_enc_type = best_multi_enc_type
+            best_mil = best_multi_mil
+            best_use_stop = best_multi_use_stop
+            best_res_enc_type = best_multi_enc_type
+            best_res_mil = best_multi_mil
         end
     end
 
@@ -3944,7 +4412,9 @@ end
 function _cs_vertex_search(neighbors::Vector{T}, neighbor_lists::Dict{T,Vector{T}},
                            ref_window::Vector{T}, ie::Symbol;
                            vertex_id=nothing, compact_copy::Bool=true,
-                           tight_intervals::Bool=true) where {T<:Unsigned}
+                           tight_intervals::Bool=true,
+                           lr_split::Bool=false, fixwidth_ref::Bool=false,
+                           ref_dist_bits::Int=0) where {T<:Unsigned}
     if isempty(neighbors)
         return (ie, :none, MIL_OPTIONS[1], nothing, :interval, false)
     end
@@ -3963,7 +4433,8 @@ function _cs_vertex_search(neighbors::Vector{T}, neighbor_lists::Dict{T,Vector{T
         # Base cost (no reference) — include CS header cost
         noref_header = _cs_header_cost(:none, enc_type, mil, false)
         base_cost = noref_header + _estimate_base_cost(neighbors, ie, mil, enc_type;
-            vertex_id=vertex_id, stop_deltas=use_stop, tight_intervals=tight_intervals)
+            vertex_id=vertex_id, stop_deltas=use_stop, tight_intervals=tight_intervals,
+            lr_split=lr_split)
 
         if base_cost < best_cost
             best_cost = base_cost
@@ -3975,18 +4446,21 @@ function _cs_vertex_search(neighbors::Vector{T}, neighbor_lists::Dict{T,Vector{T
         end
 
         # Reference cost — include CS header cost
-        if !isempty(ref_window) && length(neighbors) >= 3
+        if !isempty(ref_window) && length(neighbors) >= 1
             ref_header = _cs_header_cost(:reference, enc_type, mil, false)
             ref_res = _try_find_reference(neighbors, neighbor_lists, ref_window, ie, mil, enc_type;
                 vertex_id=vertex_id, copy_blocks=true, adaptive_copy=true,
-                stop_deltas=use_stop, compact_copy=compact_copy, tight_intervals=tight_intervals)
+                fixwidth_ref=fixwidth_ref, ref_dist_bits=ref_dist_bits,
+                stop_deltas=use_stop, compact_copy=compact_copy, tight_intervals=tight_intervals,
+                lr_split=lr_split)
             if ref_res !== nothing
                 dist, bmp, res = ref_res
-                ref_c = ref_header + estimate_encoded_value_cost(dist, ie)
+                ref_c = ref_header + (fixwidth_ref ? ref_dist_bits : estimate_encoded_value_cost(dist, ie))
                 ref_c += _estimate_adaptive_copy_cost(bmp, ie; compact_copy=compact_copy)
                 if !isempty(res)
                     ref_c += _estimate_base_cost(res, ie, mil, enc_type;
-                        vertex_id=vertex_id, stop_deltas=use_stop, tight_intervals=tight_intervals)
+                        vertex_id=vertex_id, stop_deltas=use_stop, tight_intervals=tight_intervals,
+                        lr_split=lr_split)
                 end
 
                 if ref_c < best_cost
@@ -4009,11 +4483,15 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         ref_window_size::Int=64;
         integer_encoding::Symbol=:fibonacci,
         compact_copy::Bool=true,
-        tight_intervals::Bool=true) where {T<:Unsigned}
+        tight_intervals::Bool=true,
+        lr_split::Bool=false) where {T<:Unsigned}
 
     vs = length(keys(neighbor_lists))
     ie = integer_encoding
     idx_mode = coding_scheme == :index
+
+    fixwidth_ref = lr_split  # fixed-width ref distances when lr_split active (same as STD)
+    ref_dist_bits = fixwidth_ref ? max(Int(ceil(log2(ref_window_size + 1))), 1) : 0
 
     reference_window = T[]
     function add_to_ref_window!(vertex::T)
@@ -4041,7 +4519,8 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         # Greedy search with CS headers
         _, ref_mode, mil, ref_result, enc_type, use_stop = _cs_vertex_search(
             current_neighbors, neighbor_lists, reference_window, ie;
-            vertex_id=v, compact_copy=compact_copy, tight_intervals=tight_intervals)
+            vertex_id=v, compact_copy=compact_copy, tight_intervals=tight_intervals,
+            lr_split=lr_split, fixwidth_ref=fixwidth_ref, ref_dist_bits=ref_dist_bits)
 
         # Write CS header
         _write_cs_header(wr, ref_mode, enc_type, mil, false)
@@ -4049,14 +4528,22 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         target_list = current_neighbors
         if ref_mode != :none && ref_result !== nothing
             ref_distance, copy_bitmap, residuals = ref_result
-            write_encoded_value(wr, T(ref_distance), ie)
+            if fixwidth_ref
+                write_value(wr, UInt64(ref_distance), ref_dist_bits)
+            else
+                write_encoded_value(wr, T(ref_distance), ie)
+            end
             _write_adaptive_copy(wr, copy_bitmap, ie; compact_copy=compact_copy)
             target_list = residuals
         end
 
         # Encode target_list
         if enc_type == :interval
-            write_intervals_and_residuals(wr, target_list, ie, mil; vertex_id=v, tight_intervals=tight_intervals)
+            if lr_split
+                _write_intervals_lr(wr, target_list, ie, mil; vertex_id=v, tight_intervals=tight_intervals)
+            else
+                write_intervals_and_residuals(wr, target_list, ie, mil; vertex_id=v, tight_intervals=tight_intervals)
+            end
         elseif enc_type == :delta
             if idx_mode
                 # Index mode: count-prefixed delta (no stop terminators)
@@ -4120,7 +4607,8 @@ end
 
 function read_cmdstream_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Type{T};
         integer_encoding::Symbol=:fibonacci, compact_copy::Bool=true,
-        tight_intervals::Bool=true, ref_window_size::Int=64) where {T<:Unsigned}
+        tight_intervals::Bool=true, ref_window_size::Int=64,
+        lr_split::Bool=false) where {T<:Unsigned}
 
     neighbor_lists = Dict{T,Vector{T}}()
 
@@ -4146,9 +4634,15 @@ function read_cmdstream_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, :
         end
     end
 
+    fixwidth_ref = lr_split
+    ref_dist_bits = fixwidth_ref ? max(Int(ceil(log2(ref_window_size + 1))), 1) : 0
+
     # Helper to read encoded list body
     function _read_cs_body(r_in::BitReader, v::T, enc_type::Symbol, mil::Int)
         if enc_type == :interval
+            if lr_split
+                return _read_intervals_lr(r_in, ie, mil, T; vertex_id=v, tight_intervals=tight_intervals)
+            end
             return read_intervals_and_residuals(r_in, ie, mil, T; vertex_id=v, tight_intervals=tight_intervals)
         elseif enc_type == :delta
             if is_index_mode
@@ -4197,7 +4691,7 @@ function read_cmdstream_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, :
         is_ref = ref_mode != :none
 
         if is_ref
-            distance = read_encoded_value(r, ie, T)
+            distance = fixwidth_ref ? T(read_value(r, ref_dist_bits, UInt64)) : read_encoded_value(r, ie, T)
             ref_idx = length(reference_window) - Int(distance) + 1
             ref_nbs = T[]
             if 1 <= ref_idx <= length(reference_window)
