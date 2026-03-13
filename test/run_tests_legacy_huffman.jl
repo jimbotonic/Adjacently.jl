@@ -75,7 +75,7 @@ m = ne(g)
 orig_nls = extract_neighbor_lists(g)
 
 # Known best BPE for reference
-const BEST_CGE_BPE = 2.3191
+const BEST_CG_BPE = 2.3191
 
 results = Dict{String, Float64}()
 
@@ -204,16 +204,16 @@ println("  CNR-2000 BPE Summary: Legacy & Huffman vs Best Known")
 println("  ($n_v vertices, $m edges)")
 println("=" ^ 72)
 println()
-@printf("  %-22s %10s %12s\n", "Mode", "BPE", "vs CGE best")
+@printf("  %-22s %10s %12s\n", "Mode", "BPE", "vs CG best")
 println("  " * "-" ^ 46)
 
 for label in ["Legacy children", "Legacy index", "Huffman children", "Huffman index"]
     bpe = results[label]
-    ratio = round(bpe / BEST_CGE_BPE, digits=2)
+    ratio = round(bpe / BEST_CG_BPE, digits=2)
     @printf("  %-22s %10.4f %10.1fx\n", label, bpe, ratio)
 end
 
-@printf("\n  %-22s %10.4f %10s\n", "CGE best (K=2)", BEST_CGE_BPE, "1.0x")
+@printf("\n  %-22s %10.4f %10s\n", "CG best (K=2)", BEST_CG_BPE, "1.0x")
 println()
 
 end # isfile check

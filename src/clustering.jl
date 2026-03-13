@@ -1032,7 +1032,7 @@ end
 """
     auto_select_K(g; max_K=8, min_community_frac=0.005, min_granularity=0.01, partition=nothing)
 
-Automatically select the optimal number of CGE clusters K.
+Automatically select the optimal number of CG clusters K.
 
 First runs a cheap single-pass Louvain to estimate community granularity (L/n).
 If the graph has coarse community structure (L/n < `min_granularity`), returns K=1

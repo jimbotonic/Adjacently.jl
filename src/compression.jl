@@ -95,7 +95,7 @@ end
 
 RefBuildWorkspace{T}() where {T<:Unsigned} = RefBuildWorkspace{T}(Bool[], T[])
 
-# Pre-allocated buffers for exact bit-counting in STD greedy reference search.
+# Pre-allocated buffers for exact bit-counting in BG greedy reference search.
 # Avoids creating IOBuffer/BitWriter pairs per candidate per vertex.
 mutable struct GreedyCostBuffer
     io1::IOBuffer; w1::BitWriter   # copy encoding trial
@@ -4490,7 +4490,7 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
     ie = integer_encoding
     idx_mode = coding_scheme == :index
 
-    fixwidth_ref = lr_split  # fixed-width ref distances when lr_split active (same as STD)
+    fixwidth_ref = lr_split  # fixed-width ref distances when lr_split active (same as BG)
     ref_dist_bits = fixwidth_ref ? max(Int(ceil(log2(ref_window_size + 1))), 1) : 0
 
     reference_window = T[]
@@ -5795,10 +5795,10 @@ end
 # Submodules
 # -----------------------------------------------------------------------------
 
-# CGE (Clustered Graph Encoding)
+# CG (Clustered Greedy)
 include("compression/cge.jl")
-using .CGE
-export CGE
+using .CG
+export CG
 
 # InterEncoding
 include("compression/cge/inter_encoding.jl")

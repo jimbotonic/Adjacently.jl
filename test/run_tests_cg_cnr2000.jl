@@ -15,11 +15,11 @@
 
 #!/usr/bin/env julia
 
-# CGE multi-level coarsening + encoding on CNR-2000 graph
+# CG multi-level coarsening + encoding on CNR-2000 graph
 
 include("run_tests_main.jl")
 using Logging
-using Adjacently.CGE: encode_level, CGEParams
+using Adjacently.CG: encode_level, CGParams
 using Adjacently.IO: load_adjacency_list_from_csv, BitWriter, flush_bitwriter
 using Adjacently.Clustering: louvain_partition, leiden_partition, aggregate_graph
 using Adjacently.Relabeling: relabel_vertices_rcm, relabel_vertices_llp, relabel_vertices_minhash, relabel_graph
@@ -27,13 +27,13 @@ using Adjacently.Graph: subgraph
 using LightGraphs
 using LightGraphs: nv, outneighbors
 
-@testset "CGE CGE multi-level encode on CNR-2000" begin
+@testset "CG CG multi-level encode on CNR-2000" begin
     prev_logger = current_logger()
     global_logger(ConsoleLogger(stderr, Logging.Info))
     try
         cnr_csv = "datasets/webgraph/cnr-2000/cnr-2000.csv"
         if !isfile(cnr_csv)
-            @warn "CNR-2000 CSV not found at $cnr_csv; skipping CGE test"
+            @warn "CNR-2000 CSV not found at $cnr_csv; skipping CG test"
             @test_skip "CNR-2000 dataset unavailable"
             return
         end
@@ -43,11 +43,11 @@ using LightGraphs: nv, outneighbors
         n = nv(g)
         @info "Graph loaded: n=$n"
         # Optional: Cluster-aware global reorder (2-level). Disabled by default.
-        DO_CLUSTER_AWARE = get(ENV, "CGE_CLUSTER_AWARE", "false") in ("1","true","TRUE")
+        DO_CLUSTER_AWARE = get(ENV, "CG_CLUSTER_AWARE", "false") in ("1","true","TRUE")
         if DO_CLUSTER_AWARE
             # 1) Partition -> 2) cluster blocks -> 3) local MinHash inside blocks -> relabel
             tca0 = time()
-            K1 = try parse(Int, get(ENV, "CGE_K1", "8")) catch; 8 end
+            K1 = try parse(Int, get(ENV, "CG_K1", "8")) catch; 8 end
             @info "Cluster-aware global reorder: computing initial partition (K1=$(K1))..."
             part_ca = leiden_partition(g; max_passes=8, max_levels=5)
             counts_ca = Dict{Int,Int}(); for c in part_ca; counts_ca[c] = get(counts_ca,c,0)+1; end
@@ -71,7 +71,7 @@ using LightGraphs: nv, outneighbors
                     continue
                 end
                 sg, oni, noi = subgraph(g, C)
-                k_mh = try parse(Int, get(ENV, "CGE_MINHASH_K", "64")) catch; 64 end
+                k_mh = try parse(Int, get(ENV, "CG_MINHASH_K", "64")) catch; 64 end
                 mloc = relabel_vertices_minhash(sg, :sym; k=k_mh)
                 sort!(C, by = v -> Int(mloc[oni[v]]))
                 append!(new_order, C)
@@ -86,10 +86,10 @@ using LightGraphs: nv, outneighbors
 
         # Relabeling flags (tune cluster-internal ordering)
         # Available methods: :none, :rcm, :llp, :minhash
-        RELABEL_METHOD = Symbol(get(ENV, "CGE_RELABEL_METHOD", "none"))
-        RELABEL_NEIGHBOR = Symbol(get(ENV, "CGE_RELABEL_NEIGHBOR", "sym"))  # :out or :sym
-        LLP_PASSES = (try parse(Int, get(ENV, "CGE_LLP_PASSES", "5")) catch; 5 end)
-        MINHASH_K = (try parse(Int, get(ENV, "CGE_MINHASH_K", "32")) catch; 32 end)
+        RELABEL_METHOD = Symbol(get(ENV, "CG_RELABEL_METHOD", "none"))
+        RELABEL_NEIGHBOR = Symbol(get(ENV, "CG_RELABEL_NEIGHBOR", "sym"))  # :out or :sym
+        LLP_PASSES = (try parse(Int, get(ENV, "CG_LLP_PASSES", "5")) catch; 5 end)
+        MINHASH_K = (try parse(Int, get(ENV, "CG_MINHASH_K", "32")) catch; 32 end)
         @info "Relabeling config: method=$(RELABEL_METHOD), neighbor=$(RELABEL_NEIGHBOR), llp_passes=$(LLP_PASSES), minhash_k=$(MINHASH_K)"
 
         # Utility: count directed edges for a LightGraphs graph-like API
@@ -142,13 +142,13 @@ using LightGraphs: nv, outneighbors
 
         # Parameters
         max_levels = 5
-        # Multi-level stop threshold (env override CGE_MIN_CLUSTERS, default 32)
-        min_clusters = try parse(Int, get(ENV, "CGE_MIN_CLUSTERS", "32")) catch; 32 end
+        # Multi-level stop threshold (env override CG_MIN_CLUSTERS, default 32)
+        min_clusters = try parse(Int, get(ENV, "CG_MIN_CLUSTERS", "32")) catch; 32 end
         # Use Fibonacci for positive-only fields and Elias-delta(+1) for zero-allowing fields
-        INTER_STRATEGY = Symbol(get(ENV, "CGE_INTER", "perm"))
-        BLOCK_TRY = get(ENV, "CGE_BLOCK_TRY", "false") in ("1","true","TRUE")
+        INTER_STRATEGY = Symbol(get(ENV, "CG_INTER", "perm"))
+        BLOCK_TRY = get(ENV, "CG_BLOCK_TRY", "false") in ("1","true","TRUE")
         # Use best from sweep: positions=delta, additions=delta, RLE=false
-        params = CGEParams(L=128, varint=:fibonacci, count_varint=:fibonacci, gap=:fibonacci, degree=:elias_delta, undirected_pairs=false, perm_strategy=:blockpos, membership=:elias_fano, inter_strategy=INTER_STRATEGY, intra_ref_enabled=true, intra_ref_window=32, intra_ref_rle=false, intra_block_try=false, positions_mode=:delta, additions_mode=:delta)
+        params = CGParams(L=128, varint=:fibonacci, count_varint=:fibonacci, gap=:fibonacci, degree=:elias_delta, undirected_pairs=false, perm_strategy=:blockpos, membership=:elias_fano, inter_strategy=INTER_STRATEGY, intra_ref_enabled=true, intra_ref_window=32, intra_ref_rle=false, intra_block_try=false, positions_mode=:delta, additions_mode=:delta)
 
         # Helper: reorder vertices inside each cluster using RCM on the induced subgraph
         function reorder_clusters!(clusters, base_g)
@@ -188,7 +188,7 @@ using LightGraphs: nv, outneighbors
         total_bytes = 0
         prev_coarse_n = -1
         level = 1
-        K = try parse(Int, get(ENV, "CGE_K1", "8")) catch; 8 end
+        K = try parse(Int, get(ENV, "CG_K1", "8")) catch; 8 end
         @info "Initial K1 for multi-level: $(K)"
         while level <= max_levels
                 ncur = nv(cur_g)
@@ -245,9 +245,9 @@ using LightGraphs: nv, outneighbors
             # Prepare next level's K adaptively (halve, but not below 16, and not above current K)
             K = max(16, min(K, ceil(Int, nclusters / 2)))
 
-                # Encode CGE level and compute stats
+                # Encode CG level and compute stats
                 io = IOBuffer(); w = BitWriter(io)
-                t2 = time(); stats = Adjacently.CGE.CGEStats()
+                t2 = time(); stats = Adjacently.CG.CGStats()
                 encode_level(w, cur_g, clusters; params=params, stats=stats)
                 flush_bitwriter(w; flush_last_bits=true); bytes = take!(io); t3 = time()
                 @test length(bytes) > 0
@@ -265,7 +265,7 @@ using LightGraphs: nv, outneighbors
                 head_b = ceil(Int, stats.bits_inter_headers / 8)
                 deg_b  = ceil(Int, stats.bits_inter_degrees / 8)
                 perm_b = ceil(Int, stats.bits_inter_perms / 8)
-                @info "CGE Level $(level): encode_time=$(round(t3-t2,digits=3))s size=$(level_bytes) bytes, bits/edge=$(round(bpe, digits=4)), cumulative_bits/edge=$(round(cum_bpe, digits=4))"
+                @info "CG Level $(level): encode_time=$(round(t3-t2,digits=3))s size=$(level_bytes) bytes, bits/edge=$(round(bpe, digits=4)), cumulative_bits/edge=$(round(cum_bpe, digits=4))"
                 @info "  Sections (bytes): membership=$(memb_b), intra=$(intra_b) [headers=$(ihe), ref_small_hdrs=$(irs), copy=$(icp), add=$(iad), raw=$(irw)], inter_headers=$(head_b), inter_degrees=$(deg_b), inter_perms=$(perm_b)"
 
             # Build coarse graph and check threshold

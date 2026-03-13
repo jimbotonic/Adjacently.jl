@@ -12,9 +12,9 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
 #
-# CGE: Clustered Graph Encoding
+# CG: Clustered Greedy
 
-module CGE
+module CG
 
 using LightGraphs
 using LightGraphs: AbstractGraph, outneighbors, nv, is_directed
@@ -29,14 +29,14 @@ using ..Compression: write_encoded_value, write_delta, write_truncated_binary_co
     read_bitpacked_bitmap, read_intervals_and_residuals,
     read_compressed_graph_data, compress_intervals
 
-export CGEParams, CGEStats, encode_level, decode_level, load_cge_graph
+export CGParams, CGStats, encode_level, decode_level, load_cg_graph
 
 """
-    CGEStats
+    CGStats
 
 Lightweight counters (in bits) for encode_level sections.
 """
-mutable struct CGEStats
+mutable struct CGStats
     bits_membership::Int
     bits_intra::Int
     bits_intra_headers::Int
@@ -59,7 +59,7 @@ mutable struct CGEStats
     intra_overlap_hist::Vector{Int}
     # Profiling: total additions across all ref vertices
     intra_add_count_total::Int
-    CGEStats() = new(0,0,0,0,0,0,0,0,0,0,0,0,0,
+    CGStats() = new(0,0,0,0,0,0,0,0,0,0,0,0,0,
                       Tuple{Int,Int,Int,Int,Int,Int}[],
                       0, 0, 0, zeros(Int, 10), 0)
 end
@@ -103,11 +103,11 @@ function CostBuffer()
 end
 
 """
-    CGEParams(; L=32, varint=:fibonacci, count_varint=:fibonacci, gap=:fibonacci, degree=:golomb, perm_strategy=:lehmer, undirected_pairs=true, membership=:delta, inter_strategy=:perm,
+    CGParams(; L=32, varint=:fibonacci, count_varint=:fibonacci, gap=:fibonacci, degree=:golomb, perm_strategy=:lehmer, undirected_pairs=true, membership=:delta, inter_strategy=:perm,
                  intra_ref_enabled::Bool=true, intra_ref_window::Int=16, intra_ref_rle::Bool=true,
                  intra_block_try::Bool=false)
 
-Parameters for CGE encoding.
+Parameters for CG encoding.
 - L: cluster size threshold for bit-matrix vs list encoding
 - varint: integer encoding used for sizes/lengths (positive only)
 - count_varint: encoding for counts that may be zero (default :golomb supports zero)
@@ -118,7 +118,7 @@ Parameters for CGE encoding.
 - membership: :delta or :elias_fano for cluster membership lists
  - inter_strategy: :perm (degree vectors + permutation) or :lists (explicit per-u neighbor lists in B)
 """
-Base.@kwdef struct CGEParams
+Base.@kwdef struct CGParams
     L::Int = 32
     varint::Symbol = :fibonacci
     count_varint::Symbol = :fibonacci
@@ -763,7 +763,7 @@ Estimate the bit cost of encoding `nl` without a reference (raw mode).
 Uses pre-allocated buffers from `buf` to avoid allocations.
 """
 function _estimate_raw_cost(buf::CostBuffer, nl::Vector{Int},
-                            params::CGEParams, ::Type{T},
+                            params::CGParams, ::Type{T},
                             idx_local::Int, _zz_vid) where {T<:Unsigned}
     _reset!(buf.io1, buf.w1)
     if params.intra_intervals && params.intra_lr_split
@@ -799,7 +799,7 @@ Returns total_bits. Populates `buf.positions` and `buf.adds` with the
 merge results (caller must copy if needed).
 """
 function _evaluate_candidate(buf::CostBuffer, nl::Vector{Int}, ref::Vector{Int},
-                             params::CGEParams, ::Type{T},
+                             params::CGParams, ::Type{T},
                              idx_local::Int, _zz_vid) where {T<:Unsigned}
     # Two-pointer merge into buf.positions and buf.adds (reuse vectors)
     empty!(buf.positions); empty!(buf.adds)
@@ -900,7 +900,7 @@ Greedy MIL variant: try each mil value for additions cost. Returns (best_total_b
 Populates `buf.positions` and `buf.adds`.
 """
 function _evaluate_candidate_greedy(buf::CostBuffer, nl::Vector{Int}, ref::Vector{Int},
-                                    params::CGEParams, ::Type{T},
+                                    params::CGParams, ::Type{T},
                                     idx_local::Int, _zz_vid,
                                     mil_options::Vector{Int}) where {T<:Unsigned}
     # Two-pointer merge into buf.positions and buf.adds
@@ -956,17 +956,17 @@ end
 # --------------------------
 
 """
-    encode_level(w, g, P; params=CGEParams())
+    encode_level(w, g, P; params=CGParams())
 
-Encode one coarsening level for graph `g` with partition `P` using CGE.
+Encode one coarsening level for graph `g` with partition `P` using CG.
 
 Inputs:
 - w::BitWriter: output bitstream
 - g::LightGraphs.AbstractGraph{T<:Unsigned}
 - P::Vector{Vector{T}}: list of clusters with global vertex ids
-- params::CGEParams: encoding parameters
+- params::CGParams: encoding parameters
 """
-function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; params::CGEParams=CGEParams(), stats::Union{Nothing,CGEStats}=nothing, progress::Union{Nothing,Function}=nothing, cluster_offsets::Union{Nothing,Vector{Int}}=nothing) where {T<:Unsigned}
+function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; params::CGParams=CGParams(), stats::Union{Nothing,CGStats}=nothing, progress::Union{Nothing,Function}=nothing, cluster_offsets::Union{Nothing,Vector{Int}}=nothing) where {T<:Unsigned}
     n = nv(g)
     directed = is_directed(g)
 
@@ -1733,12 +1733,12 @@ function read_stop_delta_list(r::BitReader; encoding::Symbol=:fibonacci, T::Type
 end
 
 """
-    decode_level(r::BitReader, params::CGEParams; T::Type{<:Unsigned}=UInt32, directed::Bool=true, coding_scheme::Symbol=:children)
+    decode_level(r::BitReader, params::CGParams; T::Type{<:Unsigned}=UInt32, directed::Bool=true, coding_scheme::Symbol=:children)
 
-Decode one CGE coarsening level from the bitstream.
+Decode one CG coarsening level from the bitstream.
 Returns a `Dict{T, Vector{T}}` mapping global vertex ID → sorted outneighbors.
 """
-function decode_level(r::BitReader, params::CGEParams; T::Type{<:Unsigned}=UInt32, directed::Bool=true, coding_scheme::Symbol=:children)
+function decode_level(r::BitReader, params::CGParams; T::Type{<:Unsigned}=UInt32, directed::Bool=true, coding_scheme::Symbol=:children)
     # ----------------------------------------------------------------
     # Section 1: Read cluster membership
     # ----------------------------------------------------------------
@@ -2063,14 +2063,14 @@ function decode_level(r::BitReader, params::CGEParams; T::Type{<:Unsigned}=UInt3
 end
 
 """
-    load_cge_graph(filepath::AbstractString; params::CGEParams=CGEParams(),
-                    T::Type{<:Unsigned}=UInt32, directed::Bool=true)
+    load_cg_graph(filepath::AbstractString; params::CGParams=CGParams(),
+                   T::Type{<:Unsigned}=UInt32, directed::Bool=true)
 
-Load an CGE-compressed graph from a file, decoding all levels.
+Load a CG-compressed graph from a file, decoding all levels.
 Returns a `Dict{T, Vector{T}}` mapping vertex → sorted outneighbors.
 """
-function load_cge_graph(filepath::AbstractString; params::CGEParams=CGEParams(),
-                         T::Type{<:Unsigned}=UInt32, directed::Bool=true)
+function load_cg_graph(filepath::AbstractString; params::CGParams=CGParams(),
+                        T::Type{<:Unsigned}=UInt32, directed::Bool=true)
     data = read(filepath)
     io = IOBuffer(data)
     r = BitReader(io)
@@ -2088,4 +2088,4 @@ function load_cge_graph(filepath::AbstractString; params::CGEParams=CGEParams(),
     return neighbor_lists
 end
 
-end # module CGE
+end # module CG

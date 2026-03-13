@@ -14,7 +14,7 @@
 #
 
 #
-# Test per-vertex index mode roundtrip for STD, CS, and CGE.
+# Test per-vertex index mode roundtrip for BG, CS, and CG.
 # Verifies that encoding with coding_scheme=:index and decoding produces
 # identical edge lists to the children mode encoding.
 #
@@ -31,8 +31,8 @@ using LightGraphs: nv, ne, outneighbors, vertices, eltype
 using Adjacently
 using Adjacently.IO: load_adjacency_list_from_csv
 using Adjacently.Clustering: leiden_partition
-using Adjacently.MGS: write_std_mgs3_graph, write_cs_mgs3_graph, write_cge_mgs3_graph, load_compressed_mgs3_graph
-using Adjacently.Compression.CGE: CGEParams
+using Adjacently.MGS: write_bg_mgs3_graph, write_cs_mgs3_graph, write_cg_mgs3_graph, load_compressed_mgs3_graph
+using Adjacently.Compression.CG: CGParams
 
 const DATASET = length(ARGS) >= 1 ? ARGS[1] : "cnr-2000"
 const PREFIX  = replace(DATASET, "-" => "")
@@ -74,36 +74,36 @@ m = ne(g)
 nls = extract_neighbor_lists(g)
 
 # ============================================================================
-# 1. STD Index Mode
+# 1. BG Index Mode
 # ============================================================================
 
-@testset "STD Index Mode — $DATASET roundtrip" begin
-    @info "--- STD Index Mode: write .mgz → load .mgz → verify ---"
+@testset "BG Index Mode — $DATASET roundtrip" begin
+    @info "--- BG Index Mode: write .mgz → load .mgz → verify ---"
 
-    std_base = joinpath(DS_DIR, "$(PREFIX)_std_index")
-    std_mgz = std_base * ".mgz"
+    bg_base = joinpath(DS_DIR, "$(PREFIX)_bg_index")
+    bg_mgz = bg_base * ".mgz"
 
     t_enc = time()
-    write_std_mgs3_graph(g, std_base;
+    write_bg_mgs3_graph(g, bg_base;
         coding_scheme=:index, integer_encoding=:fibonacci,
         ref_window_size=64, copy_blocks=true, adaptive_copy=true,
         stop_deltas=true, compact_copy=true,
         tight_intervals=true)
     dt_enc = round(time() - t_enc, digits=2)
 
-    @test isfile(std_mgz)
-    bpe = round(8.0 * filesize(std_mgz) / m, digits=4)
-    @info "  Encoded: $bpe BPE ($(filesize(std_mgz)) bytes, $(dt_enc)s)"
+    @test isfile(bg_mgz)
+    bpe = round(8.0 * filesize(bg_mgz) / m, digits=4)
+    @info "  Encoded: $bpe BPE ($(filesize(bg_mgz)) bytes, $(dt_enc)s)"
 
     t_dec = time()
-    g_loaded = load_compressed_mgs3_graph(std_mgz)
+    g_loaded = load_compressed_mgs3_graph(bg_mgz)
     dt_dec = round(time() - t_dec, digits=2)
 
     @test nv(g_loaded) == n_v
     @test ne(g_loaded) == m
     loaded_nls = extract_neighbor_lists(g_loaded)
     @test verify_roundtrip(nls, loaded_nls, m)
-    @info "  STD Index Mode roundtrip: PASSED ($bpe BPE, decode $(dt_dec)s)"
+    @info "  BG Index Mode roundtrip: PASSED ($bpe BPE, decode $(dt_dec)s)"
 end
 
 # ============================================================================
@@ -138,11 +138,11 @@ end
 end
 
 # ============================================================================
-# 3. CGE Index Mode (K=2)
+# 3. CG Index Mode (K=2)
 # ============================================================================
 
-@testset "CGE Index Mode K=2 — $DATASET roundtrip" begin
-    @info "--- CGE Index Mode K=2: write .mgz → load .mgz → verify ---"
+@testset "CG Index Mode K=2 — $DATASET roundtrip" begin
+    @info "--- CG Index Mode K=2: write .mgz → load .mgz → verify ---"
 
     TV = eltype(g)
     n_orig = Int(nv(g))
@@ -165,7 +165,7 @@ end
     for C in clusters; sort!(C); end
     @info "  Clusters: $(length(clusters[1])) + $(length(clusters[2])) vertices"
 
-    cge_params = CGEParams(
+    cg_params = CGParams(
         L=128,
         varint=:fibonacci, count_varint=:fibonacci,
         gap=:fibonacci, degree=:elias_delta,
@@ -185,30 +185,30 @@ end
     )
 
     # Children mode reference (same clusters)
-    ref_base = joinpath(DS_DIR, "$(PREFIX)_cge_k2_children")
+    ref_base = joinpath(DS_DIR, "$(PREFIX)_cg_k2_children")
     ref_mgz = ref_base * ".mgz"
-    write_cge_mgs3_graph(g, ref_base, clusters;
+    write_cg_mgs3_graph(g, ref_base, clusters;
         coding_scheme=:children, integer_encoding=:fibonacci,
-        params=cge_params)
+        params=cg_params)
     g_children = load_compressed_mgs3_graph(ref_mgz)
     children_nls = extract_neighbor_lists(g_children)
 
     # Index mode
-    cge_base = joinpath(DS_DIR, "$(PREFIX)_cge_k2_index")
-    cge_mgz = cge_base * ".mgz"
+    cg_base = joinpath(DS_DIR, "$(PREFIX)_cg_k2_index")
+    cg_mgz = cg_base * ".mgz"
 
     t_enc = time()
-    write_cge_mgs3_graph(g, cge_base, clusters;
+    write_cg_mgs3_graph(g, cg_base, clusters;
         coding_scheme=:index, integer_encoding=:fibonacci,
-        params=cge_params)
+        params=cg_params)
     dt_enc = round(time() - t_enc, digits=2)
 
-    @test isfile(cge_mgz)
-    bpe = round(8.0 * filesize(cge_mgz) / m, digits=4)
-    @info "  Encoded: $bpe BPE ($(filesize(cge_mgz)) bytes, $(dt_enc)s)"
+    @test isfile(cg_mgz)
+    bpe = round(8.0 * filesize(cg_mgz) / m, digits=4)
+    @info "  Encoded: $bpe BPE ($(filesize(cg_mgz)) bytes, $(dt_enc)s)"
 
     t_dec = time()
-    g_loaded = load_compressed_mgs3_graph(cge_mgz)
+    g_loaded = load_compressed_mgs3_graph(cg_mgz)
     dt_dec = round(time() - t_dec, digits=2)
 
     @test nv(g_loaded) == n_v
@@ -216,7 +216,7 @@ end
     loaded_nls = extract_neighbor_lists(g_loaded)
     m_children = ne(g_children)
     @test verify_roundtrip(children_nls, loaded_nls, m_children)
-    @info "  CGE Index Mode K=2 roundtrip: PASSED ($bpe BPE, decode $(dt_dec)s)"
+    @info "  CG Index Mode K=2 roundtrip: PASSED ($bpe BPE, decode $(dt_dec)s)"
 end
 
 end # isfile check

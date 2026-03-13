@@ -15,14 +15,14 @@
 
 #!/usr/bin/env julia
 
-# CGE K-sweep BPE study without heavy deps
+# CG K-sweep BPE study without heavy deps
 
 using Logging
 using LightGraphs: nv, ne, outneighbors
 using Adjacently
 using Adjacently.IO: load_adjacency_list_from_csv, BitWriter, flush_bitwriter
 using Adjacently.Clustering: leiden_partition
-using Adjacently.CGE: encode_level, CGEParams
+using Adjacently.CG: encode_level, CGParams
 
 function build_partition_for_K(g, part0::Vector{Int}, K::Int)
     n = nv(g)
@@ -76,7 +76,7 @@ function compute_bpe_stats(g, clusters, params)
     mcur = sum(length(outneighbors(g, v)) for v in 1:ncur)
     # Encode
     io = IOBuffer(); w = BitWriter(io)
-    stats = Adjacently.CGE.CGEStats()
+    stats = Adjacently.CG.CGStats()
     encode_level(w, g, clusters; params=params, stats=stats)
     flush_bitwriter(w; flush_last_bits=true)
     bytes = take!(io)
@@ -113,7 +113,7 @@ function main()
     prev = current_logger()
     global_logger(ConsoleLogger(stderr, Logging.Info))
     try
-        csv = get(ENV, "CGE_DATASET", "datasets/webgraph/cnr-2000/cnr-2000.csv")
+        csv = get(ENV, "CG_DATASET", "datasets/webgraph/cnr-2000/cnr-2000.csv")
         if !isfile(csv)
             @error "Dataset not found" csv
             return
@@ -129,7 +129,7 @@ function main()
         @info "Base partition labels" unique_labels=length(unique(part0))
 
         # Params
-        params = CGEParams(L=128, varint=:fibonacci, count_varint=:fibonacci, gap=:fibonacci,
+        params = CGParams(L=128, varint=:fibonacci, count_varint=:fibonacci, gap=:fibonacci,
                             degree=:elias_delta, undirected_pairs=false, perm_strategy=:blockpos,
                             membership=:elias_fano, inter_strategy=:lists, intra_ref_enabled=true,
                             intra_ref_window=32, intra_ref_rle=false,

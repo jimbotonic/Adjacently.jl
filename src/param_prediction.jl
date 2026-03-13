@@ -16,7 +16,7 @@
 """
     ParamPrediction
 
-Supervised GNN-based CGE parameter predictor. A GNN produces per-vertex
+Supervised GNN-based CG parameter predictor. A GNN produces per-vertex
 embeddings which are mean-pooled into a graph-level feature vector. Seven
 independent linear heads then predict parameter configurations via softmax.
 Training uses cross-entropy loss against grid-search-optimal labels.
@@ -38,10 +38,10 @@ using ..CustomLightGraphs: SimpleDiGraph
 using ..GNN: GNNModel, gnn_forward, gnn_backward_rl!,
              save_gnn_model, load_gnn_weights!
 using ..IO: BitWriter, flush_bitwriter
-using ..Compression: CGE
+using ..Compression: CG
 
 export ParamPredictor, MasterGNNWeights,
-       graph_level_readout, predict_params, actions_to_cge_params,
+       graph_level_readout, predict_params, actions_to_cg_params,
        compute_bpe, grid_search_best_params, generate_training_labels,
        supervised_loss_backward!, train_param_predictor!,
        evaluate_param_predictor, save_param_predictor, load_param_predictor
@@ -53,7 +53,7 @@ export ParamPredictor, MasterGNNWeights,
 """
     ParamPredictor
 
-Multi-head supervised classifier over 7 CGE parameter groups.
+Multi-head supervised classifier over 7 CG parameter groups.
 Each head is a linear layer from graph features to a softmax over options,
 trained with cross-entropy loss.
 """
@@ -189,7 +189,7 @@ end
     predict_params(predictor, h_graph)
 
 Predict parameter configuration from all 7 heads via argmax.
-Returns `(actions, cge_params)`.
+Returns `(actions, cg_params)`.
 """
 function predict_params(predictor::ParamPredictor, h_graph::Vector{Float64})
     n_heads = length(predictor.heads)
@@ -202,17 +202,17 @@ function predict_params(predictor::ParamPredictor, h_graph::Vector{Float64})
         actions[i] = argmax(probs)
     end
 
-    params = actions_to_cge_params(predictor, actions)
+    params = actions_to_cg_params(predictor, actions)
     return actions, params
 end
 
 """
-    actions_to_cge_params(predictor, actions)
+    actions_to_cg_params(predictor, actions)
 
-Convert action indices to a concrete `CGEParams` struct.
+Convert action indices to a concrete `CGParams` struct.
 Non-predicted parameters use best-known defaults.
 """
-function actions_to_cge_params(predictor::ParamPredictor, actions::Vector{Int})
+function actions_to_cg_params(predictor::ParamPredictor, actions::Vector{Int})
     window = predictor.head_options[1][actions[1]]::Int
     intervals = predictor.head_options[2][actions[2]]::Bool
     lr_split_raw = predictor.head_options[3][actions[3]]::Bool
@@ -224,7 +224,7 @@ function actions_to_cge_params(predictor::ParamPredictor, actions::Vector{Int})
     # Enforce dependency: lr_split requires intervals
     lr_split = intervals ? lr_split_raw : false
 
-    return CGE.CGEParams(;
+    return CG.CGParams(;
         intra_ref_window = window,
         intra_intervals = intervals,
         intra_lr_split = lr_split,
@@ -248,12 +248,12 @@ function actions_to_cge_params(predictor::ParamPredictor, actions::Vector{Int})
 end
 
 """
-    compute_bpe(g, cge_params, clusters)
+    compute_bpe(g, cg_params, clusters)
 
-Run CGE `encode_level` on graph `g` with given parameters and cluster
+Run CG `encode_level` on graph `g` with given parameters and cluster
 partition. Returns bits per edge (BPE) as a Float64.
 """
-function compute_bpe(g::AbstractGraph{T}, cge_params::CGE.CGEParams,
+function compute_bpe(g::AbstractGraph{T}, cg_params::CG.CGParams,
                      clusters::Vector{Vector{T}}) where {T<:Unsigned}
     m = ne(g)
     if m == 0
@@ -262,7 +262,7 @@ function compute_bpe(g::AbstractGraph{T}, cge_params::CGE.CGEParams,
 
     io = IOBuffer()
     w = BitWriter(io)
-    CGE.encode_level(w, g, clusters; params=cge_params)
+    CG.encode_level(w, g, clusters; params=cg_params)
     flush_bitwriter(w)
 
     total_bytes = position(io)
@@ -296,7 +296,7 @@ function grid_search_best_params(g::AbstractGraph{T};
     best_actions = zeros(Int, n_heads)
     all_bpes = Float64[]
 
-    # Build a dummy predictor to reuse actions_to_cge_params
+    # Build a dummy predictor to reuse actions_to_cg_params
     dummy = ParamPredictor(1; lr=0.0)
 
     combo_idx = 0
@@ -310,7 +310,7 @@ function grid_search_best_params(g::AbstractGraph{T};
                                 combo_idx += 1
                                 actions = [w_idx, int_idx, lr_idx, mil_idx,
                                            ca_idx, sd_idx, zz_idx]
-                                params = actions_to_cge_params(dummy, actions)
+                                params = actions_to_cg_params(dummy, actions)
                                 bpe = compute_bpe(g, params, clusters)
                                 push!(all_bpes, bpe)
 
@@ -518,7 +518,7 @@ end
     evaluate_param_predictor(master, predictor, g; feature_set, seed)
 
 Evaluate the trained predictor on a graph using argmax prediction.
-Returns `(bpe, cge_params)`.
+Returns `(bpe, cg_params)`.
 """
 function evaluate_param_predictor(master::MasterGNNWeights,
                                    predictor::ParamPredictor,

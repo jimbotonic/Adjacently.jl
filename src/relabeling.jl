@@ -25,7 +25,8 @@ using ..PageRank: PR
 export relabel_graph, relabel_vertices, relabel_vertices_score, relabel_vertices_lexicographic, relabel_vertices_rcm, relabel_vertices_webgraph_lex,
        relabel_vertices_llp, relabel_vertices_minhash, relabel_vertices_bisection,
        relabel_graph_llp, relabel_graph_leiden_llp,
-       save_llp_ordering, load_llp_ordering
+       save_llp_ordering, load_llp_ordering,
+       ordering_quality_metrics, print_ordering_metrics, compare_ordering_metrics
 
 """
     relabel_graph(g::AbstractGraph{T}, vertex_mapping::Vector{T}) where {T<:Unsigned}
@@ -1022,6 +1023,324 @@ function load_llp_ordering(path::String, ::Type{T}) where {T}
     end
     @info "Loaded LLP ordering from $path ($(length(data)) vertices)"
     return mapping
+end
+
+"""
+    _sorted_overlap_count(a::Vector{Int}, b::Vector{Int})
+
+Count elements common to both sorted integer vectors using merge scan. O(|a| + |b|).
+"""
+function _sorted_overlap_count(a::Vector{Int}, b::Vector{Int})
+    count = 0
+    i, j = 1, 1
+    na, nb = length(a), length(b)
+    @inbounds while i <= na && j <= nb
+        if a[i] == b[j]
+            count += 1; i += 1; j += 1
+        elseif a[i] < b[j]
+            i += 1
+        else
+            j += 1
+        end
+    end
+    return count
+end
+
+"""
+    _sorted_setdiff(a::Vector{Int}, b::Vector{Int})
+
+Return elements in sorted vector `a` that are not in sorted vector `b`. O(|a| + |b|).
+"""
+function _sorted_setdiff(a::Vector{Int}, b::Vector{Int})
+    result = Int[]
+    i, j = 1, 1
+    na, nb = length(a), length(b)
+    @inbounds while i <= na
+        if j > nb || a[i] < b[j]
+            push!(result, a[i])
+            i += 1
+        elseif a[i] == b[j]
+            i += 1; j += 1
+        else
+            j += 1
+        end
+    end
+    return result
+end
+
+"""
+    ordering_quality_metrics(g::AbstractGraph{T}; window::Int=7, mil::Int=4, ref_sample::Int=0) where {T<:Unsigned}
+
+Compute ordering quality metrics that characterize how well a vertex ordering
+supports different compression strategies.
+
+Gap/interval metrics are computed over all vertices. Reference overlap metrics
+can be sampled for large graphs by setting `ref_sample > 0`.
+
+Returns a Dict{Symbol, Any} with:
+- Gap metrics (lower = better for CS/BG delta/interval encoding):
+  - :avg_log_gap — mean log₂(gap+1) between consecutive sorted neighbors
+  - :avg_successor_dist — mean |v - u| for all edges (v,u)
+  - :avg_successor_dist_norm — avg_successor_dist / n
+- Interval metrics (higher = better for CS/BG):
+  - :interval_coverage — fraction of neighbors in consecutive runs ≥ mil
+  - :avg_intervals_per_vertex — mean interval count per vertex
+- Reference metrics (higher = better for BV/CG copy-list encoding):
+  - :avg_best_overlap — mean best overlap count within window
+  - :avg_best_jaccard — mean best Jaccard similarity within window
+  - :ref_hit_rate — fraction of vertices with any ref overlap > 0
+  - :avg_copy_fraction — mean fraction of neighbors copyable from best ref
+"""
+function ordering_quality_metrics(g::AbstractGraph{T}; window::Int=7, mil::Int=4, ref_sample::Int=0) where {T<:Unsigned}
+    n = Int(nv(g))
+
+    # Pre-build sorted neighbor lists
+    adj = Vector{Vector{Int}}(undef, n)
+    total_edges = 0
+    for v in vertices(g)
+        vi = Int(v)
+        adj[vi] = sort(Int.(collect(outneighbors(g, v))))
+        total_edges += length(adj[vi])
+    end
+
+    # === Gap statistics (between consecutive sorted neighbors) ===
+    total_log_gap = 0.0
+    n_gaps = 0
+    for vi in 1:n
+        nbrs = adj[vi]
+        @inbounds for j in 2:length(nbrs)
+            gap = nbrs[j] - nbrs[j-1]
+            total_log_gap += log2(Float64(gap) + 1.0)
+            n_gaps += 1
+        end
+    end
+    avg_log_gap = n_gaps > 0 ? total_log_gap / n_gaps : 0.0
+
+    # === Successor distance (|v - neighbor|) ===
+    total_succ_dist = 0.0
+    for vi in 1:n
+        @inbounds for u in adj[vi]
+            total_succ_dist += abs(vi - u)
+        end
+    end
+    avg_succ_dist = total_edges > 0 ? total_succ_dist / total_edges : 0.0
+
+    # === Interval statistics ===
+    total_in_intervals = 0
+    total_interval_count = 0
+    for vi in 1:n
+        nbrs = adj[vi]
+        deg = length(nbrs)
+        deg < mil && continue
+        run_start = 1
+        @inbounds for j in 2:deg
+            if nbrs[j] != nbrs[j-1] + 1
+                run_len = j - run_start
+                if run_len >= mil
+                    total_in_intervals += run_len
+                    total_interval_count += 1
+                end
+                run_start = j
+            end
+        end
+        run_len = deg - run_start + 1
+        if run_len >= mil
+            total_in_intervals += run_len
+            total_interval_count += 1
+        end
+    end
+    interval_coverage = total_edges > 0 ? Float64(total_in_intervals) / total_edges : 0.0
+    avg_intervals = n > 0 ? Float64(total_interval_count) / n : 0.0
+
+    # === Reference overlap statistics ===
+    if ref_sample > 0 && ref_sample < n
+        rng = Random.MersenneTwister(42)
+        sample_indices = sort(Random.randperm(rng, n)[1:ref_sample])
+    else
+        sample_indices = collect(1:n)
+    end
+
+    total_best_overlap = 0
+    total_best_jaccard = 0.0
+    total_copy_fraction = 0.0
+    ref_hits = 0
+    sampled_with_neighbors = 0
+    # Residual stats: after removing copied elements, measure residual encoding cost
+    total_residual_log_gap = 0.0
+    n_residual_gaps = 0
+    total_residuals_in_intervals = 0
+    total_residual_count = 0
+
+    for vi in sample_indices
+        nbrs = adj[vi]
+        deg = length(nbrs)
+        deg == 0 && continue
+        sampled_with_neighbors += 1
+
+        best_overlap = 0
+        best_jaccard = 0.0
+        best_ri = 0
+
+        for ri in max(1, vi - window):(vi - 1)
+            ref_nbrs = adj[ri]
+            isempty(ref_nbrs) && continue
+            overlap = _sorted_overlap_count(nbrs, ref_nbrs)
+            if overlap > best_overlap
+                best_overlap = overlap
+                union_size = deg + length(ref_nbrs) - overlap
+                best_jaccard = Float64(overlap) / union_size
+                best_ri = ri
+            end
+        end
+
+        total_best_overlap += best_overlap
+        total_best_jaccard += best_jaccard
+        total_copy_fraction += Float64(best_overlap) / deg
+        if best_overlap > 0
+            ref_hits += 1
+        end
+
+        # Compute residual stats
+        if best_ri > 0 && best_overlap > 0
+            residuals = _sorted_setdiff(nbrs, adj[best_ri])
+        else
+            residuals = nbrs
+        end
+        nr = length(residuals)
+        total_residual_count += nr
+        # Gap stats on residuals
+        @inbounds for j in 2:nr
+            gap = residuals[j] - residuals[j-1]
+            total_residual_log_gap += log2(Float64(gap) + 1.0)
+            n_residual_gaps += 1
+        end
+        # Interval coverage of residuals
+        if nr >= mil
+            run_start = 1
+            @inbounds for j in 2:nr
+                if residuals[j] != residuals[j-1] + 1
+                    if j - run_start >= mil
+                        total_residuals_in_intervals += j - run_start
+                    end
+                    run_start = j
+                end
+            end
+            if nr - run_start + 1 >= mil
+                total_residuals_in_intervals += nr - run_start + 1
+            end
+        end
+    end
+
+    sn = max(sampled_with_neighbors, 1)
+    avg_residual_log_gap = n_residual_gaps > 0 ? total_residual_log_gap / n_residual_gaps : 0.0
+    residual_interval_coverage = total_residual_count > 0 ? Float64(total_residuals_in_intervals) / total_residual_count : 0.0
+
+    return Dict{Symbol, Any}(
+        :n_vertices => n,
+        :n_edges => total_edges,
+        :window => window,
+        :mil => mil,
+        :ref_sample => ref_sample > 0 ? ref_sample : n,
+        :avg_log_gap => avg_log_gap,
+        :avg_successor_dist => avg_succ_dist,
+        :avg_successor_dist_norm => avg_succ_dist / max(n, 1),
+        :interval_coverage => interval_coverage,
+        :avg_intervals_per_vertex => avg_intervals,
+        :avg_best_overlap => Float64(total_best_overlap) / sn,
+        :avg_best_jaccard => total_best_jaccard / sn,
+        :ref_hit_rate => Float64(ref_hits) / sn,
+        :avg_copy_fraction => total_copy_fraction / sn,
+        :avg_residual_log_gap => avg_residual_log_gap,
+        :residual_interval_coverage => residual_interval_coverage,
+    )
+end
+
+"""
+    print_ordering_metrics(metrics::Dict{Symbol, Any}; label::String="")
+
+Pretty-print ordering quality metrics.
+"""
+function print_ordering_metrics(metrics::Dict{Symbol, Any}; label::String="")
+    _pad(s, w) = s * " "^max(0, w - length(s))
+    _rpad(s, w) = " "^max(0, w - length(s)) * s
+    _f(v, d) = d == 1 ? string(round(v; digits=1)) :
+               d == 3 ? string(round(v; digits=3)) :
+               d == 4 ? string(round(v; digits=4)) :
+               string(round(v; sigdigits=6))
+
+    hdr = isempty(label) ? "Ordering Quality Metrics" : "Ordering Quality Metrics [$label]"
+    println(hdr)
+    println("-"^62)
+    println("  $(_pad("vertices", 32)) $(metrics[:n_vertices])")
+    println("  $(_pad("edges", 32)) $(metrics[:n_edges])")
+    println("  $(_pad("window", 32)) $(metrics[:window])")
+    println("  $(_pad("mil", 32)) $(metrics[:mil])")
+    if haskey(metrics, :ref_sample)
+        println("  $(_pad("ref_sample", 32)) $(metrics[:ref_sample])")
+    end
+    println("-"^62)
+    println("  Gap metrics (lower = better locality, helps CS/BG):")
+    println("    $(_pad("avg_log_gap", 30)) $(_rpad(_f(metrics[:avg_log_gap], 4), 10))")
+    println("    $(_pad("avg_successor_dist", 30)) $(_rpad(_f(metrics[:avg_successor_dist], 1), 10))")
+    println("    $(_pad("avg_succ_dist_norm", 30)) $(_rpad(_f(metrics[:avg_successor_dist_norm], 6), 10))")
+    println("  Interval metrics (higher = more intervals, helps CS/BG):")
+    ic = metrics[:interval_coverage]
+    println("    $(_pad("interval_coverage", 30)) $(_rpad(_f(ic, 4), 10))  ($(round(100*ic; digits=1))%)")
+    println("    $(_pad("avg_intervals/vertex", 30)) $(_rpad(_f(metrics[:avg_intervals_per_vertex], 4), 10))")
+    println("  Reference metrics (higher = better ref copy, helps BV/CG):")
+    println("    $(_pad("avg_best_overlap", 30)) $(_rpad(_f(metrics[:avg_best_overlap], 3), 10))")
+    println("    $(_pad("avg_best_jaccard", 30)) $(_rpad(_f(metrics[:avg_best_jaccard], 4), 10))")
+    rh = metrics[:ref_hit_rate]
+    println("    $(_pad("ref_hit_rate", 30)) $(_rpad(_f(rh, 4), 10))  ($(round(100*rh; digits=1))%)")
+    cf = metrics[:avg_copy_fraction]
+    println("    $(_pad("avg_copy_fraction", 30)) $(_rpad(_f(cf, 4), 10))  ($(round(100*cf; digits=1))%)")
+    println("  Residual metrics (after best-ref copy):")
+    println("    $(_pad("avg_residual_log_gap", 30)) $(_rpad(_f(metrics[:avg_residual_log_gap], 4), 10))")
+    ric = metrics[:residual_interval_coverage]
+    println("    $(_pad("residual_interval_cov", 30)) $(_rpad(_f(ric, 4), 10))  ($(round(100*ric; digits=1))%)")
+end
+
+"""
+    compare_ordering_metrics(m1::Dict{Symbol,Any}, m2::Dict{Symbol,Any}; label1::String="Order 1", label2::String="Order 2")
+
+Print two sets of ordering metrics side by side for comparison.
+Delta column shows m2 - m1.
+"""
+function compare_ordering_metrics(m1::Dict{Symbol,Any}, m2::Dict{Symbol,Any}; label1::String="Order 1", label2::String="Order 2")
+    _rpad(s, w) = " "^max(0, w - length(s)) * s
+    _f(v, d) = d == 1 ? string(round(v; digits=1)) :
+               d == 3 ? string(round(v; digits=3)) :
+               d == 4 ? string(round(v; digits=4)) :
+               string(round(v; sigdigits=6))
+    _pad(s, w) = s * " "^max(0, w - length(s))
+
+    function _row(name, key, digits)
+        v1 = Float64(m1[key])
+        v2 = Float64(m2[key])
+        d = v2 - v1
+        s1 = _rpad(_f(v1, digits), 12)
+        s2 = _rpad(_f(v2, digits), 12)
+        sd = _rpad((d >= 0 ? "+" : "") * _f(d, digits), 12)
+        println("  $(_pad(name, 28)) $s1 $s2 $sd")
+    end
+
+    println("\n  $(_pad("Metric", 28)) $(_rpad(label1, 12)) $(_rpad(label2, 12)) $(_rpad("Delta(2-1)", 12))")
+    println("  ", "-"^66)
+    println("  Gap metrics (lower = better locality, helps CS/BG):")
+    _row("avg_log_gap", :avg_log_gap, 4)
+    _row("avg_successor_dist", :avg_successor_dist, 1)
+    _row("avg_succ_dist_norm", :avg_successor_dist_norm, 6)
+    println("  Interval metrics (higher = more intervals, helps CS/BG):")
+    _row("interval_coverage", :interval_coverage, 4)
+    _row("avg_intervals/vertex", :avg_intervals_per_vertex, 4)
+    println("  Reference metrics (higher = better ref copy, helps BV/CG):")
+    _row("avg_best_overlap", :avg_best_overlap, 3)
+    _row("avg_best_jaccard", :avg_best_jaccard, 4)
+    _row("ref_hit_rate", :ref_hit_rate, 4)
+    _row("avg_copy_fraction", :avg_copy_fraction, 4)
+    println("  Residual metrics (after best-ref copy):")
+    _row("avg_residual_log_gap", :avg_residual_log_gap, 4)
+    _row("residual_interval_cov", :residual_interval_coverage, 4)
 end
 
 end # module
