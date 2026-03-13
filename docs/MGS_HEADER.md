@@ -21,7 +21,6 @@ The header format is thus:
 | Value | Mode |
 |-------|------|
 | 0x00 | No option (uncompressed) |
-| 0x0F | ASTRA (legacy adaptive streaming) |
 | 0x10–0x8F | BG (Standard greedy compressed mode) |
 | 0x90–0x9F | CS (Command Stream compressed mode) |
 | 0xA0–0xAF | CG (Clustered Graph Encoding) |
@@ -46,8 +45,7 @@ variable parameters. The decoder reconstructs all needed params from byte 2 alon
 | 0x02 | BG with recommended defaults | window=64, all features on |
 | 0x03 | CS with recommended defaults | compact_copy=true, tight_intervals=true, window=64 |
 | 0x04 | CG with recommended defaults | implicit_ranges, perm, window=16, no intervals |
-| 0x05 | ASTRA (legacy adaptive) | None |
-| 0x06–0x0F | Reserved | — |
+| 0x05–0x0F | Reserved | — |
 
 ### Parameter Ranges (0x10–0xFF): algorithm + explicit params
 
@@ -92,7 +90,7 @@ offset = membership × 72 + window_idx × 12 + interval_mode × 4 + mil_idx
 
 `inter_strategy` is not encoded (hardcoded to `:lists`).
 Both `intra_mil` and `intra_adapt_mil` are set to the decoded mil value.
-All other CG fields are hardcoded to best-known defaults (see `decode_cge_params` in `src/mgs.jl`).
+All other CG fields are hardcoded to best-known defaults (see `decode_cg_params` in `src/mgs.jl`).
 
 #### CG Parameter Encoding — v3.1 (legacy, mixed-radix)
 

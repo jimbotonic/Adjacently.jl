@@ -383,7 +383,7 @@ Best CS BPE across all tested datasets:
 | Dataset | CS BPE | CG BPE | BG BPE | BV BPE | CS Config |
 |---------|--------|---------|---------|--------|-----------|
 | cnr-2000 (no reorder) | 2.4348 | **2.3191** | 2.4929 | 2.898 | w=64, no-lr |
-| cnr-2000 (Leiden+LLP) | **2.3042** | 2.5652 | 2.3258 | 3.2335 | w=256, no-lr |
+| cnr-2000 (Leiden+LLP) | 2.3643 | 2.5652 | **2.3258** | 3.2335 | w=64, no-lr |
 | in-2004 | 1.7839 | **1.7513** | 1.895 | 2.172 | w=64, no-lr |
 | web-google core (Leiden+LLP) | **4.0288** | 4.3296 | 4.0735 | 5.0081 | w=256, no-lr |
 | web-google rcore (Leiden+LLP) | **3.7337** | 3.9359 | 3.7626 | 4.1751 | w=256, no-lr |

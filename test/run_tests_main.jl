@@ -139,7 +139,7 @@ function samples_bits(samples::Vector{T}, encoding::Symbol) where {T<:Unsigned}
         end
         
         # capture number of bits for this sample
-        sample_nbits = writer.index - 1
+        sample_nbits = writer.bits_in
         flush_bitwriter(writer; flush_last_bits=true)
         
         # read the bits for this sample

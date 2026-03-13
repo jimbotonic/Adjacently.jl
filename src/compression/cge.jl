@@ -27,7 +27,8 @@ using ..Compression: write_encoded_value, write_delta, write_truncated_binary_co
     read_encoded_value, read_delta, read_elias_fano,
     read_small_count, read_rle_ones_deltas, read_bitmap_rle_ones_deltas,
     read_bitpacked_bitmap, read_intervals_and_residuals,
-    read_compressed_graph_data, compress_intervals
+    read_compressed_graph_data, compress_intervals,
+    estimate_encoded_value_cost, estimate_interval_runlength_encoding_cost
 
 export CGParams, CGStats, encode_level, decode_level, load_cg_graph
 
@@ -66,7 +67,7 @@ end
 
 @inline function _total_bits(w::BitWriter)
     # Bytes written to underlying IO + buffered bits
-    return Int(position(w.io)) * 8 + (w.index - 1)
+    return Int(position(w.io)) * 8 + w.bits_in
 end
 
 """
@@ -77,29 +78,31 @@ Reset an IOBuffer/BitWriter pair for reuse without allocation.
 @inline function _reset!(io::IOBuffer, w::BitWriter)
     truncate(io, 0)
     seek(io, 0)
-    w.index = 1
+    w.accum = UInt64(0)
+    w.bits_in = 0
     w.bit_count = 0
 end
 
 """
-    CostBuffer
+    CostBuffer{T}
 
 Pre-allocated buffers for cost estimation in the reference search loop.
 Avoids creating ~576 IOBuffer/BitWriter pairs per vertex.
+Parameterized on T to hold neighbor lists directly as Vector{T}.
 """
-mutable struct CostBuffer
+mutable struct CostBuffer{T<:Unsigned}
     io1::IOBuffer; w1::BitWriter   # positions: copy-blocks / raw encoding
     io2::IOBuffer; w2::BitWriter   # complement / stop-delta / additions
     io3::IOBuffer; w3::BitWriter   # intervals / second trial
-    positions::Vector{Int}
-    adds::Vector{Int}
-    skipped::Vector{Int}
+    positions::Vector{T}
+    adds::Vector{T}
+    skipped::Vector{T}
 end
 
-function CostBuffer()
+function CostBuffer{T}() where {T<:Unsigned}
     io1 = IOBuffer(); io2 = IOBuffer(); io3 = IOBuffer()
-    CostBuffer(io1, BitWriter(io1), io2, BitWriter(io2), io3, BitWriter(io3),
-               Int[], Int[], Int[])
+    CostBuffer{T}(io1, BitWriter(io1), io2, BitWriter(io2), io3, BitWriter(io3),
+               T[], T[], T[])
 end
 
 """
@@ -396,7 +399,7 @@ Positions are grouped into contiguous runs (copy blocks). Format:
   - subsequent blocks: varint(gap_from_prev_end), varint(length)
 All values >= 1 (1-based positions, gaps >= 1, lengths >= 1).
 """
-function _write_copy_blocks(w::BitWriter, positions::Vector{Int}, encoding::Symbol)
+function _write_copy_blocks(w::BitWriter, positions::AbstractVector{<:Integer}, encoding::Symbol)
     if isempty(positions)
         Compression.write_small_count(w, UInt32(0), encoding)
         return
@@ -755,192 +758,337 @@ end
 # Minimum number of reference candidates to use threaded search
 const MIN_CANDIDATES_FOR_THREADING = 8
 
+# Maximum candidates to fully evaluate after overlap screening (2-phase pruning)
+const MAX_REF_CANDIDATES_PHASE2 = 16
+
+# ---------- Analytical cost estimators (no IOBuffer allocation) ----------
 
 """
-    _estimate_raw_cost(buf, nl, params, T, idx_local, _zz_vid) → Int
+    _estimate_small_count_cost(v, varint) → Int
 
-Estimate the bit cost of encoding `nl` without a reference (raw mode).
-Uses pre-allocated buffers from `buf` to avoid allocations.
+Analytical cost of `write_small_count`: 2 bits for 0-2, 2+varint for 3+.
 """
-function _estimate_raw_cost(buf::CostBuffer, nl::Vector{Int},
-                            params::CGParams, ::Type{T},
-                            idx_local::Int, _zz_vid) where {T<:Unsigned}
-    _reset!(buf.io1, buf.w1)
-    if params.intra_intervals && params.intra_lr_split
-        _write_ir_lr(buf.w1, T.(nl), :fibonacci, params.intra_mil, _zz_vid; tight_deltas=params.intra_tight_deltas)
-    elseif params.intra_intervals
-        Compression.write_intervals_and_residuals(buf.w1, T.(nl), :fibonacci, params.intra_mil; vertex_id=_zz_vid)
-    elseif params.intra_stop_deltas
-        _write_stop_delta_zigzag(buf.w1, T.(nl), :fibonacci, _zz_vid)
+@inline function _estimate_small_count_cost(v::Integer, varint::Symbol)::Int
+    v <= 2 && return 2
+    return 2 + estimate_encoded_value_cost(UInt64(v), varint)
+end
+
+"""
+    _estimate_delta_list_cost(sorted_vals, encoding; vertex_id=nothing, positive_gaps=false) → Int
+
+Analytical cost of `write_delta` for a sorted list.
+"""
+function _estimate_delta_list_cost(sorted_vals::Vector{T}, encoding::Symbol;
+                                    vertex_id=nothing, positive_gaps::Bool=false)::Int where {T<:Unsigned}
+    isempty(sorted_vals) && return 0
+    cost = 0
+    # First value
+    if vertex_id !== nothing
+        offset = Int64(sorted_vals[1]) - Int64(vertex_id)
+        cost += estimate_encoded_value_cost(UInt64(Compression._zigzag_encode(offset) + 1), encoding)
     else
-        Compression.write_small_count(buf.w1, T(length(nl)), params.count_varint)
-        if !isempty(nl)
-            write_delta(buf.w1, T.(nl), :fibonacci; vertex_id=_zz_vid)
+        cost += estimate_encoded_value_cost(sorted_vals[1], encoding)
+    end
+    # Remaining gaps
+    for i in 2:length(sorted_vals)
+        gap = sorted_vals[i] - sorted_vals[i-1]
+        if positive_gaps
+            cost += estimate_encoded_value_cost(gap, encoding)
+        else
+            cost += estimate_encoded_value_cost(gap + T(1), encoding)
         end
     end
-    raw_bits = _total_bits(buf.w1)
+    return cost
+end
+
+"""
+    _estimate_stop_delta_zigzag_cost(sorted_vals, encoding, vertex_id) → Int
+
+Analytical cost of `_write_stop_delta_zigzag`.
+"""
+function _estimate_stop_delta_zigzag_cost(sorted_vals::Vector{T}, encoding::Symbol,
+                                           vertex_id)::Int where {T<:Unsigned}
+    isempty(sorted_vals) && return 1  # just STOP bit
+    cost = 1  # STOP bit
+    # First value
+    cost += 1  # continuation bit
+    if vertex_id !== nothing
+        offset = Int64(sorted_vals[1]) - Int64(vertex_id)
+        cost += estimate_encoded_value_cost(UInt64(Compression._zigzag_encode(offset) + 1), encoding)
+    else
+        cost += estimate_encoded_value_cost(sorted_vals[1], encoding)
+    end
+    # Remaining gaps (>= 1 for sorted unique)
+    for i in 2:length(sorted_vals)
+        cost += 1 + estimate_encoded_value_cost(sorted_vals[i] - sorted_vals[i-1], encoding)
+    end
+    return cost
+end
+
+"""
+    _estimate_copy_blocks_cost(positions, encoding) → Int
+
+Analytical cost of `_write_copy_blocks`: small_count(nblocks) + per-block costs.
+"""
+function _estimate_copy_blocks_cost(positions::AbstractVector{<:Integer}, encoding::Symbol)::Int
+    isempty(positions) && return _estimate_small_count_cost(0, encoding)
+    # Compute copy blocks
+    nblocks = 0
+    i = 1
+    block_cost = 0
+    prev_end = 0
+    while i <= length(positions)
+        start = positions[i]
+        len = 1
+        while i + len <= length(positions) && positions[i + len] == start + len
+            len += 1
+        end
+        nblocks += 1
+        if nblocks == 1
+            block_cost += estimate_encoded_value_cost(UInt32(start), encoding)
+            block_cost += estimate_encoded_value_cost(UInt32(len), encoding)
+        else
+            gap = start - prev_end
+            block_cost += estimate_encoded_value_cost(UInt32(gap), encoding)
+            block_cost += estimate_encoded_value_cost(UInt32(len), encoding)
+        end
+        prev_end = start + len
+        i += len
+    end
+    return _estimate_small_count_cost(nblocks, encoding) + block_cost
+end
+
+"""
+    _estimate_ir_lr_cost(neighbors, encoding, mil, vertex_id; tight_deltas) → Int
+
+CG-specific analytical cost of `_write_ir_lr` (intervals + LR-split residuals).
+"""
+function _estimate_ir_lr_cost(neighbors::Vector{T}, encoding::Symbol, mil::Int,
+                               vertex_id; tight_deltas::Bool=false)::Int where {T<:Unsigned}
+    if vertex_id === nothing || isempty(neighbors)
+        return estimate_interval_runlength_encoding_cost(neighbors, encoding, mil, 3; vertex_id=vertex_id)
+    end
+    vid = T(vertex_id)
+    intervals, residuals = compress_intervals(neighbors, mil)
+    cost = 0
+
+    # Interval count
+    cost += estimate_encoded_value_cost(T(length(intervals)) + T(1), encoding)
+
+    # Intervals
+    prev_ref = T(0)
+    for (idx, (start, len)) in enumerate(intervals)
+        if idx == 1
+            encoded_start = UInt64(Compression._zigzag_encode(Int64(start) - Int64(vid)) + 1)
+            cost += estimate_encoded_value_cost(encoded_start, encoding)
+        else
+            cost += estimate_encoded_value_cost(start - prev_ref, encoding)
+        end
+        cost += estimate_encoded_value_cost(T(len - mil + 1), encoding)
+        prev_ref = start  # CG doesn't use tight_intervals for inter-interval gaps
+    end
+
+    # Residual count
+    cost += estimate_encoded_value_cost(T(length(residuals)) + T(1), encoding)
+
+    if !isempty(residuals)
+        # Split at vid
+        split_idx = 0
+        @inbounds for i in 1:length(residuals)
+            residuals[i] < vid ? (split_idx = i) : break
+        end
+        n_left = split_idx
+        n_right = length(residuals) - n_left
+
+        # Left count
+        cost += estimate_encoded_value_cost(T(n_left) + T(1), encoding)
+
+        # Left distances (ascending from vid)
+        if n_left > 0
+            prev = T(0)
+            for i in 1:n_left
+                d = vid - residuals[n_left - i + 1]
+                if i == 1
+                    cost += estimate_encoded_value_cost(d, encoding)
+                elseif tight_deltas
+                    cost += estimate_encoded_value_cost(d - prev, encoding)
+                else
+                    cost += estimate_encoded_value_cost(d - prev + T(1), encoding)
+                end
+                prev = d
+            end
+        end
+
+        # Right distances (ascending from vid, +1 shift)
+        if n_right > 0
+            prev = T(0)
+            for i in 1:n_right
+                d = residuals[n_left + i] - vid + T(1)
+                if i == 1
+                    cost += estimate_encoded_value_cost(d, encoding)
+                elseif tight_deltas
+                    cost += estimate_encoded_value_cost(d - prev, encoding)
+                else
+                    cost += estimate_encoded_value_cost(d - prev + T(1), encoding)
+                end
+                prev = d
+            end
+        end
+    end
+
+    return cost
+end
+
+"""
+    _estimate_raw_cost_analytical(nl, params, T, _zz_vid) → (Int, Bool)
+
+Analytical bit cost of encoding `nl` without a reference (raw mode).
+No IOBuffer allocations — pure arithmetic cost estimation.
+Returns (raw_bits, raw_use_intervals).
+"""
+function _estimate_raw_cost_analytical(nl::Vector{T}, params::CGParams,
+                                        ::Type{T}, _zz_vid)::Tuple{Int,Bool} where {T<:Unsigned}
+    raw_use_intervals = false
+
+    if params.intra_intervals && params.intra_lr_split
+        raw_bits = _estimate_ir_lr_cost(nl, :fibonacci, params.intra_mil, _zz_vid; tight_deltas=params.intra_tight_deltas)
+    elseif params.intra_intervals
+        raw_bits = estimate_interval_runlength_encoding_cost(nl, :fibonacci, params.intra_mil, 3; vertex_id=_zz_vid)
+    elseif params.intra_stop_deltas
+        raw_bits = _estimate_stop_delta_zigzag_cost(nl, :fibonacci, _zz_vid)
+    else
+        raw_bits = _estimate_small_count_cost(length(nl), params.count_varint)
+        if !isempty(nl)
+            raw_bits += _estimate_delta_list_cost(nl, :fibonacci; vertex_id=_zz_vid)
+        end
+    end
 
     if params.intra_raw_adaptive && params.intra_stop_deltas
-        # Also try intervals; pick cheaper with mode flag cost
-        _reset!(buf.io2, buf.w2)
-        Compression.write_intervals_and_residuals(buf.w2, T.(nl), :fibonacci, params.intra_adapt_mil; vertex_id=_zz_vid)
-        raw_iv_bits = _total_bits(buf.w2)
+        raw_iv_bits = estimate_interval_runlength_encoding_cost(nl, :fibonacci, params.intra_adapt_mil, 3; vertex_id=_zz_vid)
+        if 1 + raw_iv_bits < 1 + raw_bits
+            raw_use_intervals = true
+        end
         raw_bits = min(1 + raw_bits, 1 + raw_iv_bits)
     end
 
-    return raw_bits
+    return raw_bits, raw_use_intervals
 end
 
 """
-    _evaluate_candidate(buf, nl, ref, params, T, idx_local, _zz_vid) → Int
+    _evaluate_candidate_analytical(positions, adds, ref_len, params, T, _zz_vid; best_so_far) → (Int, UInt8, Bool)
 
-Estimate the bit cost of encoding `nl` using `ref` as a reference.
-Returns total_bits. Populates `buf.positions` and `buf.adds` with the
-merge results (caller must copy if needed).
+Analytical bit cost of encoding with a reference, given pre-computed positions/adds.
+Returns (total_bits, copy_mode, add_use_intervals).
+Supports early termination: if positions cost alone exceeds `best_so_far`, returns early.
 """
-function _evaluate_candidate(buf::CostBuffer, nl::Vector{Int}, ref::Vector{Int},
-                             params::CGParams, ::Type{T},
-                             idx_local::Int, _zz_vid) where {T<:Unsigned}
-    # Two-pointer merge into buf.positions and buf.adds (reuse vectors)
-    empty!(buf.positions); empty!(buf.adds)
-    i = 1; j = 1
-    @inbounds while i <= length(nl) && j <= length(ref)
-        if nl[i] == ref[j]
-            push!(buf.positions, j); i += 1; j += 1
-        elseif nl[i] < ref[j]
-            push!(buf.adds, nl[i]); i += 1
-        else
-            j += 1
-        end
-    end
-    @inbounds while i <= length(nl); push!(buf.adds, nl[i]); i += 1; end
-
-    # --- Positions estimation (matching actual 3-way adaptive) ---
+function _evaluate_candidate_analytical(positions::Vector{T}, adds::Vector{T},
+                                         ref_len::Int, params::CGParams, ::Type{T},
+                                         _zz_vid; best_so_far::Int=typemax(Int))::Tuple{Int,UInt8,Bool} where {T<:Unsigned}
+    # --- Positions estimation ---
     local pos_bits::Int
+    local copy_mode::UInt8 = 0x00
     if params.intra_copy_adaptive && params.intra_copy_blocks
-        ref_len = length(ref)
         # Copy-blocks cost
-        _reset!(buf.io1, buf.w1)
-        _write_copy_blocks(buf.w1, buf.positions, params.varint)
-        cb_bits = _total_bits(buf.w1)
-
-        # Bitmap cost (analytical: exactly ref_len bits)
+        cb_bits = _estimate_copy_blocks_cost(positions, params.varint)
+        # Bitmap cost
         bm_bits = ref_len
-
-        # Complement cost (positions NOT copied)
-        empty!(buf.skipped)
-        pos_idx = 1
-        @inbounds for p in 1:ref_len
-            if pos_idx <= length(buf.positions) && buf.positions[pos_idx] == p
-                pos_idx += 1
-            else
-                push!(buf.skipped, p)
+        # Complement cost
+        n_skipped = ref_len - length(positions)
+        if n_skipped > 0
+            # Build complement inline for cost estimation
+            skipped = Vector{T}(undef, n_skipped)
+            si = 0; pi = 1
+            @inbounds for p in T(1):T(ref_len)
+                if pi <= length(positions) && positions[pi] == p
+                    pi += 1
+                else
+                    si += 1
+                    skipped[si] = p
+                end
             end
+            cc_bits = _estimate_copy_blocks_cost(skipped, params.varint)
+        else
+            cc_bits = _estimate_small_count_cost(0, params.varint)
         end
-        _reset!(buf.io2, buf.w2)
-        _write_copy_blocks(buf.w2, buf.skipped, params.varint)
-        cc_bits = _total_bits(buf.w2)
-
         # 3-way min with mode flag costs
-        pos_bits = min(1 + bm_bits, 2 + cb_bits, 2 + cc_bits)
-    elseif params.intra_copy_blocks
-        _reset!(buf.io1, buf.w1)
-        _write_copy_blocks(buf.w1, buf.positions, params.varint)
-        pos_bits = _total_bits(buf.w1)
-    else
-        _reset!(buf.io1, buf.w1)
-        Compression.write_small_count(buf.w1, T(length(buf.positions)), params.count_varint)
-        if !isempty(buf.positions)
-            write_delta(buf.w1, UInt32.(buf.positions), :fibonacci)
+        t_bm = 1 + bm_bits; t_cb = 2 + cb_bits; t_cc = 2 + cc_bits
+        if t_bm <= t_cb && t_bm <= t_cc
+            pos_bits = t_bm; copy_mode = 0x00
+        elseif t_cb <= t_cc
+            pos_bits = t_cb; copy_mode = 0x01
+        else
+            pos_bits = t_cc; copy_mode = 0x02
         end
-        pos_bits = _total_bits(buf.w1)
+    elseif params.intra_copy_blocks
+        pos_bits = _estimate_copy_blocks_cost(positions, params.varint)
+        copy_mode = 0x01
+    else
+        pos_bits = _estimate_small_count_cost(length(positions), params.count_varint)
+        if !isempty(positions)
+            pos_bits += _estimate_delta_list_cost(UInt32.(positions), :fibonacci)
+        end
     end
 
-    # --- Additions estimation (matching actual adaptive) ---
+    # Early termination: if positions alone exceed best, skip additions
+    if pos_bits >= best_so_far
+        return pos_bits, copy_mode, false
+    end
+
+    # --- Additions estimation ---
     local add_bits::Int
+    local add_use_intervals::Bool = false
     if params.intra_intervals && params.intra_lr_split
-        _reset!(buf.io2, buf.w2)
-        _write_ir_lr(buf.w2, T.(buf.adds), :fibonacci, params.intra_mil, _zz_vid; tight_deltas=params.intra_tight_deltas)
-        add_bits = _total_bits(buf.w2)
+        add_bits = _estimate_ir_lr_cost(adds, :fibonacci, params.intra_mil, _zz_vid; tight_deltas=params.intra_tight_deltas)
     elseif params.intra_intervals
-        _reset!(buf.io2, buf.w2)
-        Compression.write_intervals_and_residuals(buf.w2, T.(buf.adds), :fibonacci, params.intra_mil; vertex_id=_zz_vid)
-        add_bits = _total_bits(buf.w2)
+        add_bits = estimate_interval_runlength_encoding_cost(adds, :fibonacci, params.intra_mil, 3; vertex_id=_zz_vid)
     elseif params.intra_add_adaptive && params.intra_stop_deltas
-        # Both STOP-delta and intervals; pick cheaper with mode flag
-        _reset!(buf.io2, buf.w2)
-        _write_stop_delta_zigzag(buf.w2, T.(buf.adds), :fibonacci, _zz_vid)
-        sd_bits = _total_bits(buf.w2)
-
-        _reset!(buf.io3, buf.w3)
-        Compression.write_intervals_and_residuals(buf.w3, T.(buf.adds), :fibonacci, params.intra_adapt_mil; vertex_id=_zz_vid)
-        iv_bits = _total_bits(buf.w3)
-
+        sd_bits = _estimate_stop_delta_zigzag_cost(adds, :fibonacci, _zz_vid)
+        iv_bits = estimate_interval_runlength_encoding_cost(adds, :fibonacci, params.intra_adapt_mil, 3; vertex_id=_zz_vid)
+        if 1 + iv_bits < 1 + sd_bits
+            add_use_intervals = true
+        end
         add_bits = min(1 + sd_bits, 1 + iv_bits)
     elseif params.intra_stop_deltas
-        _reset!(buf.io2, buf.w2)
-        _write_stop_delta_zigzag(buf.w2, T.(buf.adds), :fibonacci, _zz_vid)
-        add_bits = _total_bits(buf.w2)
+        add_bits = _estimate_stop_delta_zigzag_cost(adds, :fibonacci, _zz_vid)
     else
-        _reset!(buf.io2, buf.w2)
-        Compression.write_small_count(buf.w2, T(length(buf.adds)), params.count_varint)
-        if !isempty(buf.adds)
-            write_delta(buf.w2, T.(buf.adds), :fibonacci; vertex_id=_zz_vid)
+        add_bits = _estimate_small_count_cost(length(adds), params.count_varint)
+        if !isempty(adds)
+            add_bits += _estimate_delta_list_cost(adds, :fibonacci; vertex_id=_zz_vid)
         end
-        add_bits = _total_bits(buf.w2)
     end
 
-    return pos_bits + add_bits
+    return pos_bits + add_bits, copy_mode, add_use_intervals
 end
 
 """
-    _evaluate_candidate_greedy(buf, nl, ref, params, T, idx_local, _zz_vid, mil_options) → (Int, Int)
+    _evaluate_candidate_greedy_analytical(positions, adds, params, T, _zz_vid, mil_options) → (Int, Int)
 
-Greedy MIL variant: try each mil value for additions cost. Returns (best_total_bits, best_mil).
-Populates `buf.positions` and `buf.adds`.
+Analytical greedy MIL variant: try each mil value for additions cost.
+Returns (best_total_bits, best_mil).
 """
-function _evaluate_candidate_greedy(buf::CostBuffer, nl::Vector{Int}, ref::Vector{Int},
-                                    params::CGParams, ::Type{T},
-                                    idx_local::Int, _zz_vid,
-                                    mil_options::Vector{Int}) where {T<:Unsigned}
-    # Two-pointer merge into buf.positions and buf.adds
-    empty!(buf.positions); empty!(buf.adds)
-    i = 1; j = 1
-    @inbounds while i <= length(nl) && j <= length(ref)
-        if nl[i] == ref[j]
-            push!(buf.positions, j); i += 1; j += 1
-        elseif nl[i] < ref[j]
-            push!(buf.adds, nl[i]); i += 1
-        else
-            j += 1
-        end
-    end
-    @inbounds while i <= length(nl); push!(buf.adds, nl[i]); i += 1; end
-
-    # Positions cost (doesn't depend on mil)
-    _reset!(buf.io1, buf.w1)
+function _evaluate_candidate_greedy_analytical(positions::Vector{T}, adds::Vector{T},
+                                                params::CGParams, ::Type{T},
+                                                _zz_vid,
+                                                mil_options::Vector{Int})::Tuple{Int,Int} where {T<:Unsigned}
+    # Positions cost (doesn't depend on mil) — analytical
     if params.intra_copy_blocks
-        _write_copy_blocks(buf.w1, buf.positions, params.varint)
+        pos_bits = _estimate_copy_blocks_cost(positions, params.varint)
     else
-        Compression.write_small_count(buf.w1, T(length(buf.positions)), params.count_varint)
-        if !isempty(buf.positions)
-            write_delta(buf.w1, UInt32.(buf.positions), :fibonacci)
+        pos_bits = _estimate_small_count_cost(length(positions), params.count_varint)
+        if !isempty(positions)
+            pos_bits += _estimate_delta_list_cost(UInt32.(positions), :fibonacci)
         end
     end
-    pos_bits = _total_bits(buf.w1)
 
-    # Try each mil for additions
+    # Try each mil for additions — analytical
     best_bits = typemax(Int)
     best_mil = mil_options[1]
-    adds_T = T.(buf.adds)
     for mil in mil_options
-        _reset!(buf.io2, buf.w2)
         if params.intra_lr_split
-            _write_ir_lr(buf.w2, adds_T, :fibonacci, mil, _zz_vid; tight_deltas=params.intra_tight_deltas)
+            add_bits = _estimate_ir_lr_cost(adds, :fibonacci, mil, _zz_vid; tight_deltas=params.intra_tight_deltas)
         else
-            Compression.write_intervals_and_residuals(buf.w2, adds_T, :fibonacci, mil; vertex_id=_zz_vid)
+            add_bits = estimate_interval_runlength_encoding_cost(adds, :fibonacci, mil, 3; vertex_id=_zz_vid)
         end
-        add_bits = _total_bits(buf.w2)
         total = pos_bits + add_bits
         if total < best_bits
             best_bits = total
@@ -949,6 +1097,48 @@ function _evaluate_candidate_greedy(buf::CostBuffer, nl::Vector{Int}, ref::Vecto
     end
 
     return best_bits, best_mil
+end
+
+"""
+    _merge_positions_adds!(nl, ref, positions, adds)
+
+Two-pointer merge producing positions (1-based indices into ref) and adds (unmatched from nl).
+Reuses the provided vectors.
+"""
+@inline function _merge_positions_adds!(nl::Vector{T}, ref::Vector{T},
+                                         positions::Vector{T}, adds::Vector{T}) where {T<:Unsigned}
+    empty!(positions); empty!(adds)
+    i = 1; j = 1
+    @inbounds while i <= length(nl) && j <= length(ref)
+        if nl[i] == ref[j]
+            push!(positions, T(j)); i += 1; j += 1
+        elseif nl[i] < ref[j]
+            push!(adds, nl[i]); i += 1
+        else
+            j += 1
+        end
+    end
+    @inbounds while i <= length(nl); push!(adds, nl[i]); i += 1; end
+end
+
+"""
+    _sorted_overlap_count(a, b) → Int
+
+Count common elements between two sorted vectors using two-pointer scan.
+"""
+@inline function _sorted_overlap_count(a::Vector{T}, b::Vector{T})::Int where {T}
+    count = 0
+    i = 1; j = 1
+    @inbounds while i <= length(a) && j <= length(b)
+        if a[i] == b[j]
+            count += 1; i += 1; j += 1
+        elseif a[i] < b[j]
+            i += 1
+        else
+            j += 1
+        end
+    end
+    return count
 end
 
 # --------------------------
@@ -1107,65 +1297,58 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                 end
                 # else fall through to per-vertex path
             end
-            # Optional intra-cluster referencing to exploit overlap in successive lists
-            prev_lists = Vector{Vector{Int}}()
-            # First pass: decide refs and compute ref data
-            use_ref_vec = Vector{Bool}(undef, s)
-            ref_delta_vec = Vector{UInt32}(undef, s)
-            ref_positions_list = Vector{Vector{Int}}(undef, s)
-            additions_list = Vector{Vector{Int}}(undef, s)
-            raw_lists = Vector{Vector{Int}}(undef, s)
-            ref_len_list = Vector{Int}(undef, s)
-            # Decisions for encoding modes
-            pos_use_bitmap_vec = Vector{Bool}(undef, s)
-            add_use_intervals_vec = Vector{Bool}(undef, s)
-            # Per-vertex mil (greedy search populates this; otherwise fixed)
-            mil_vec = fill(params.intra_mil, s)
-            _mil_options = [2, 3, 4, 5]
-            # Pre-allocate one CostBuffer per thread for reuse across vertices
-            # Use maxthreadid() to cover all thread IDs including interactive threads
-            _nslots = Threads.maxthreadid()
-            _nthreads = Threads.nthreads()
-            _thread_bufs = [CostBuffer() for _ in 1:_nslots]
-            # Thread-local best arrays (allocated once, reused across vertices)
-            _tb_bits = Vector{Int}(undef, _nslots)
-            _tb_idx = Vector{Int}(undef, _nslots)
-            _tb_mil = Vector{Int}(undef, _nslots)
-            _tb_pos = Vector{Vector{Int}}(undef, _nslots)
-            _tb_add = Vector{Vector{Int}}(undef, _nslots)
-            for (idx_local, u) in enumerate(C)
-                progress !== nothing && progress(idx_local, s, ci, n_clusters)
-                # gather local neighbors of u within C, as local indices (1-based)
-                nl = Int[]
+            # Pre-build ALL neighbor lists for the cluster upfront (optimization #4)
+            all_nl = Vector{Vector{T}}(undef, s)
+            for (i, u) in enumerate(C)
+                nl = T[]
                 for v in outneighbors(g, Int(u))
-                    if haskey(local_index, v)
-                        push!(nl, local_index[v])
+                    lv = get(local_index, v, 0)
+                    if lv != 0
+                        push!(nl, T(lv))
                     end
                 end
                 sort!(nl)
-                # decide reference and mil (greedy by measured bits)
-                use_ref = false; ref_positions = Int[]; additions = Int[]; ref_delta_val = UInt32(0)
+                all_nl[i] = nl
+            end
+
+            # First pass: decide refs and compute ref data
+            use_ref_vec = Vector{Bool}(undef, s)
+            ref_delta_vec = Vector{UInt32}(undef, s)
+            ref_positions_list = Vector{Vector{T}}(undef, s)
+            additions_list = Vector{Vector{T}}(undef, s)
+            ref_len_list = Vector{Int}(undef, s)
+            # Decisions for encoding modes (stored during search, replayed in write phase)
+            copy_mode_vec = Vector{UInt8}(undef, s)    # 0=bitmap, 1=copy-blocks, 2=complement
+            add_mode_vec = Vector{Bool}(undef, s)      # true=intervals, false=stop-delta (ref adds)
+            raw_mode_vec = Vector{Bool}(undef, s)      # true=intervals, false=stop-delta (raw)
+            # Per-vertex mil (greedy search populates this; otherwise fixed)
+            mil_vec = fill(params.intra_mil, s)
+            _mil_options = [2, 3, 4, 5]
+
+            # Double-buffer swap: two position/adds vector pairs (optimization #5)
+            _pos_a = T[]; _adds_a = T[]
+            _pos_b = T[]; _adds_b = T[]
+
+            for idx_local in 1:s
+                progress !== nothing && progress(idx_local, s, ci, n_clusters)
+                nl = all_nl[idx_local]
+                # decide reference and mil
+                use_ref = false; ref_delta_val = UInt32(0)
+                best_copy_mode = 0x00; best_add_mode = false; best_raw_mode = false
                 if params.intra_greedy_mil
-                    # Greedy per-vertex mil search: try all mil values for raw and ref
+                    # Greedy per-vertex mil search: try all mil values for raw and ref (analytical)
                     best_bits = typemax(Int)
                     best_mil_val = params.intra_mil
                     best_is_ref = false
                     best_ref_idx = 0
-                    best_ref_pos = Int[]
-                    best_ref_add = Int[]
 
-                    # Try raw encoding with each mil (reuse buffer)
                     _zz_vid = params.intra_zigzag ? T(idx_local) : nothing
-                    nl_T = T.(nl)
-                    buf0 = _thread_bufs[1]
                     for mil in _mil_options
-                        _reset!(buf0.io1, buf0.w1)
                         if params.intra_lr_split
-                            _write_ir_lr(buf0.w1, nl_T, :fibonacci, mil, _zz_vid; tight_deltas=params.intra_tight_deltas)
+                            raw_bits = _estimate_ir_lr_cost(nl, :fibonacci, mil, _zz_vid; tight_deltas=params.intra_tight_deltas)
                         else
-                            Compression.write_intervals_and_residuals(buf0.w1, nl_T, :fibonacci, mil; vertex_id=_zz_vid)
+                            raw_bits = estimate_interval_runlength_encoding_cost(nl, :fibonacci, mil, 3; vertex_id=_zz_vid)
                         end
-                        raw_bits = _total_bits(buf0.w1)
                         if raw_bits < best_bits
                             best_bits = raw_bits
                             best_mil_val = mil
@@ -1173,138 +1356,126 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                         end
                     end
 
-                    # Try ref encoding with each candidate × each mil
-                    if params.intra_ref_enabled && !isempty(prev_lists)
-                        wstart = max(1, length(prev_lists) - params.intra_ref_window + 1)
-                        n_candidates = length(prev_lists) - wstart + 1
+                    # Try ref encoding with 2-phase pruning + analytical cost
+                    if params.intra_ref_enabled && idx_local > 1
+                        wstart = max(1, idx_local - params.intra_ref_window)
+                        wend = idx_local - 1
+                        n_candidates = wend - wstart + 1
 
-                        if n_candidates >= MIN_CANDIDATES_FOR_THREADING && _nthreads > 1
-                            # Threaded greedy reference search
-                            fill!(_tb_bits, typemax(Int))
-                            fill!(_tb_mil, params.intra_mil)
-                            fill!(_tb_idx, 0)
-                            Threads.@threads :static for rix in wstart:length(prev_lists)
-                                tid = Threads.threadid()
-                                buf_t = _thread_bufs[tid]
-                                bits, mil_val = _evaluate_candidate_greedy(buf_t, nl, prev_lists[rix], params, T, idx_local, _zz_vid, _mil_options)
-                                if bits < _tb_bits[tid]
-                                    _tb_bits[tid] = bits
-                                    _tb_mil[tid] = mil_val
-                                    _tb_idx[tid] = rix
-                                    _tb_pos[tid] = copy(buf_t.positions)
-                                    _tb_add[tid] = copy(buf_t.adds)
-                                end
+                        # Phase 1: overlap screening (cheap O(|nl|+|ref|) per candidate)
+                        if n_candidates > MAX_REF_CANDIDATES_PHASE2
+                            overlap_scores = Vector{Tuple{Int,Int}}(undef, n_candidates)
+                            for (ci2, rix) in enumerate(wstart:wend)
+                                ov = _sorted_overlap_count(nl, all_nl[rix])
+                                overlap_scores[ci2] = (ov, rix)
                             end
-                            g_best_bits, g_best_tid = findmin(_tb_bits)
-                            if g_best_bits < best_bits
-                                best_bits = g_best_bits
-                                best_mil_val = _tb_mil[g_best_tid]
-                                best_is_ref = true
-                                best_ref_idx = _tb_idx[g_best_tid]
-                                best_ref_pos = _tb_pos[g_best_tid]
-                                best_ref_add = _tb_add[g_best_tid]
-                            end
+                            sort!(overlap_scores; by = x -> -x[1])
+                            phase2_indices = [overlap_scores[k][2] for k in 1:min(MAX_REF_CANDIDATES_PHASE2, n_candidates)]
                         else
-                            # Sequential greedy reference search with buffer reuse
-                            buf0 = _thread_bufs[1]
-                            for rix in wstart:length(prev_lists)
-                                bits, mil_val = _evaluate_candidate_greedy(buf0, nl, prev_lists[rix], params, T, idx_local, _zz_vid, _mil_options)
-                                if bits < best_bits
-                                    best_bits = bits
-                                    best_mil_val = mil_val
-                                    best_is_ref = true
-                                    best_ref_idx = rix
-                                    best_ref_pos = copy(buf0.positions)
-                                    best_ref_add = copy(buf0.adds)
-                                end
+                            phase2_indices = collect(wstart:wend)
+                        end
+
+                        # Phase 2: full analytical evaluation on top candidates
+                        for rix in phase2_indices
+                            _merge_positions_adds!(nl, all_nl[rix], _pos_a, _adds_a)
+                            bits, mil_val = _evaluate_candidate_greedy_analytical(_pos_a, _adds_a, params, T, _zz_vid, _mil_options)
+                            if bits < best_bits
+                                best_bits = bits
+                                best_mil_val = mil_val
+                                best_is_ref = true
+                                best_ref_idx = rix
                             end
                         end
                     end
 
                     if best_is_ref
                         use_ref = true
-                        ref_positions = best_ref_pos
-                        additions = best_ref_add
                         ref_delta_val = UInt32(idx_local - best_ref_idx)
+                        # Final merge for the winner — swap into storage
+                        _merge_positions_adds!(nl, all_nl[best_ref_idx], _pos_a, _adds_a)
+                        ref_positions_list[idx_local] = copy(_pos_a)
+                        additions_list[idx_local] = copy(_adds_a)
+                    else
+                        ref_positions_list[idx_local] = T[]
+                        additions_list[idx_local] = T[]
                     end
                     mil_vec[idx_local] = best_mil_val
-                elseif params.intra_ref_enabled && !isempty(prev_lists)
-                    # Accurate reference decision: estimate costs matching actual adaptive encoding
+                elseif params.intra_ref_enabled && idx_local > 1
+                    # Analytical reference decision with 2-phase pruning + early termination
                     _zz_vid = params.intra_zigzag ? T(idx_local) : nothing
 
-                    # Raw estimation using pre-allocated buffer
-                    raw_bits = _estimate_raw_cost(_thread_bufs[1], nl, params, T, idx_local, _zz_vid)
+                    # Raw estimation (analytical)
+                    raw_bits, raw_use_iv = _estimate_raw_cost_analytical(nl, params, T, _zz_vid)
+                    best_raw_mode = raw_use_iv
 
-                    # Ref delta header overhead (only ref vertices pay this)
+                    # Ref delta header overhead
                     ref_overhead = 0
                     if params.intra_ref_fixwidth
                         ref_overhead = max(1, ceil(Int, log2(params.intra_ref_window)))
                     end
 
-                    wstart = max(1, length(prev_lists) - params.intra_ref_window + 1)
-                    n_candidates = length(prev_lists) - wstart + 1
+                    wstart = max(1, idx_local - params.intra_ref_window)
+                    wend = idx_local - 1
+                    n_candidates = wend - wstart + 1
 
-                    if n_candidates >= MIN_CANDIDATES_FOR_THREADING && _nthreads > 1
-                        # Threaded reference search
-                        fill!(_tb_bits, typemax(Int))
-                        fill!(_tb_idx, 0)
-                        Threads.@threads :static for rix in wstart:length(prev_lists)
-                            tid = Threads.threadid()
-                            buf_t = _thread_bufs[tid]
-                            bits = _evaluate_candidate(buf_t, nl, prev_lists[rix], params, T, idx_local, _zz_vid)
-                            total = bits + ref_overhead
-                            if total < _tb_bits[tid]
-                                _tb_bits[tid] = total
-                                _tb_idx[tid] = rix
-                                _tb_pos[tid] = copy(buf_t.positions)
-                                _tb_add[tid] = copy(buf_t.adds)
-                            end
+                    # Phase 1: overlap screening
+                    if n_candidates > MAX_REF_CANDIDATES_PHASE2
+                        overlap_scores = Vector{Tuple{Int,Int}}(undef, n_candidates)
+                        for (ci2, rix) in enumerate(wstart:wend)
+                            ov = _sorted_overlap_count(nl, all_nl[rix])
+                            overlap_scores[ci2] = (ov, rix)
                         end
-                        g_best_bits, g_best_tid = findmin(_tb_bits)
-                        if g_best_bits < raw_bits
-                            use_ref = true
-                            ref_positions = _tb_pos[g_best_tid]
-                            additions = _tb_add[g_best_tid]
-                            ref_delta_val = UInt32(idx_local - _tb_idx[g_best_tid])
-                        end
+                        sort!(overlap_scores; by = x -> -x[1])
+                        phase2_indices = [overlap_scores[k][2] for k in 1:min(MAX_REF_CANDIDATES_PHASE2, n_candidates)]
                     else
-                        # Sequential reference search with buffer reuse
-                        buf0 = _thread_bufs[1]
-                        best_bits = raw_bits
-                        best_idx = 0
-                        best_pos = Int[]
-                        best_add = Int[]
-                        for rix in wstart:length(prev_lists)
-                            bits = _evaluate_candidate(buf0, nl, prev_lists[rix], params, T, idx_local, _zz_vid)
-                            total = bits + ref_overhead
-                            if total < best_bits
-                                best_bits = total
-                                best_idx = rix
-                                best_pos = copy(buf0.positions)
-                                best_add = copy(buf0.adds)
-                            end
-                        end
-                        if best_idx > 0
-                            use_ref = true
-                            ref_positions = best_pos
-                            additions = best_add
-                            ref_delta_val = UInt32(idx_local - best_idx)
+                        phase2_indices = collect(wstart:wend)
+                    end
+
+                    # Phase 2: analytical evaluation with early termination
+                    best_bits = raw_bits
+                    best_idx = 0
+                    # Use double-buffer swap: _pos_a/_adds_a for current, _pos_b/_adds_b for best
+                    for rix in phase2_indices
+                        _merge_positions_adds!(nl, all_nl[rix], _pos_a, _adds_a)
+                        ref_len = length(all_nl[rix])
+                        bits, cm, aim = _evaluate_candidate_analytical(_pos_a, _adds_a, ref_len, params, T, _zz_vid; best_so_far=best_bits - ref_overhead)
+                        total = bits + ref_overhead
+                        if total < best_bits
+                            best_bits = total
+                            best_idx = rix
+                            best_copy_mode = cm
+                            best_add_mode = aim
+                            # Swap buffers: _pos_b/_adds_b now hold the best result
+                            _pos_a, _pos_b = _pos_b, _pos_a
+                            _adds_a, _adds_b = _adds_b, _adds_a
                         end
                     end
+                    if best_idx > 0
+                        use_ref = true
+                        ref_delta_val = UInt32(idx_local - best_idx)
+                        # Best result is in _pos_b/_adds_b (after last swap)
+                        ref_positions_list[idx_local] = copy(_pos_b)
+                        additions_list[idx_local] = copy(_adds_b)
+                    end
+                    if !use_ref
+                        ref_positions_list[idx_local] = T[]
+                        additions_list[idx_local] = T[]
+                    end
+                else
+                    ref_positions_list[idx_local] = T[]
+                    additions_list[idx_local] = T[]
                 end
                 use_ref_vec[idx_local] = use_ref
                 ref_delta_vec[idx_local] = ref_delta_val
-                ref_positions_list[idx_local] = ref_positions
-                additions_list[idx_local] = additions
-                raw_lists[idx_local] = nl
+                copy_mode_vec[idx_local] = best_copy_mode
+                add_mode_vec[idx_local] = best_add_mode
+                raw_mode_vec[idx_local] = best_raw_mode
                 if use_ref
-                    # store reference list length for bitmap construction
                     ref_index = idx_local - Int(ref_delta_val)
-                    ref_len_list[idx_local] = ref_index >= 1 ? length(prev_lists[ref_index]) : 0
+                    ref_len_list[idx_local] = ref_index >= 1 ? length(all_nl[ref_index]) : 0
                 else
                     ref_len_list[idx_local] = 0
                 end
-                push!(prev_lists, nl)
             end
 
             # Write per-cluster ref bitmap and ref deltas
@@ -1378,6 +1549,9 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
             local _vtx_offsets = _idx_mode ? Vector{Int}(undef, s + 1) : nothing
             local pw = _idx_mode ? _vtx_payload_bw : w  # payload writer
 
+            # Pre-allocate reusable complement vector for write phase
+            _wp_skipped = T[]
+
             for idx_local in 1:s
                 if _idx_mode
                     _vtx_offsets[idx_local] = _total_bits(pw)
@@ -1391,49 +1565,33 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                     ref_len = ref_len_list[idx_local]
                     local bpos0 = _total_bits(pw)
                     if params.intra_copy_adaptive && params.intra_copy_blocks
-                        # 3-way adaptive: bitmap / copy-blocks / complement copy-blocks
-                        # Copy-blocks cost
-                        local _io_cb = IOBuffer(); local _w_cb = BitWriter(_io_cb)
-                        _write_copy_blocks(_w_cb, ref_positions, params.varint)
-                        local _cb_bits = _total_bits(_w_cb)
-
-                        # Complement: encode positions NOT copied (sorted, same format)
-                        local _skipped = let pos_idx = 1, sk = Int[]
-                            for p in 1:ref_len
-                                if pos_idx <= length(ref_positions) && ref_positions[pos_idx] == p
-                                    pos_idx += 1
-                                else
-                                    push!(sk, p)
-                                end
-                            end
-                            sk
-                        end
-                        local _io_cc = IOBuffer(); local _w_cc = BitWriter(_io_cc)
-                        _write_copy_blocks(_w_cc, _skipped, params.varint)
-                        local _cc_bits = _total_bits(_w_cc)
-
-                        local _bm_bits = ref_len  # bitmap = exactly ref_len bits
-
-                        # 3-way nested mode: outer=1 → bitmap; outer=0,inner=0 → copy-blocks;
-                        #                    outer=0,inner=1 → complement
-                        # Cost: bitmap=1+ref_len  copy-blocks=2+cb_bits  complement=2+cc_bits
-                        local _t_bm = 1 + _bm_bits
-                        local _t_cb = 2 + _cb_bits
-                        local _t_cc = 2 + _cc_bits
-
-                        if _t_bm <= _t_cb && _t_bm <= _t_cc
+                        # 3-way adaptive: use stored decision from search phase
+                        local _cm = copy_mode_vec[idx_local]
+                        if _cm == 0x00
+                            # Bitmap mode
                             write_bit(pw, true)   # outer=1: bitmap
                             local _bm_arr = fill(false, ref_len)
-                            for p in ref_positions; if 1 <= p <= ref_len; _bm_arr[p] = true; end; end
+                            for p in ref_positions; if 1 <= Int(p) <= ref_len; _bm_arr[Int(p)] = true; end; end
                             for b in _bm_arr; write_bit(pw, b); end
                             if stats !== nothing; stats.intra_copy_bitmap_count += 1; end
-                        elseif _t_cb <= _t_cc
-                            write_bit(pw, false); write_bit(pw, false)  # outer=0,inner=0: copy-blocks
+                        elseif _cm == 0x01
+                            # Copy-blocks mode
+                            write_bit(pw, false); write_bit(pw, false)
                             _write_copy_blocks(pw, ref_positions, params.varint)
                             if stats !== nothing; stats.intra_copy_blocks_count += 1; end
                         else
-                            write_bit(pw, false); write_bit(pw, true)   # outer=0,inner=1: complement
-                            _write_copy_blocks(pw, _skipped, params.varint)
+                            # Complement mode — build complement using pre-allocated vector
+                            write_bit(pw, false); write_bit(pw, true)
+                            empty!(_wp_skipped)
+                            local _pi = 1
+                            @inbounds for p in T(1):T(ref_len)
+                                if _pi <= length(ref_positions) && ref_positions[_pi] == p
+                                    _pi += 1
+                                else
+                                    push!(_wp_skipped, p)
+                                end
+                            end
+                            _write_copy_blocks(pw, _wp_skipped, params.varint)
                             if stats !== nothing; stats.intra_copy_complement_count += 1; end
                         end
 
@@ -1448,7 +1606,7 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                     elseif ref_len > 0
                         copied = fill(false, ref_len)
                         for p in ref_positions
-                            if 1 <= p <= ref_len; copied[p] = true; end
+                            if 1 <= Int(p) <= ref_len; copied[Int(p)] = true; end
                         end
                         Compression.write_bitmap_rle_ones_deltas(pw, copied, params.varint)
                     else
@@ -1459,12 +1617,12 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                     # additions: MGS intervals, custom intervals, or plain delta
                     local ah0 = _total_bits(pw)
                     if (params.intra_intervals || params.intra_greedy_mil) && params.intra_lr_split
-                        _write_ir_lr(pw, T.(additions), :fibonacci, mil_vec[idx_local], _zz_vid; tight_deltas=params.intra_tight_deltas)
+                        _write_ir_lr(pw, additions, :fibonacci, mil_vec[idx_local], _zz_vid; tight_deltas=params.intra_tight_deltas)
                     elseif params.intra_intervals || params.intra_greedy_mil
-                        Compression.write_intervals_and_residuals(pw, T.(additions), :fibonacci, mil_vec[idx_local]; vertex_id=_zz_vid)
+                        Compression.write_intervals_and_residuals(pw, additions, :fibonacci, mil_vec[idx_local]; vertex_id=_zz_vid)
                     elseif params.additions_mode == :intervals
                         # detect runs and write intervals + singles
-                        runs = Vector{Tuple{Int,Int}}(); singles = Int[]
+                        runs = Vector{Tuple{T,Int}}(); singles = T[]
                         if !isempty(additions)
                             i3 = 1
                             while i3 <= length(additions)
@@ -1488,32 +1646,24 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                         end
                         Compression.write_small_count(pw, T(length(singles)), params.count_varint)
                         if !isempty(singles)
-                            write_delta(pw, T.(singles), :fibonacci; vertex_id=_zz_vid)
+                            write_delta(pw, singles, :fibonacci; vertex_id=_zz_vid)
                         end
                     elseif params.intra_add_adaptive && params.intra_stop_deltas
-                        # Adaptive: per-vertex pick cheaper of STOP-delta vs intervals
-                        # Write mode bit inline (0=stop-delta, 1=intervals), then payload
-                        local adds_T = T.(additions)
-                        local _io_sd = IOBuffer(); local _w_sd = BitWriter(_io_sd)
-                        _write_stop_delta_zigzag(_w_sd, adds_T, :fibonacci, _zz_vid)
-                        local _sd_bits = _total_bits(_w_sd)
-                        local _io_iv = IOBuffer(); local _w_iv = BitWriter(_io_iv)
-                        Compression.write_intervals_and_residuals(_w_iv, adds_T, :fibonacci, params.intra_adapt_mil; vertex_id=_zz_vid)
-                        local _iv_bits = _total_bits(_w_iv)
-                        if _iv_bits + 1 < _sd_bits   # +1 for the mode flag itself
+                        # Adaptive: use stored decision from search phase
+                        if add_mode_vec[idx_local]
                             write_bit(pw, true)   # intervals
-                            Compression.write_intervals_and_residuals(pw, adds_T, :fibonacci, params.intra_adapt_mil; vertex_id=_zz_vid)
+                            Compression.write_intervals_and_residuals(pw, additions, :fibonacci, params.intra_adapt_mil; vertex_id=_zz_vid)
                         else
                             write_bit(pw, false)  # stop-delta
-                            _write_stop_delta_zigzag(pw, adds_T, :fibonacci, _zz_vid)
+                            _write_stop_delta_zigzag(pw, additions, :fibonacci, _zz_vid)
                         end
                     else
                         if params.intra_stop_deltas
-                            _write_stop_delta_zigzag(pw, T.(additions), :fibonacci, _zz_vid)
+                            _write_stop_delta_zigzag(pw, additions, :fibonacci, _zz_vid)
                         else
                             Compression.write_small_count(pw, T(length(additions)), params.count_varint)
                             if !isempty(additions)
-                                write_delta(pw, T.(additions), :fibonacci; vertex_id=_zz_vid)
+                                write_delta(pw, additions, :fibonacci; vertex_id=_zz_vid)
                             end
                         end
                     end
@@ -1527,35 +1677,28 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                     end
                 else
                     # raw
-                    nl = raw_lists[idx_local]
+                    nl = all_nl[idx_local]
                     local rb0 = _total_bits(pw)
                     if (params.intra_intervals || params.intra_greedy_mil) && params.intra_lr_split
-                        _write_ir_lr(pw, T.(nl), :fibonacci, mil_vec[idx_local], _zz_vid; tight_deltas=params.intra_tight_deltas)
+                        _write_ir_lr(pw, nl, :fibonacci, mil_vec[idx_local], _zz_vid; tight_deltas=params.intra_tight_deltas)
                     elseif params.intra_intervals || params.intra_greedy_mil
-                        Compression.write_intervals_and_residuals(pw, T.(nl), :fibonacci, mil_vec[idx_local]; vertex_id=_zz_vid)
+                        Compression.write_intervals_and_residuals(pw, nl, :fibonacci, mil_vec[idx_local]; vertex_id=_zz_vid)
                     elseif params.intra_raw_adaptive && params.intra_stop_deltas
-                        # Adaptive: per-vertex pick cheaper of STOP-delta vs intervals
-                        local nl_T = T.(nl)
-                        local _io_sd2 = IOBuffer(); local _w_sd2 = BitWriter(_io_sd2)
-                        _write_stop_delta_zigzag(_w_sd2, nl_T, :fibonacci, _zz_vid)
-                        local _sd_bits2 = _total_bits(_w_sd2)
-                        local _io_iv2 = IOBuffer(); local _w_iv2 = BitWriter(_io_iv2)
-                        Compression.write_intervals_and_residuals(_w_iv2, nl_T, :fibonacci, params.intra_adapt_mil; vertex_id=_zz_vid)
-                        local _iv_bits2 = _total_bits(_w_iv2)
-                        if _iv_bits2 + 1 < _sd_bits2
+                        # Adaptive: use stored decision from search phase
+                        if raw_mode_vec[idx_local]
                             write_bit(pw, true)   # intervals
-                            Compression.write_intervals_and_residuals(pw, nl_T, :fibonacci, params.intra_adapt_mil; vertex_id=_zz_vid)
+                            Compression.write_intervals_and_residuals(pw, nl, :fibonacci, params.intra_adapt_mil; vertex_id=_zz_vid)
                         else
                             write_bit(pw, false)  # stop-delta
-                            _write_stop_delta_zigzag(pw, nl_T, :fibonacci, _zz_vid)
+                            _write_stop_delta_zigzag(pw, nl, :fibonacci, _zz_vid)
                         end
                     elseif params.intra_stop_deltas
-                        _write_stop_delta_zigzag(pw, T.(nl), :fibonacci, _zz_vid)
+                        _write_stop_delta_zigzag(pw, nl, :fibonacci, _zz_vid)
                     else
                         # raw count: use small-count which escapes to varint for large values and handles zero
                         Compression.write_small_count(pw, T(length(nl)), params.count_varint)
                         if !isempty(nl)
-                            write_delta(pw, T.(nl), :fibonacci; vertex_id=_zz_vid)
+                            write_delta(pw, nl, :fibonacci; vertex_id=_zz_vid)
                         end
                     end
                     if stats !== nothing

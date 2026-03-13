@@ -32,7 +32,7 @@ function elias_bits(v::T, encoding::Symbol) where {T<:Unsigned}
     elseif encoding == :elias_delta
         write_elias_delta(writer, v)
     end
-    nbits = writer.index - 1 # capture number of bits before flush resets it
+    nbits = writer.bits_in # capture number of bits before flush resets it
     flush_bitwriter(writer; flush_last_bits=true)
     # read the bits from the buffer
     seekstart(io)

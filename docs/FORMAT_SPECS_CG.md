@@ -620,7 +620,7 @@ Best CG BPE across all tested datasets, compared with BG, CS, and WebGraph BV:
 | Dataset | Vertices | Edges | CG BPE | BG BPE | CS BPE | BV BPE | CG Config |
 |---------|----------|-------|---------|---------|--------|--------|------------|
 | cnr-2000 (no reorder) | 325K | 3.2M | **2.3191** | 2.4929 | 2.4348 | 2.898 | K=2, w=64, no LLP |
-| cnr-2000 (Leiden+LLP) | 325K | 3.2M | 2.5652 | 2.3258 | **2.3042** | 3.2335 | K=1, w=64; CS w=256 best |
+| cnr-2000 (Leiden+LLP) | 325K | 3.2M | 2.5652 | **2.3258** | 2.3643 | 3.2335 | K=1, w=64; BG w=64 best |
 | in-2004 | 1.38M | 16.9M | **1.7513** | 1.895 | 1.7839 | 2.172 | K=1, w=8 |
 | enwiki-2013 | 4.2M | 101M | **12.4854** | — | — | 13.114 | K=1, w=64, LLP, iv+LR |
 | web-google core | 434K | 3.4M | 4.3296 | 4.0735 | **4.0288** | 5.0081 | K=1, w=8, Leiden+LLP, no-iv m4 |

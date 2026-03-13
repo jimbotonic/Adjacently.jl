@@ -28,7 +28,7 @@ function golomb_bits(v::T, k::Int) where {T<:Unsigned}
     io = IOBuffer()
     writer = BitWriter(io)
     write_golomb(writer, v, k)
-    nbits = writer.index - 1 # capture number of bits before flush resets it
+    nbits = writer.bits_in # capture number of bits before flush resets it
     flush_bitwriter(writer; flush_last_bits=true)
     seekstart(io)
     reader = BitReader(io)

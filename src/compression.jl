@@ -111,8 +111,47 @@ end
 @inline function _greedy_reset!(io::IOBuffer, w::BitWriter)
     truncate(io, 0)
     seek(io, 0)
-    w.index = 1
+    w.accum = UInt64(0)
+    w.bits_in = 0
     w.bit_count = 0
+end
+
+# Two-pointer overlap count on sorted vectors. O(|a|+|b|), zero allocation.
+@inline function _sorted_overlap_count(a::Vector{T}, b::Vector{T})::Int where {T}
+    count = 0
+    i = 1; j = 1
+    @inbounds while i <= length(a) && j <= length(b)
+        if a[i] == b[j]
+            count += 1; i += 1; j += 1
+        elseif a[i] < b[j]
+            i += 1
+        else
+            j += 1
+        end
+    end
+    return count
+end
+
+# Single-pass sorted merge producing copy bitmap + residual vector.
+# `bitmap` is resized to length(ref_nl), `residuals` is emptied and filled.
+function _sorted_merge_ref!(bitmap::Vector{Bool}, residuals::Vector{T},
+                            neighbors::Vector{T}, ref_nl::Vector{T}) where {T}
+    ref_len = length(ref_nl)
+    resize!(bitmap, ref_len)
+    empty!(residuals)
+    i = 1; j = 1
+    @inbounds while i <= length(neighbors) && j <= ref_len
+        if neighbors[i] == ref_nl[j]
+            bitmap[j] = true; i += 1; j += 1
+        elseif neighbors[i] < ref_nl[j]
+            push!(residuals, neighbors[i]); i += 1
+        else
+            bitmap[j] = false; j += 1
+        end
+    end
+    @inbounds while j <= ref_len; bitmap[j] = false; j += 1; end
+    @inbounds while i <= length(neighbors); push!(residuals, neighbors[i]); i += 1; end
+    return nothing
 end
 
 ################################################################################
@@ -970,42 +1009,35 @@ end
     write_fibonacci(w::BitWriter, n::T) where {T<:Unsigned}
 
 Write `n` using Fibonacci coding (with '1' stop bit), using precomputed FIB_NUMBERS.
+Zero-allocation: builds a UInt64 bitmask and writes via a single `write_value` call.
 """
 function write_fibonacci(w::BitWriter, n::T) where {T<:Unsigned}
     n == 0 && throw(ArgumentError("Fibonacci code undefined for 0"))
 
-    # find which Fibonacci numbers we need
-    selected_indices = Int[]
-    remaining = n
-    i = length(FIB_NUMBERS)
-
-    while i >= 1 && remaining > 0
+    # Greedy Fibonacci decomposition into a bitmask (bit i-1 ↔ FIB_NUMBERS[i])
+    code = UInt64(0)
+    max_idx = 0
+    remaining = UInt64(n)
+    @inbounds for i in length(FIB_NUMBERS):-1:1
         if FIB_NUMBERS[i] <= remaining
-            push!(selected_indices, i)
             remaining -= FIB_NUMBERS[i]
-            i -= 1  # skip next to avoid consecutive ones
+            code |= (UInt64(1) << (i - 1))
+            if i > max_idx; max_idx = i; end
+            remaining == 0 && break
         end
-        i -= 1
     end
 
-    # write bits in ascending order (index 1 first)
-    reverse!(selected_indices)
-    current_selected = 1
-    
-    for bit_pos in 1:length(FIB_NUMBERS)
-        if current_selected <= length(selected_indices) && selected_indices[current_selected] == bit_pos
-            write_bit(w, true)
-            current_selected += 1
-        else
-            write_bit(w, false)
-        end
-        
-        # if we've written all selected bits and the last bit was 1, we can add the stop bit
-        if current_selected > length(selected_indices) && !isempty(selected_indices) && selected_indices[end] == bit_pos
-            write_bit(w, true)  # stop bit
-            break
-        end
+    # Fibonacci code is written LSB-first: bit position 1 (FIB[1]) first, then 2, etc.
+    # followed by a '1' stop bit. write_value writes MSB-first, so we reverse.
+    # Build the MSB-first codeword: positions 0..max_idx-1 of `code`, then stop bit.
+    code_len = max_idx + 1   # including stop bit
+    msb_code = UInt64(0)
+    @inbounds for i in 0:(max_idx - 1)
+        msb_code = (msb_code << 1) | ((code >> i) & 1)
     end
+    msb_code = (msb_code << 1) | UInt64(1)  # stop bit '1'
+
+    write_value(w, msb_code, code_len)
 end
 
 """
@@ -2750,7 +2782,7 @@ const _FIXED_ENCODING = :fibonacci
 
 # Total bits written so far (bytes flushed to IO + buffered bits)
 @inline function _total_bits(w::BitWriter)
-    return Int(position(w.io)) * 8 + (w.index - 1)
+    return Int(position(w.io)) * 8 + w.bits_in
 end
 
 # Flattened Encoding Options (Type, MIL)
@@ -2759,6 +2791,9 @@ const ENCODING_OPTIONS = vcat(
     [(:rle, mil) for mil in MIL_OPTIONS],
     [(:delta, 0)]
 )
+
+# Max candidates for phase 2 of two-phase reference search
+const MAX_REF_CANDIDATES_PHASE2 = 8
 
 # Fixed MIL for adaptive header mode (intervals path)
 const ADAPTIVE_MIL = 4
@@ -4002,93 +4037,6 @@ function _estimate_base_cost(target::Vector{T}, ie::Symbol, mil::Int, enc_type::
     return 0
 end
 
-function _try_find_reference(neighbors::Vector{T}, neighbor_lists::Dict{T,Vector{T}},
-                                ref_window::Vector{T}, ie::Symbol, mil::Int, enc_type::Symbol= :interval; vertex_id=nothing, copy_blocks::Bool=false, adaptive_copy::Bool=false, fixwidth_ref::Bool=false, ref_dist_bits::Int=0, stop_deltas::Bool=false, bv_blocks::Bool=false, compact_copy::Bool=false, tight_intervals::Bool=false, buf::Union{GreedyCostBuffer,Nothing}=nothing, lr_split::Bool=false) where {T<:Unsigned}
-    ns = Set(neighbors)
-    best_cost = nothing
-    best_distance = nothing
-    best_bitmap = Bool[]
-    best_residuals = T[]
-
-    for (i, ref_v) in enumerate(ref_window)
-        ref_nl = get(neighbor_lists, ref_v, T[])
-        isempty(ref_nl) && continue
-
-        ref_neighbors_set = Set(ref_nl)
-        overlap = length(intersect(ns, ref_neighbors_set))
-        overlap < 1 && continue
-
-        copy_bitmap = Bool[n in ns for n in ref_nl]
-        residuals = sort(T[n for n in neighbors if !(n in ref_neighbors_set)])
-
-        distance = T(length(ref_window) - i + 1)
-        ref_cost = fixwidth_ref ? ref_dist_bits : estimate_encoded_value_cost(distance, ie)
-
-        if buf !== nothing
-            # Exact bit-counting: trial-encode copy to buffer, measure bits
-            _greedy_reset!(buf.io1, buf.w1)
-            if adaptive_copy && copy_blocks
-                _write_adaptive_copy(buf.w1, copy_bitmap, ie; bv_blocks=bv_blocks, compact_copy=compact_copy)
-            elseif copy_blocks
-                _write_copy_blocks(buf.w1, copy_bitmap, ie)
-            else
-                write_bitmap_adaptive(buf.w1, copy_bitmap, ie)
-            end
-            ref_cost += _total_bits(buf.w1)
-
-            # Exact residual cost
-            if !isempty(residuals)
-                _greedy_reset!(buf.io2, buf.w2)
-                if enc_type == :interval
-                    if lr_split
-                        _write_intervals_lr(buf.w2, residuals, ie, mil; vertex_id=vertex_id, tight_intervals=tight_intervals)
-                    else
-                        write_intervals_and_residuals(buf.w2, residuals, ie, mil; vertex_id=vertex_id, tight_intervals=tight_intervals)
-                    end
-                elseif enc_type == :delta
-                    if stop_deltas
-                        _write_stop_delta(buf.w2, residuals, ie; vertex_id=vertex_id)
-                    else
-                        write_encoded_value(buf.w2, T(length(residuals) + 1), ie)
-                        write_delta(buf.w2, residuals, ie; vertex_id=vertex_id)
-                    end
-                elseif enc_type == :rle
-                    write_encoded_value(buf.w2, T(length(residuals) + 1), ie)
-                    deltas = delta_encode_vector(residuals)
-                    write_hybrid_mix_encoded_list(buf.w2, deltas, ie, true, mil, false; vertex_id=vertex_id)
-                end
-                ref_cost += _total_bits(buf.w2)
-            end
-        else
-            # Estimation-based costing (original path)
-            if adaptive_copy && copy_blocks
-                ref_cost += _estimate_adaptive_copy_cost(copy_bitmap, ie; bv_blocks=bv_blocks, compact_copy=compact_copy)
-            elseif copy_blocks
-                ref_cost += _estimate_copy_blocks_cost(copy_bitmap, ie)
-            else
-                ref_cost += _estimate_adaptive_bitmap_cost(copy_bitmap, ie)
-            end
-
-            if !isempty(residuals)
-                ref_cost += _estimate_base_cost(residuals, ie, mil, enc_type; vertex_id=vertex_id, stop_deltas=stop_deltas, tight_intervals=tight_intervals, lr_split=lr_split)
-            end
-        end
-
-        if best_cost === nothing || ref_cost < best_cost
-            best_cost = ref_cost
-            best_distance = distance
-            best_bitmap = copy_bitmap
-            best_residuals = residuals
-        end
-    end
-
-    if best_distance === nothing
-        return nothing
-    end
-    return (best_distance, best_bitmap, best_residuals)
-end
-
-
 function _greedy_vertex_search(neighbors::Vector{T}, neighbor_lists::Dict{T,Vector{T}},
                                    ref_window::Vector{T}, ie::Symbol; vertex_id=nothing, copy_blocks::Bool=false, adaptive_copy::Bool=false, fixwidth_ref::Bool=false, ref_dist_bits::Int=0, stop_deltas::Bool=false, adaptive_deltas::Bool=false, split_residual::Bool=false, bv_blocks::Bool=false, compact_copy::Bool=false, tight_intervals::Bool=false, buf::Union{GreedyCostBuffer,Nothing}=nothing, lr_split::Bool=false, multi_ref::Bool=false, adaptive_header::Bool=false) where {T<:Unsigned}
     if isempty(neighbors)
@@ -4137,6 +4085,29 @@ function _greedy_vertex_search(neighbors::Vector{T}, neighbor_lists::Dict{T,Vect
         end
     end
 
+    # Helper: compute copy cost for a bitmap
+    @inline function _copy_cost(bmp::Vector{Bool})
+        if buf !== nothing
+            _greedy_reset!(buf.io1, buf.w1)
+            if adaptive_copy && copy_blocks
+                _write_adaptive_copy(buf.w1, bmp, ie; bv_blocks=bv_blocks, compact_copy=compact_copy)
+            elseif copy_blocks
+                _write_copy_blocks(buf.w1, bmp, ie)
+            else
+                write_bitmap_adaptive(buf.w1, bmp, ie)
+            end
+            return _total_bits(buf.w1)
+        else
+            if adaptive_copy && copy_blocks
+                return _estimate_adaptive_copy_cost(bmp, ie; bv_blocks=bv_blocks, compact_copy=compact_copy)
+            elseif copy_blocks
+                return _estimate_copy_blocks_cost(bmp, ie)
+            else
+                return _estimate_adaptive_bitmap_cost(bmp, ie)
+            end
+        end
+    end
+
     # Standard encoding options loop (always runs)
     # In adaptive header mode, only evaluate STOP-delta and intervals(ADAPTIVE_MIL)
     _enc_options = adaptive_header ? ADAPTIVE_ENCODING_OPTIONS : ENCODING_OPTIONS
@@ -4165,160 +4136,160 @@ function _greedy_vertex_search(neighbors::Vector{T}, neighbor_lists::Dict{T,Vect
                     best_res_enc_type = enc_type
                     best_res_mil = mil
                 end
-
-                if !isempty(ref_window) && length(neighbors) >= 1
-                    ref_header = _vlc_header_cost(:reference, enc_type, mil; adaptive=adaptive_header)
-                    ref_res = _try_find_reference(neighbors, neighbor_lists, ref_window, ie, mil, enc_type; vertex_id=vertex_id, copy_blocks=copy_blocks, adaptive_copy=adaptive_copy, fixwidth_ref=fixwidth_ref, ref_dist_bits=ref_dist_bits, stop_deltas=use_stop, bv_blocks=bv_blocks, compact_copy=compact_copy, tight_intervals=tight_intervals, buf=buf, lr_split=lr_split)
-                    if ref_res !== nothing
-                        dist, bmp, res = ref_res
-                        base_ref_c = ref_header + (fixwidth_ref ? ref_dist_bits : estimate_encoded_value_cost(dist, ie))
-                        if buf !== nothing
-                            _greedy_reset!(buf.io1, buf.w1)
-                            if adaptive_copy && copy_blocks
-                                _write_adaptive_copy(buf.w1, bmp, ie; bv_blocks=bv_blocks, compact_copy=compact_copy)
-                            elseif copy_blocks
-                                _write_copy_blocks(buf.w1, bmp, ie)
-                            else
-                                write_bitmap_adaptive(buf.w1, bmp, ie)
-                            end
-                            base_ref_c += _total_bits(buf.w1)
-                        else
-                            if adaptive_copy && copy_blocks
-                                base_ref_c += _estimate_adaptive_copy_cost(bmp, ie; bv_blocks=bv_blocks, compact_copy=compact_copy)
-                            elseif copy_blocks
-                                base_ref_c += _estimate_copy_blocks_cost(bmp, ie)
-                            else
-                                base_ref_c += _estimate_adaptive_bitmap_cost(bmp, ie)
-                            end
-                        end
-
-                        res_options = split_residual ? ENCODING_OPTIONS : [(enc_type, mil)]
-                        for (res_et, res_mil) in res_options
-                            res_use_stop = res_et == :delta ? use_stop : false
-                            res_c = base_ref_c
-                            if !isempty(res)
-                                res_c += _cost_for_list(res, res_mil, res_et, res_use_stop)
-                            end
-                            if split_residual
-                                if res_et == enc_type && (res_mil == mil || res_et == :delta)
-                                    res_c += 1
-                                else
-                                    res_c += 5
-                                end
-                            end
-                            res_c += flag_cost
-
-                            if res_c < best_cost
-                                best_cost = res_c
-                                best_ref_mode = :reference
-                                best_mil = mil
-                                best_enc_type = enc_type
-                                best_ref_result = ref_res
-                                best_use_stop = use_stop
-                                best_res_enc_type = res_et
-                                best_res_mil = res_mil
-                            end
-                        end
-                    end
-                end
             end
         end
 
-    # ── Multi-reference search ─────────────────────────────────────────────
-    # Try all top-K ref1 candidates paired with all window ref2 candidates.
-    # The optimal (ref1, ref2) pair may not include the best single ref.
-    if multi_ref && !adaptive_header && !isempty(ref_window) && length(neighbors) >= 6
-        ns = Set(neighbors)
-
-        # Helper: estimate copy cost for a bitmap
-        @inline function _copy_cost_est(bmp::Vector{Bool})
-            if adaptive_copy && copy_blocks
-                return _estimate_adaptive_copy_cost(bmp, ie; bv_blocks=bv_blocks, compact_copy=compact_copy)
-            elseif copy_blocks
-                return _estimate_copy_blocks_cost(bmp, ie)
-            else
-                return _estimate_adaptive_bitmap_cost(bmp, ie)
-            end
-        end
-
-        # Collect ref1 candidates: (distance, bitmap, residuals, overlap, ref1_base_cost)
-        ref1_candidates = Vector{Tuple{T, Vector{Bool}, Vector{T}, Int, Int}}()
-
+    # ── Two-phase reference search ─────────────────────────────────────────
+    if !isempty(ref_window) && length(neighbors) >= 1
+        # Phase 1: cheap overlap screening for all candidates
+        overlap_candidates = Vector{Tuple{Int,Vector{T},T}}()  # (overlap, ref_nl, distance)
         for (i, ref_v) in enumerate(ref_window)
             ref_nl = get(neighbor_lists, ref_v, T[])
             isempty(ref_nl) && continue
-            ref_set = Set(ref_nl)
-            overlap = length(intersect(ns, ref_set))
-            overlap < 1 && continue
-
-            copy_bitmap = Bool[n in ns for n in ref_nl]
-            residuals = sort(T[n for n in neighbors if !(n in ref_set)])
+            ov = _sorted_overlap_count(neighbors, ref_nl)
+            ov < 1 && continue
             distance = T(length(ref_window) - i + 1)
-
-            dist_cost = fixwidth_ref ? ref_dist_bits : estimate_encoded_value_cost(distance, ie)
-            ref1_base = dist_cost + _copy_cost_est(copy_bitmap)
-
-            push!(ref1_candidates, (distance, copy_bitmap, residuals, overlap, ref1_base))
+            push!(overlap_candidates, (ov, ref_nl, distance))
         end
 
-        # Sort by overlap descending, take top-K
-        sort!(ref1_candidates, by=x -> x[4], rev=true)
-        top_k = min(length(ref1_candidates), 5)
+        # Sort by overlap descending, take top-K for full evaluation
+        sort!(overlap_candidates, by=x -> x[1], rev=true)
+        phase2_k = min(length(overlap_candidates), MAX_REF_CANDIDATES_PHASE2)
 
-        best_multi_cost = best_cost  # must beat current best (single-ref or no-ref)
-        best_multi_result = nothing
-        best_multi_enc_type = best_enc_type
-        best_multi_mil = best_mil
-        best_multi_use_stop = best_use_stop
+        # Pre-allocated workspace for merge
+        _merge_bmp = Bool[]
+        _merge_res = T[]
 
-        for k in 1:top_k
-            dist1, bmp1, res1, _, ref1_base = ref1_candidates[k]
-            length(res1) < 3 && continue
-            ns_res = Set(res1)
+        # Phase 2: full evaluation of top-K candidates
+        for ci in 1:phase2_k
+            _, ref_nl, distance = overlap_candidates[ci]
+            _sorted_merge_ref!(_merge_bmp, _merge_res, neighbors, ref_nl)
 
-            for (j, ref2_v) in enumerate(ref_window)
-                ref2_nl = get(neighbor_lists, ref2_v, T[])
-                isempty(ref2_nl) && continue
-                ref2_set = Set(ref2_nl)
-                overlap2 = length(intersect(ns_res, ref2_set))
-                overlap2 < 3 && continue
+            # Copy cost (computed once per candidate)
+            dist_cost = fixwidth_ref ? ref_dist_bits : estimate_encoded_value_cost(distance, ie)
+            copy_c = _copy_cost(_merge_bmp)
 
-                copy_bmp2 = Bool[n in ns_res for n in ref2_nl]
-                residuals2 = sort(T[n for n in res1 if !(n in ref2_set)])
-                dist2 = T(length(ref_window) - j + 1)
+            # Save bitmap/residuals for potential best update (copy once)
+            bmp_snapshot = copy(_merge_bmp)
+            res_snapshot = copy(_merge_res)
 
-                ref2_dist_cost = fixwidth_ref ? ref_dist_bits : estimate_encoded_value_cost(dist2, ie)
-                ref2_copy_cost = _copy_cost_est(copy_bmp2)
+            for (enc_type, mil) in _enc_options
+                delta_variants = if adaptive_deltas && enc_type == :delta
+                    [(false, true), (true, true)]
+                else
+                    [(stop_deltas, false)]
+                end
 
-                # Try each encoding for residuals
-                for (enc_type, mil) in ENCODING_OPTIONS
-                    use_stop = (enc_type == :delta) ? stop_deltas : false
-                    multi_header = _vlc_header_cost(:multi_ref, enc_type, mil)
-                    total = multi_header + ref1_base + ref2_dist_cost + ref2_copy_cost
-                    if !isempty(residuals2)
-                        total += _cost_for_list(residuals2, mil, enc_type, use_stop)
-                    end
+                for (use_stop, is_adaptive) in delta_variants
+                    flag_cost = is_adaptive ? 1 : 0
+                    ref_header = _vlc_header_cost(:reference, enc_type, mil; adaptive=adaptive_header)
+                    actual_stop = adaptive_header ? true : use_stop
+                    base_ref_c = ref_header + dist_cost + copy_c
 
-                    if total < best_multi_cost
-                        best_multi_cost = total
-                        best_multi_result = (dist1, bmp1, dist2, copy_bmp2, residuals2)
-                        best_multi_enc_type = enc_type
-                        best_multi_mil = mil
-                        best_multi_use_stop = use_stop
+                    res_options = split_residual ? ENCODING_OPTIONS : [(enc_type, mil)]
+                    for (res_et, res_mil) in res_options
+                        res_use_stop = res_et == :delta ? actual_stop : false
+                        res_c = base_ref_c
+                        if !isempty(res_snapshot)
+                            res_c += _cost_for_list(res_snapshot, res_mil, res_et, res_use_stop)
+                        end
+                        if split_residual
+                            if res_et == enc_type && (res_mil == mil || res_et == :delta)
+                                res_c += 1
+                            else
+                                res_c += 5
+                            end
+                        end
+                        res_c += flag_cost
+
+                        if res_c < best_cost
+                            best_cost = res_c
+                            best_ref_mode = :reference
+                            best_mil = mil
+                            best_enc_type = enc_type
+                            best_ref_result = (distance, bmp_snapshot, res_snapshot)
+                            best_use_stop = use_stop
+                            best_res_enc_type = res_et
+                            best_res_mil = res_mil
+                        end
                     end
                 end
             end
         end
 
-        if best_multi_result !== nothing
-            best_cost = best_multi_cost
-            best_ref_mode = :multi_ref
-            best_ref_result = best_multi_result
-            best_enc_type = best_multi_enc_type
-            best_mil = best_multi_mil
-            best_use_stop = best_multi_use_stop
-            best_res_enc_type = best_multi_enc_type
-            best_res_mil = best_multi_mil
+        # ── Multi-reference search ─────────────────────────────────────────
+        if multi_ref && !adaptive_header && length(neighbors) >= 6
+            # Reuse phase 1 overlap data for ref1 top-5 selection
+            top_k1 = min(length(overlap_candidates), 5)
+
+            # Build ref1 candidates with full merge data
+            ref1_data = Vector{Tuple{T, Vector{Bool}, Vector{T}, Int}}()  # (dist, bmp, res, base_cost)
+            for k in 1:top_k1
+                _, ref_nl, dist1 = overlap_candidates[k]
+                _sorted_merge_ref!(_merge_bmp, _merge_res, neighbors, ref_nl)
+                length(_merge_res) < 3 && continue
+                bmp1 = copy(_merge_bmp)
+                res1 = copy(_merge_res)
+                d_cost = fixwidth_ref ? ref_dist_bits : estimate_encoded_value_cost(dist1, ie)
+                ref1_base = d_cost + _copy_cost(bmp1)
+                push!(ref1_data, (dist1, bmp1, res1, ref1_base))
+            end
+
+            best_multi_cost = best_cost
+            best_multi_result = nothing
+            best_multi_enc_type = best_enc_type
+            best_multi_mil = best_mil
+            best_multi_use_stop = best_use_stop
+
+            _merge_bmp2 = Bool[]
+            _merge_res2 = T[]
+
+            for (dist1, bmp1, res1, ref1_base) in ref1_data
+                # Phase 1 for ref2: overlap with res1 (already sorted)
+                for (i, ref_v) in enumerate(ref_window)
+                    ref2_nl = get(neighbor_lists, ref_v, T[])
+                    isempty(ref2_nl) && continue
+                    ov2 = _sorted_overlap_count(res1, ref2_nl)
+                    ov2 < 3 && continue
+
+                    _sorted_merge_ref!(_merge_bmp2, _merge_res2, res1, ref2_nl)
+                    dist2 = T(length(ref_window) - i + 1)
+
+                    ref2_dist_cost = fixwidth_ref ? ref_dist_bits : estimate_encoded_value_cost(dist2, ie)
+                    ref2_copy_cost = _copy_cost(_merge_bmp2)
+
+                    bmp2_snap = copy(_merge_bmp2)
+                    res2_snap = copy(_merge_res2)
+
+                    for (enc_type, mil) in ENCODING_OPTIONS
+                        use_stop = (enc_type == :delta) ? stop_deltas : false
+                        multi_header = _vlc_header_cost(:multi_ref, enc_type, mil)
+                        total = multi_header + ref1_base + ref2_dist_cost + ref2_copy_cost
+                        if !isempty(res2_snap)
+                            total += _cost_for_list(res2_snap, mil, enc_type, use_stop)
+                        end
+
+                        if total < best_multi_cost
+                            best_multi_cost = total
+                            best_multi_result = (dist1, bmp1, dist2, bmp2_snap, res2_snap)
+                            best_multi_enc_type = enc_type
+                            best_multi_mil = mil
+                            best_multi_use_stop = use_stop
+                        end
+                    end
+                end
+            end
+
+            if best_multi_result !== nothing
+                best_cost = best_multi_cost
+                best_ref_mode = :multi_ref
+                best_ref_result = best_multi_result
+                best_enc_type = best_multi_enc_type
+                best_mil = best_multi_mil
+                best_use_stop = best_multi_use_stop
+                best_res_enc_type = best_multi_enc_type
+                best_res_mil = best_multi_mil
+            end
         end
     end
 
@@ -4426,11 +4397,9 @@ function _cs_vertex_search(neighbors::Vector{T}, neighbor_lists::Dict{T,Vector{T
     best_ref_result = nothing
     best_use_stop = false
 
+    # No-ref evaluation
     for (enc_type, mil) in ENCODING_OPTIONS
-        # Always use stop_deltas for :delta enc_type
         use_stop = enc_type == :delta
-
-        # Base cost (no reference) — include CS header cost
         noref_header = _cs_header_cost(:none, enc_type, mil, false)
         base_cost = noref_header + _estimate_base_cost(neighbors, ie, mil, enc_type;
             vertex_id=vertex_id, stop_deltas=use_stop, tight_intervals=tight_intervals,
@@ -4444,21 +4413,44 @@ function _cs_vertex_search(neighbors::Vector{T}, neighbor_lists::Dict{T,Vector{T
             best_ref_result = nothing
             best_use_stop = use_stop
         end
+    end
 
-        # Reference cost — include CS header cost
-        if !isempty(ref_window) && length(neighbors) >= 1
-            ref_header = _cs_header_cost(:reference, enc_type, mil, false)
-            ref_res = _try_find_reference(neighbors, neighbor_lists, ref_window, ie, mil, enc_type;
-                vertex_id=vertex_id, copy_blocks=true, adaptive_copy=true,
-                fixwidth_ref=fixwidth_ref, ref_dist_bits=ref_dist_bits,
-                stop_deltas=use_stop, compact_copy=compact_copy, tight_intervals=tight_intervals,
-                lr_split=lr_split)
-            if ref_res !== nothing
-                dist, bmp, res = ref_res
-                ref_c = ref_header + (fixwidth_ref ? ref_dist_bits : estimate_encoded_value_cost(dist, ie))
-                ref_c += _estimate_adaptive_copy_cost(bmp, ie; compact_copy=compact_copy)
-                if !isempty(res)
-                    ref_c += _estimate_base_cost(res, ie, mil, enc_type;
+    # ── Two-phase reference search ─────────────────────────────────────
+    if !isempty(ref_window) && length(neighbors) >= 1
+        # Phase 1: cheap overlap screening
+        overlap_candidates = Vector{Tuple{Int,Vector{T},T}}()
+        for (i, ref_v) in enumerate(ref_window)
+            ref_nl = get(neighbor_lists, ref_v, T[])
+            isempty(ref_nl) && continue
+            ov = _sorted_overlap_count(neighbors, ref_nl)
+            ov < 1 && continue
+            distance = T(length(ref_window) - i + 1)
+            push!(overlap_candidates, (ov, ref_nl, distance))
+        end
+
+        sort!(overlap_candidates, by=x -> x[1], rev=true)
+        phase2_k = min(length(overlap_candidates), MAX_REF_CANDIDATES_PHASE2)
+
+        _merge_bmp = Bool[]
+        _merge_res = T[]
+
+        # Phase 2: full evaluation of top-K candidates
+        for ci in 1:phase2_k
+            _, ref_nl, distance = overlap_candidates[ci]
+            _sorted_merge_ref!(_merge_bmp, _merge_res, neighbors, ref_nl)
+
+            dist_cost = fixwidth_ref ? ref_dist_bits : estimate_encoded_value_cost(distance, ie)
+            copy_c = _estimate_adaptive_copy_cost(_merge_bmp, ie; compact_copy=compact_copy)
+
+            bmp_snapshot = copy(_merge_bmp)
+            res_snapshot = copy(_merge_res)
+
+            for (enc_type, mil) in ENCODING_OPTIONS
+                use_stop = enc_type == :delta
+                ref_header = _cs_header_cost(:reference, enc_type, mil, false)
+                ref_c = ref_header + dist_cost + copy_c
+                if !isempty(res_snapshot)
+                    ref_c += _estimate_base_cost(res_snapshot, ie, mil, enc_type;
                         vertex_id=vertex_id, stop_deltas=use_stop, tight_intervals=tight_intervals,
                         lr_split=lr_split)
                 end
@@ -4468,7 +4460,7 @@ function _cs_vertex_search(neighbors::Vector{T}, neighbor_lists::Dict{T,Vector{T
                     best_ref_mode = :reference
                     best_mil = mil
                     best_enc_type = enc_type
-                    best_ref_result = ref_res
+                    best_ref_result = (distance, bmp_snapshot, res_snapshot)
                     best_use_stop = use_stop
                 end
             end

@@ -43,127 +43,142 @@ export BitWriter,
 	load_triangles
 
 ################################################################################
-# BitWriter
+# BitWriter — UInt64-accumulator implementation
+#
+# Bits are packed MSB-first into a 64-bit accumulator (right-aligned: the
+# first bit written occupies the highest position, the most recent bit is
+# at position 0).  When the accumulator fills to 64 bits it is flushed to
+# the underlying IO as 8 big-endian bytes via hton.
 ################################################################################
 
 """
     BitWriter
 
-writer for bits
+High-performance bit writer using a UInt64 accumulator.
+Bits are written MSB-first (big-endian bit order).
 """
 mutable struct BitWriter
     io::Base.IO
-    buffer::Vector{Bool}
-    index::Int  # next bit to write in buffer
-    bit_count::Int64 # total bits written
+    accum::UInt64      # accumulator — bits packed right-aligned, MSB-first
+    bits_in::Int       # number of valid bits in accum (0–63)
+    bit_count::Int64   # total bits written since creation / last reset
 end
 
 """
     BitWriter(io::Base.IO; capacity=4096*8)
 
-constructor for BitWriter
-
-@param io::Base.IO: The io to write to
-@param capacity::Int: The capacity of the buffer
+Construct a BitWriter that writes to `io`.
+The `capacity` parameter is accepted for API compatibility but unused.
 """
 function BitWriter(io::Base.IO; capacity=BUFFER_SIZE*8)
-    BitWriter(io, Vector{Bool}(undef, capacity), 1, 0)
+    BitWriter(io, UInt64(0), 0, 0)
+end
+
+# Flush all 64 accumulator bits to IO as 8 big-endian bytes.
+@inline function _flush_accum(w::BitWriter)
+    write(w.io, hton(w.accum))
+    w.accum = UInt64(0)
+    w.bits_in = 0
 end
 
 """
     write_bit(writer::BitWriter, bit::Bool)
 
-write a bit to the writer
-
-@param writer::BitWriter: The bit writer to write to
-@param bit::Bool: The bit to write
+Write a single bit to the writer.
 """
-function write_bit(writer::BitWriter, bit::Bool)
-    writer.buffer[writer.index] = bit
-    writer.index += 1
-    writer.bit_count += 1
-    if writer.index > length(writer.buffer)
-        flush_bitwriter(writer)
+@inline function write_bit(w::BitWriter, bit::Bool)
+    w.accum = (w.accum << 1) | UInt64(bit)
+    w.bits_in += 1
+    w.bit_count += 1
+    if w.bits_in == 64
+        _flush_accum(w)
     end
 end
 
 """
     write_bits(writer::BitWriter, bits::Vector{Bool})
 
-write bits to the writer
-
-@param writer::BitWriter: The bit writer to write to
-@param bits::Vector{Bool}: The bits to write
+Write a vector of bits to the writer.
 """
-function write_bits(writer::BitWriter, bits::Vector{Bool})
-    for bit in bits
-        write_bit(writer, bit)
+function write_bits(w::BitWriter, bits::Vector{Bool})
+    @inbounds for bit in bits
+        write_bit(w, bit)
     end
 end
 
 """
     write_value(writer::BitWriter, value::T, n::Int) where {T<:Unsigned}
 
-write a value to the writer
-
-@param writer::BitWriter: the bit writer to write to
-@param value::UInt: the value to write
-@param n::Int: the number of bits to write
+Write the lowest `n` bits of `value` in MSB-first order.
 """
-function write_value(writer::BitWriter, value::T, n::Int) where {T<:Unsigned}
-    for i in (n-1):-1:0
-        write_bit(writer, ((value >> i) & 1) == 1)
+@inline function write_value(w::BitWriter, value::T, n::Int) where {T<:Unsigned}
+    n == 0 && return
+    v = UInt64(value)
+    total = w.bits_in + n
+    w.bit_count += n
+    if total <= 64
+        # Fast path: everything fits in the accumulator
+        w.accum = (w.accum << n) | v
+        w.bits_in = total
+        if total == 64
+            _flush_accum(w)
+        end
+    else
+        # Split across accumulator boundary
+        first_n = 64 - w.bits_in
+        w.accum = (w.accum << first_n) | (v >> (n - first_n))
+        write(w.io, hton(w.accum))
+        rest = n - first_n
+        w.accum = v & ((UInt64(1) << rest) - 1)
+        w.bits_in = rest
     end
 end
 
 """
     write_bytes(writer::BitWriter, bytes::Vector{UInt8})
 
-write bytes to the writer
-
-@param writer::BitWriter: the bit writer to write to
-@param bytes::Vector{UInt8}: the bytes to write
+Write a vector of bytes to the writer (8 bits each, MSB-first).
 """
-function write_bytes(writer::BitWriter, bytes::Vector{UInt8})
-    for byte in bytes
-        write_value(writer, byte, 8)
+function write_bytes(w::BitWriter, bytes::Vector{UInt8})
+    @inbounds for byte in bytes
+        write_value(w, byte, 8)
     end
 end
 
 """
     flush_bitwriter(writer::BitWriter; flush_last_bits::Bool = false)
 
-flush the writer to the io
-
-@param writer::BitWriter: the bit writer to flush
-@param flush_last_bits::Bool: whether to flush the last padded byte
+Flush buffered bits to the underlying IO stream.
+Full bytes are always written. If `flush_last_bits` is true, the final
+partial byte is zero-padded on the right and written as well.
 """
-function flush_bitwriter(writer::BitWriter; flush_last_bits::Bool = false)	
-    n = writer.index - 1  # total valid bits
-    full_bytes = div(n, 8)
-    remaining_bits = n % 8
+function flush_bitwriter(w::BitWriter; flush_last_bits::Bool = false)
+    w.bits_in == 0 && return
 
-    # write full bytes
-    for i in 1:8:(full_bytes * 8)
-        byte = UInt8(0)
-        for j in 0:7
-            byte |= UInt8(writer.buffer[i + j] ? 1 : 0) << (7 - j)
-        end
-        write(writer.io, byte)
+    # Left-align the valid bits for byte extraction
+    aligned = w.accum << (64 - w.bits_in)
+    full_bytes = w.bits_in >> 3          # div by 8
+    remaining_bits = w.bits_in & 7       # mod 8
+
+    # Write full bytes from the left-aligned value
+    for i in 0:(full_bytes - 1)
+        write(w.io, UInt8((aligned >> (56 - 8 * i)) & 0xff))
     end
 
-    # optionally flush last padded byte
     if flush_last_bits && remaining_bits > 0
-        byte = UInt8(0)
-        offset = full_bytes * 8
-        for j in 0:(remaining_bits - 1)
-            byte |= UInt8(writer.buffer[offset + j + 1] ? 1 : 0) << (7 - j)
+        # Write zero-padded last byte
+        write(w.io, UInt8((aligned >> (56 - 8 * full_bytes)) & 0xff))
+        w.accum = UInt64(0)
+        w.bits_in = 0
+    else
+        # Keep remaining bits (right-aligned in accum)
+        if remaining_bits > 0
+            w.accum = w.accum & ((UInt64(1) << remaining_bits) - 1)
+        else
+            w.accum = UInt64(0)
         end
-        # remaining low bits stay 0 (padding)
-        write(writer.io, byte)
+        w.bits_in = remaining_bits
     end
-
-    writer.index = 1  # reset buffer
 end
 
 ################################################################################

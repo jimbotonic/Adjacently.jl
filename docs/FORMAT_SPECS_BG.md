@@ -534,7 +534,7 @@ Best BG BPE across all tested datasets:
 | Dataset | BG BPE | CG BPE | CS BPE | BV BPE | BG Config |
 |---------|---------|---------|--------|--------|------------|
 | cnr-2000 (no reorder) | 2.4929 | **2.3191** | 2.4348 | 2.898 | w=64, lr+mr |
-| cnr-2000 (Leiden+LLP) | 2.3258 | 2.5652 | **2.3042** | 3.2335 | w=64, no-lr, mr |
+| cnr-2000 (Leiden+LLP) | **2.3258** | 2.5652 | 2.3643 | 3.2335 | w=64, no-lr, mr |
 | in-2004 | 1.895 | **1.7513** | 1.7839 | 2.172 | w=64, lr+mr |
 | web-google core (Leiden+LLP) | 4.0735 | 4.3296 | **4.0288** | 5.0081 | w=64, no-lr, mr |
 | web-google rcore (Leiden+LLP) | 3.7626 | 3.9359 | **3.7337** | 4.1751 | w=64, no-lr, mr |

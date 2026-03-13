@@ -24,7 +24,7 @@ function unary_bits(v::T, invert::Bool = false) where {T<:Unsigned}
     io = IOBuffer()
     writer = BitWriter(io)
     write_unary_coding(writer, v, invert)
-    nbits = writer.index - 1 # capture number of bits before flush resets it
+    nbits = writer.bits_in # capture number of bits before flush resets it
     flush_bitwriter(writer; flush_last_bits=true)
     seekstart(io)
     reader = BitReader(io)
@@ -40,7 +40,7 @@ function truncated_binary_bits(v::T, n::Int) where {T<:Unsigned}
     io = IOBuffer()
     writer = BitWriter(io)
     write_truncated_binary_coding(writer, v, n)
-    nbits = writer.index - 1 # capture number of bits before flush resets it
+    nbits = writer.bits_in # capture number of bits before flush resets it
     flush_bitwriter(writer; flush_last_bits=true)
     seekstart(io)
     reader = BitReader(io)
@@ -56,7 +56,7 @@ function zeta_bits(v::T, k::Int) where {T<:Unsigned}
     io = IOBuffer()
     writer = BitWriter(io)
     write_zeta_coding(writer, v, k)
-    nbits = writer.index - 1 # capture number of bits before flush resets it
+    nbits = writer.bits_in # capture number of bits before flush resets it
     flush_bitwriter(writer; flush_last_bits=true)
     seekstart(io)
     reader = BitReader(io)

@@ -67,8 +67,7 @@ const ALG_HUFFMAN    = 0x01
 const ALG_BG        = 0x02   # BG with recommended defaults
 const ALG_CS         = 0x03   # CS with recommended defaults
 const ALG_CG        = 0x04   # CG with recommended defaults
-const ALG_ASTRA      = 0x05
-# 0x06–0x0F reserved
+# 0x05–0x0F reserved
 
 # Parameter ranges: algorithm + explicit params
 const PARAM_BG_BASE = 0x10   # BG + params (64 slots: 0x10–0x4F)
@@ -368,9 +367,7 @@ export write_mgs3_graph,
        load_mgs3_graph,
        load_compressed_mgs3_graph,
        write_huffman_compressed_mgs3_graph,
-	   write_complex_encoded_compressed_mgs3_graph,
 	   load_huffman_compressed_mgs3_graph,
-	   load_complex_encoded_compressed_mgs3_graph,
 	   load_greedy_mgs3_graph,
 	   write_bg_mgs3_graph,
 	   write_cs_mgs3_graph,
@@ -657,36 +654,18 @@ Supported encoding schemes:
 
 Supported compression types:
 - :huffman - Huffman coding (default)
-- :complex - complex encoding (delta + mix + reference + recursive reference)
-
-Supported integer encodings:
-- :elias_gamma - Elias gamma coding
-- :elias_delta - Elias delta coding
-- :golomb - Golomb coding
-- :fibonacci - Fibonacci coding
-- :zeta - Zeta coding
-- :fed - Fibonacci+Elias Delta hybrid coding
-
-Supported complex encoding options:
-- :delta - delta encoding only
-- :mix - mix encoding (run-length + interval)
-- :hybrid - hybrid encoding (delta + mix + reference only)
-- :hybrid+ - hybrid+ encoding (delta + mix + recursive reference)
 
 @returns nothing
 """
 function write_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, coding_scheme::Symbol=:children, compression::Symbol=:huffman, integer_encoding::Symbol=:fibonacci, use_mix_mode::Bool=true, reference_enabled::Bool=true, recursive_reference::Bool=true, ref_window_size::Int=1024) where {T<:Unsigned}
 	# supported compression
-	supported_compressions = [:huffman, :complex]
-	supported_complex_options = [:delta, :mix, :hybrid, :hybrid_plus]
+	supported_compressions = [:huffman]
 	supported_integer_encodings = [:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta, :fed]
 
 	if compression == :huffman
         write_huffman_compressed_mgs3_graph(g, filename, coding_scheme)
-    elseif compression == :complex
-        write_complex_encoded_compressed_mgs3_graph(g, filename, coding_scheme, integer_encoding, use_mix_mode, reference_enabled, recursive_reference, ref_window_size)
     else
-        error("Unsupported compression scheme: $compression. Supported schemes are :huffman, :complex")
+        error("Unsupported compression scheme: $compression. Supported schemes are :huffman")
     end
 end
 
@@ -863,91 +842,6 @@ function write_huffman_compressed_mgs3_graph(g::AbstractGraph{T}, filename::Abst
 	b = 0xff
 	write(f, b >> sp)
 
-	close(f)
-end
-
-################################################################################
-# Complex-encoding (delta + run-length + interval + recursive reference) + variable length encoding of MGS v3 graph
-################################################################################
-
-"""
-    write_complex_encoded_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, coding_scheme::Symbol=:children, compression::Symbol=:elias_delta) where {T<:Unsigned}
-
-Write graph in a compressed MGS v3 format (Complex-encoding (delta + run-length + interval + recursive reference) + variable length encoding)
-
-Parameters:
-- g: Input graph
-- filename: Output filename
-- encoding: Coding scheme (:children for children section only, :index for index+children sections)
-- compression: Compression scheme to use (default: :elias_delta)
-- use_mix_mode: Whether to use mix mode (default: true)
-- reference_enabled: Whether to enable reference encoding (default: true)
-- recursive_reference: Whether to enable recursive reference encoding (default: true)
-
-@returns nothing
-"""
-function write_complex_encoded_compressed_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString, coding_scheme::Symbol=:children, integer_encoding::Symbol=:elias_delta, use_mix_mode::Bool=true, reference_enabled::Bool=true, recursive_reference::Bool=true, ref_window_size::Int=1024) where {T<:Unsigned}
-	# Header format: see MGS_HEADER.md
-	vs = vertices(g)
-	# number of vertices
-	gs = convert(UInt64, length(vs))
-
-	# if the graph has more than 2^40-1 vertices, `T` should be `UInt64`
-	if gs > MGS_MAX_SIZE
-		error("Input graph cannot have more than 2^40-1 vertices")
-	end
-
-	# `n_bits_v` is the number of bits needed to represent the graph vertices
-	n_bits_v = convert(UInt8, ceil(log(2, gs)))
-	# Get appropriate custom UInt type based on number of bits needed
-	V = infer_uint_custom_type(n_bits_v)
-
-	# Create header using new format
-	# Header: 'MGS' (3 bytes) + major/minor version (2 bytes) + flags (2 bytes) + vertices (5 bytes)
-	
-	# ASTRA uses ALG_ASTRA algorithm ID
-	option_flags = UInt8(ALG_ASTRA)
-
-	# Create flag bytes
-	flag_byte1, flag_byte2 = create_header_flags(:directed, coding_scheme, integer_encoding, option_flags)
-
-	# Construct 12-byte header
-	header_bytes = UInt8[
-		# 'MGS' signature (3 bytes)
-		0x4d, 0x47, 0x53,
-		# Major version = 3, Minor version = 2 (2 bytes)
-		0x03, 0x02,
-		# Flag bytes (2 bytes) 
-		flag_byte1, flag_byte2,
-		# Number of vertices (5 bytes, little-endian UInt40)
-		(gs & 0xff), ((gs >> 8) & 0xff), ((gs >> 16) & 0xff), ((gs >> 24) & 0xff), ((gs >> 32) & 0xff)
-	]
-
-	# create the output file (with extension .mgz)
-	f = open(filename * ".mgz", "w")
-
-	# create a bitwriter
-	bw = BitWriter(f)
-
-	@info("writing header section (new format)")
-	### write header (12 bytes total)
-	# Write all header bytes at once
-	write_bytes(bw, header_bytes)
-
-	# Build neighbor lists from graph for write_compressed_graph_data
-	neighbor_lists = Dict{V,Vector{V}}()
-	for v in vs
-		ovs = outneighbors(g, v)
-		neighbor_lists[convert(V, v)] = [convert(V, o) for o in ovs]
-	end
-
-	# Use the comprehensive write_compressed_graph_data function
-	# This handles mix encoding (delta + run-length) with reference encoding
-	@info("writing compressed graph data using write_compressed_graph_data")
-	write_compressed_graph_data(bw, neighbor_lists, coding_scheme, integer_encoding, use_mix_mode, reference_enabled, recursive_reference, ref_window_size)
-
-	# flush the bitwriter and close the file
-	flush_bitwriter(bw; flush_last_bits=true)
 	close(f)
 end
 
@@ -1241,8 +1135,6 @@ function load_compressed_mgs3_graph(filename::AbstractString)
 			ref_window_size=p.ref_window_size, lr_split=p.lr_split)
 	elseif byte2 == ALG_CG
 		load_cg_mgs3_graph(f, graph_type, gs; params=_cg_default_params(), coding_scheme=encoding)
-	elseif byte2 == ALG_ASTRA
-		error("ASTRA loader not yet implemented")
 	elseif byte2 <= 0x0F
 		error("Reserved algorithm ID: 0x$(string(byte2, base=16, pad=2))")
 	# Parameter ranges (0x10–0xFF)
@@ -1390,56 +1282,6 @@ function load_huffman_compressed_mgs3_graph(io::IO, graph_type::Symbol, encoding
 		end
 	end
 	close(io)
-	return g
-end
-
-"""
-    load_complex_encoded_compressed_mgs3_graph(io::IO, graph_type::Symbol, encoding::Symbol, gs::UInt64, compression::Symbol)
-
-Load graph in compressed MGS v3 format (Complex-encoding (delta + run-length + interval + recursive reference) + variable length encoding)
-
-Parameters:
-- io: Input stream
-- graph_type: Graph type (:directed or :undirected)
-- coding_scheme: Coding scheme (:children or :index)
-- gs: Number of vertices
-- integer_encoding: Integer encoding (:elias_delta, :fibonacci, :zeta, :fed)
-- use_mix_mode: Whether to use mix mode (default: true)
-- reference_enabled: Whether to enable reference encoding (default: true)
-
-@returns a graph loaded with the compression scheme specified in the header.
-"""
-function load_complex_encoded_compressed_mgs3_graph(io::IO, graph_type::Symbol, coding_scheme::Symbol, gs::UInt64, integer_encoding::Symbol)
-	# `n_size_u` is the number of bits needed to represent the graph vertices
-	n_bits_v = convert(UInt8, ceil(log(2, gs)))
-	# Get appropriate unsigned int type based on number of bits needed
-	V = infer_uint_custom_type(n_bits_v)
-	
-	# Initialize graph according to graph type
-	g = graph_type == :directed ? SimpleDiGraph{V}() : SimpleGraph{V}()
-	
-	@info("generating graph")
-	@info("adding vertices")
-	# Add vertices to graph
-	add_vertices!(g, gs)
-	
-	# Create BitReader from the IO stream
-	reader = BitReader(io)
-	
-	@info("reading compressed graph data using read_compressed_graph_data")
-	# Use the comprehensive read_compressed_graph_data function
-	# This handles mix encoding (delta + run-length) with reference encoding
-	neighbor_lists = read_compressed_graph_data(reader, V(gs), coding_scheme, integer_encoding, V)
-	
-	@info("building graph from neighbor lists")
-	# Build graph from the decoded neighbor lists
-	for (source_vertex, neighbors) in neighbor_lists
-		for target_vertex in neighbors
-			add_edge!(g, source_vertex, target_vertex)
-		end
-	end
-	
-	@info("graph construction completed: $(nv(g)) vertices, $(ne(g)) edges")
 	return g
 end
 
