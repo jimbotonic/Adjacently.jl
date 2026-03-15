@@ -20,7 +20,7 @@ using LightGraphs
 using LightGraphs: AbstractGraph, outneighbors, nv, is_directed
 
 using ...IO: BitWriter, BitReader, write_bit, write_bits, write_value, flush_bitwriter,
-    read_bit, read_bits, read_value, write_bytes
+    read_bit, read_bits, read_value, write_bytes, reset_bitwriter!, bytes_written, get_bytes
 import ..Compression
 using ..Compression: write_encoded_value, write_delta, write_truncated_binary_coding,
     write_hybrid_mix_encoded_list, delta_encode_vector, write_elias_fano,
@@ -66,42 +66,36 @@ mutable struct CGStats
 end
 
 @inline function _total_bits(w::BitWriter)
-    # Bytes written to underlying IO + buffered bits
-    return Int(position(w.io)) * 8 + w.bits_in
+    return w.bit_count
 end
 
 """
-    _reset!(io::IOBuffer, w::BitWriter)
+    _reset!(w::BitWriter)
 
-Reset an IOBuffer/BitWriter pair for reuse without allocation.
+Reset a BitWriter for reuse without allocation.
 """
-@inline function _reset!(io::IOBuffer, w::BitWriter)
-    truncate(io, 0)
-    seek(io, 0)
-    w.accum = UInt64(0)
-    w.bits_in = 0
-    w.bit_count = 0
+@inline function _reset!(w::BitWriter)
+    reset_bitwriter!(w)
 end
 
 """
     CostBuffer{T}
 
 Pre-allocated buffers for cost estimation in the reference search loop.
-Avoids creating ~576 IOBuffer/BitWriter pairs per vertex.
+Uses buffer-only BitWriters (no IO target) for fast reset.
 Parameterized on T to hold neighbor lists directly as Vector{T}.
 """
 mutable struct CostBuffer{T<:Unsigned}
-    io1::IOBuffer; w1::BitWriter   # positions: copy-blocks / raw encoding
-    io2::IOBuffer; w2::BitWriter   # complement / stop-delta / additions
-    io3::IOBuffer; w3::BitWriter   # intervals / second trial
+    w1::BitWriter   # positions: copy-blocks / raw encoding
+    w2::BitWriter   # complement / stop-delta / additions
+    w3::BitWriter   # intervals / second trial
     positions::Vector{T}
     adds::Vector{T}
     skipped::Vector{T}
 end
 
 function CostBuffer{T}() where {T<:Unsigned}
-    io1 = IOBuffer(); io2 = IOBuffer(); io3 = IOBuffer()
-    CostBuffer{T}(io1, BitWriter(io1), io2, BitWriter(io2), io3, BitWriter(io3),
+    CostBuffer{T}(BitWriter(capacity=1024), BitWriter(capacity=1024), BitWriter(capacity=1024),
                T[], T[], T[])
 end
 
@@ -153,6 +147,7 @@ Base.@kwdef struct CGParams
     intra_adapt_mil::Int = 2          # MIL for adaptive interval encoding (2=most aggressive)
     intra_lr_split::Bool = false       # Left/right residual split: split residuals at vertex_id after interval extraction
     intra_tight_deltas::Bool = false  # Skip +1 shift on delta gaps in LR residuals (gaps are always ≥ 1 for sorted unique lists)
+    cost_model::Int = Compression.DEFAULT_COST_MODEL  # 0=full analytical, 1=fast (skip interval/LR, pure delta cost)
 end
 
 # --------------------------
@@ -759,7 +754,10 @@ end
 const MIN_CANDIDATES_FOR_THREADING = 8
 
 # Maximum candidates to fully evaluate after overlap screening (2-phase pruning)
-const MAX_REF_CANDIDATES_PHASE2 = 16
+# Full model: evaluate all candidates (low cap was causing BPE regression)
+const MAX_REF_CANDIDATES_PHASE2 = 1024
+# Fast model: limit evaluation for speed
+const MAX_REF_CANDIDATES_PHASE2_FAST = 16
 
 # ---------- Analytical cost estimators (no IOBuffer allocation) ----------
 
@@ -859,6 +857,70 @@ function _estimate_copy_blocks_cost(positions::AbstractVector{<:Integer}, encodi
 end
 
 """
+    _estimate_complement_blocks_cost(positions, ref_len, encoding) → Int
+
+Analytical cost of copy-blocks for the complement (skipped) positions.
+Derives complement blocks from positions without allocating a complement vector.
+The complement of positions in [1..ref_len] is the set of indices NOT in positions.
+"""
+function _estimate_complement_blocks_cost(positions::AbstractVector{<:Integer}, ref_len::Int, encoding::Symbol)::Int
+    n_skipped = ref_len - length(positions)
+    n_skipped <= 0 && return _estimate_small_count_cost(0, encoding)
+
+    # Walk through positions to find complement blocks (gaps)
+    nblocks = 0
+    block_cost = 0
+    prev_complement_end = 0
+
+    # Build position blocks first, then derive complement blocks from gaps
+    i = 1
+    pos_block_start = 0
+    pos_block_end = 0
+    complement_cursor = 1  # next expected skipped index
+
+    while i <= length(positions)
+        pos_block_start = positions[i]
+        blen = 1
+        while i + blen <= length(positions) && positions[i + blen] == pos_block_start + blen
+            blen += 1
+        end
+        pos_block_end = pos_block_start + blen - 1
+
+        # Gap before this position block: [complement_cursor, pos_block_start-1]
+        if complement_cursor < pos_block_start
+            gap_len = pos_block_start - complement_cursor
+            nblocks += 1
+            if nblocks == 1
+                block_cost += estimate_encoded_value_cost(UInt32(complement_cursor), encoding)
+            else
+                gap_from_prev = complement_cursor - prev_complement_end
+                block_cost += estimate_encoded_value_cost(UInt32(gap_from_prev), encoding)
+            end
+            block_cost += estimate_encoded_value_cost(UInt32(gap_len), encoding)
+            prev_complement_end = complement_cursor + gap_len
+        end
+
+        complement_cursor = pos_block_end + 1
+        i += blen
+    end
+
+    # Trailing gap after last position block: [complement_cursor, ref_len]
+    if complement_cursor <= ref_len
+        gap_len = ref_len - complement_cursor + 1
+        nblocks += 1
+        if nblocks == 1
+            block_cost += estimate_encoded_value_cost(UInt32(complement_cursor), encoding)
+        else
+            gap_from_prev = complement_cursor - prev_complement_end
+            block_cost += estimate_encoded_value_cost(UInt32(gap_from_prev), encoding)
+        end
+        block_cost += estimate_encoded_value_cost(UInt32(gap_len), encoding)
+    end
+
+    return _estimate_small_count_cost(nblocks, encoding) + block_cost
+end
+
+"""
     _estimate_ir_lr_cost(neighbors, encoding, mil, vertex_id; tight_deltas) → Int
 
 CG-specific analytical cost of `_write_ir_lr` (intervals + LR-split residuals).
@@ -950,6 +1012,27 @@ function _estimate_raw_cost_analytical(nl::Vector{T}, params::CGParams,
                                         ::Type{T}, _zz_vid)::Tuple{Int,Bool} where {T<:Unsigned}
     raw_use_intervals = false
 
+    # Fast cost model: skip interval/LR estimation, use stop-delta + adaptive interval check
+    if params.cost_model == Compression.COST_MODEL_FAST
+        if params.intra_stop_deltas
+            raw_bits = _estimate_stop_delta_zigzag_cost(nl, :fibonacci, _zz_vid)
+        else
+            raw_bits = _estimate_small_count_cost(length(nl), params.count_varint)
+            if !isempty(nl)
+                raw_bits += _estimate_delta_list_cost(nl, :fibonacci; vertex_id=_zz_vid)
+            end
+        end
+        # Keep adaptive decision (cheap interval estimation vs stop-delta)
+        if params.intra_raw_adaptive && params.intra_stop_deltas
+            raw_iv_bits = estimate_interval_runlength_encoding_cost(nl, :fibonacci, params.intra_adapt_mil, 3; vertex_id=_zz_vid)
+            if 1 + raw_iv_bits < 1 + raw_bits
+                raw_use_intervals = true
+            end
+            raw_bits = min(1 + raw_bits, 1 + raw_iv_bits)
+        end
+        return raw_bits, raw_use_intervals
+    end
+
     if params.intra_intervals && params.intra_lr_split
         raw_bits = _estimate_ir_lr_cost(nl, :fibonacci, params.intra_mil, _zz_vid; tight_deltas=params.intra_tight_deltas)
     elseif params.intra_intervals
@@ -987,6 +1070,58 @@ function _evaluate_candidate_analytical(positions::Vector{T}, adds::Vector{T},
     # --- Positions estimation ---
     local pos_bits::Int
     local copy_mode::UInt8 = 0x00
+
+    if params.cost_model == Compression.COST_MODEL_FAST
+        # Fast model: 3-way adaptive without allocating complement vector
+        if params.intra_copy_adaptive && params.intra_copy_blocks
+            cb_bits = _estimate_copy_blocks_cost(positions, params.varint)
+            bm_bits = ref_len
+            cc_bits = _estimate_complement_blocks_cost(positions, ref_len, params.varint)
+            t_bm = 1 + bm_bits; t_cb = 2 + cb_bits; t_cc = 2 + cc_bits
+            if t_bm <= t_cb && t_bm <= t_cc
+                pos_bits = t_bm; copy_mode = 0x00
+            elseif t_cb <= t_cc
+                pos_bits = t_cb; copy_mode = 0x01
+            else
+                pos_bits = t_cc; copy_mode = 0x02
+            end
+        elseif params.intra_copy_blocks
+            pos_bits = _estimate_copy_blocks_cost(positions, params.varint)
+            copy_mode = 0x01
+        else
+            pos_bits = _estimate_small_count_cost(length(positions), params.count_varint)
+            if !isempty(positions)
+                pos_bits += _estimate_delta_list_cost(UInt32.(positions), :fibonacci)
+            end
+        end
+
+        # Early termination
+        if pos_bits >= best_so_far
+            return pos_bits, copy_mode, false
+        end
+
+        # Fast additions: stop-delta + adaptive interval check (cheap)
+        local fast_add_use_intervals::Bool = false
+        fast_add_bits = if params.intra_stop_deltas
+            _estimate_stop_delta_zigzag_cost(adds, :fibonacci, _zz_vid)
+        else
+            ab = _estimate_small_count_cost(length(adds), params.count_varint)
+            if !isempty(adds)
+                ab += _estimate_delta_list_cost(adds, :fibonacci; vertex_id=_zz_vid)
+            end
+            ab
+        end
+        if params.intra_add_adaptive && params.intra_stop_deltas
+            iv_bits = estimate_interval_runlength_encoding_cost(adds, :fibonacci, params.intra_adapt_mil, 3; vertex_id=_zz_vid)
+            if 1 + iv_bits < 1 + fast_add_bits
+                fast_add_use_intervals = true
+            end
+            fast_add_bits = min(1 + fast_add_bits, 1 + iv_bits)
+        end
+
+        return pos_bits + fast_add_bits, copy_mode, fast_add_use_intervals
+    end
+
     if params.intra_copy_adaptive && params.intra_copy_blocks
         # Copy-blocks cost
         cb_bits = _estimate_copy_blocks_cost(positions, params.varint)
@@ -1070,6 +1205,32 @@ function _evaluate_candidate_greedy_analytical(positions::Vector{T}, adds::Vecto
                                                 params::CGParams, ::Type{T},
                                                 _zz_vid,
                                                 mil_options::Vector{Int})::Tuple{Int,Int} where {T<:Unsigned}
+    # Fast model: keep copy-blocks for positions, single MIL with interval vs delta adaptive
+    if params.cost_model == Compression.COST_MODEL_FAST
+        if params.intra_copy_blocks
+            pos_bits = _estimate_copy_blocks_cost(positions, params.varint)
+        else
+            pos_bits = _estimate_small_count_cost(length(positions), params.count_varint)
+            if !isempty(positions)
+                pos_bits += _estimate_delta_list_cost(UInt32.(positions), :fibonacci)
+            end
+        end
+        # Single fixed MIL: compare interval vs stop-delta for additions
+        fast_mil = params.intra_adapt_mil > 0 ? params.intra_adapt_mil : mil_options[1]
+        iv_add = estimate_interval_runlength_encoding_cost(adds, :fibonacci, fast_mil, 3; vertex_id=_zz_vid)
+        sd_add = if params.intra_stop_deltas
+            _estimate_stop_delta_zigzag_cost(adds, :fibonacci, _zz_vid)
+        else
+            ab = _estimate_small_count_cost(length(adds), params.count_varint)
+            if !isempty(adds)
+                ab += _estimate_delta_list_cost(adds, :fibonacci; vertex_id=_zz_vid)
+            end
+            ab
+        end
+        add_bits = min(iv_add, sd_add)
+        return pos_bits + add_bits, fast_mil
+    end
+
     # Positions cost (doesn't depend on mil) — analytical
     if params.intra_copy_blocks
         pos_bits = _estimate_copy_blocks_cost(positions, params.varint)
@@ -1253,13 +1414,13 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                     neighbor_lists[T(i)] = nl
                 end
                 # Encode block to temp buffer
-                local io_blk = IOBuffer(); local w_blk = BitWriter(io_blk)
+                local w_blk = BitWriter()
                 Compression.write_compressed_graph_data(w_blk, neighbor_lists, :children, :fibonacci, true, true, true, params.intra_ref_window)
                 flush_bitwriter(w_blk; flush_last_bits=true)
-                block_bytes = take!(io_blk)
+                block_bytes = copy(get_bytes(w_blk))
                 block_bits = length(block_bytes) * 8
                 # Cheap baseline: raw count + delta per vertex
-                local io_base = IOBuffer(); local w_base = BitWriter(io_base)
+                local w_base = BitWriter()
                 for u in C
                     nl_int = Int[]
                     for v in outneighbors(g, Int(u))
@@ -1275,7 +1436,7 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                     end
                 end
                 flush_bitwriter(w_base; flush_last_bits=true)
-                baseline_bits = length(take!(io_base)) * 8
+                baseline_bits = bytes_written(w_base) * 8
                 # Decision with small header buffer H=8 bits
                 use_block = (block_bits + 8 < baseline_bits)
                 # Write cluster mode flag and either block or fall back
@@ -1343,6 +1504,26 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                     best_ref_idx = 0
 
                     _zz_vid = params.intra_zigzag ? T(idx_local) : nothing
+                    if params.cost_model == Compression.COST_MODEL_FAST
+                        # Fast model: single MIL, compare interval vs stop-delta
+                        fast_mil = params.intra_adapt_mil > 0 ? params.intra_adapt_mil : params.intra_mil
+                        iv_raw = estimate_interval_runlength_encoding_cost(nl, :fibonacci, fast_mil, 3; vertex_id=_zz_vid)
+                        sd_raw = if params.intra_stop_deltas
+                            _estimate_stop_delta_zigzag_cost(nl, :fibonacci, _zz_vid)
+                        else
+                            ab = _estimate_small_count_cost(length(nl), params.count_varint)
+                            if !isempty(nl)
+                                ab += _estimate_delta_list_cost(nl, :fibonacci; vertex_id=_zz_vid)
+                            end
+                            ab
+                        end
+                        raw_bits = min(iv_raw, sd_raw)
+                        if raw_bits < best_bits
+                            best_bits = raw_bits
+                            best_mil_val = fast_mil
+                            best_is_ref = false
+                        end
+                    else
                     for mil in _mil_options
                         if params.intra_lr_split
                             raw_bits = _estimate_ir_lr_cost(nl, :fibonacci, mil, _zz_vid; tight_deltas=params.intra_tight_deltas)
@@ -1355,6 +1536,7 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                             best_is_ref = false
                         end
                     end
+                    end
 
                     # Try ref encoding with 2-phase pruning + analytical cost
                     if params.intra_ref_enabled && idx_local > 1
@@ -1363,14 +1545,15 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                         n_candidates = wend - wstart + 1
 
                         # Phase 1: overlap screening (cheap O(|nl|+|ref|) per candidate)
-                        if n_candidates > MAX_REF_CANDIDATES_PHASE2
+                        _max_k_greedy = params.cost_model == Compression.COST_MODEL_FAST ? MAX_REF_CANDIDATES_PHASE2_FAST : MAX_REF_CANDIDATES_PHASE2
+                        if n_candidates > _max_k_greedy
                             overlap_scores = Vector{Tuple{Int,Int}}(undef, n_candidates)
                             for (ci2, rix) in enumerate(wstart:wend)
                                 ov = _sorted_overlap_count(nl, all_nl[rix])
                                 overlap_scores[ci2] = (ov, rix)
                             end
                             sort!(overlap_scores; by = x -> -x[1])
-                            phase2_indices = [overlap_scores[k][2] for k in 1:min(MAX_REF_CANDIDATES_PHASE2, n_candidates)]
+                            phase2_indices = [overlap_scores[k][2] for k in 1:min(_max_k_greedy, n_candidates)]
                         else
                             phase2_indices = collect(wstart:wend)
                         end
@@ -1419,14 +1602,15 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                     n_candidates = wend - wstart + 1
 
                     # Phase 1: overlap screening
-                    if n_candidates > MAX_REF_CANDIDATES_PHASE2
+                    _max_k_ref = params.cost_model == Compression.COST_MODEL_FAST ? MAX_REF_CANDIDATES_PHASE2_FAST : MAX_REF_CANDIDATES_PHASE2
+                    if n_candidates > _max_k_ref
                         overlap_scores = Vector{Tuple{Int,Int}}(undef, n_candidates)
                         for (ci2, rix) in enumerate(wstart:wend)
                             ov = _sorted_overlap_count(nl, all_nl[rix])
                             overlap_scores[ci2] = (ov, rix)
                         end
                         sort!(overlap_scores; by = x -> -x[1])
-                        phase2_indices = [overlap_scores[k][2] for k in 1:min(MAX_REF_CANDIDATES_PHASE2, n_candidates)]
+                        phase2_indices = [overlap_scores[k][2] for k in 1:min(_max_k_ref, n_candidates)]
                     else
                         phase2_indices = collect(wstart:wend)
                     end
@@ -1544,8 +1728,7 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
             # In index mode (cluster_offsets !== nothing), use two-pass encoding:
             # encode payloads to temp buffer, then write intra-vertex offset table + data
             local _idx_mode = cluster_offsets !== nothing
-            local _vtx_payload_io = _idx_mode ? IOBuffer() : nothing
-            local _vtx_payload_bw = _idx_mode ? BitWriter(_vtx_payload_io) : nothing
+            local _vtx_payload_bw = _idx_mode ? BitWriter() : nothing
             local _vtx_offsets = _idx_mode ? Vector{Int}(undef, s + 1) : nothing
             local pw = _idx_mode ? _vtx_payload_bw : w  # payload writer
 
@@ -1724,8 +1907,7 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                 end
 
                 # Write buffered payload data precisely (avoid byte-padding corruption)
-                seekstart(_vtx_payload_io)
-                local _vtx_data = take!(_vtx_payload_io)
+                local _vtx_data = get_bytes(_vtx_payload_bw)
                 local _full_bytes = _payload_total_bits ÷ 8
                 local _remaining_bits = _payload_total_bits % 8
                 # Write full bytes via write_bytes (MSB-first per byte)

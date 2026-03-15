@@ -22,61 +22,100 @@ using ..CustomLightGraphs: SimpleDiGraph, SimpleGraph, SimpleEdge
 using ..Util: infer_uint_custom_type
 using ..Constants: BUFFER_SIZE
 
-export BitWriter, 
-	BitReader, 
+export BitWriter,
+	BitReader,
 	write_bit,
 	write_bits,
-	write_value, 
+	write_value,
 	write_bytes,
-	read_bit, 
-	read_bits, 
+	read_bit,
+	read_bits,
 	read_value,
 	peek_bit,
 	flush_bitwriter,
-	load_jls_serialized, 
-	serialize_to_jls, 
-	load_jld_serialized, 
-	serialize_to_jld, 
-	load_adjacency_list_from_csv, 
-	load_adjacency_list, 
-	load_graph_from_pajek, 
+	reset_bitwriter!,
+	bytes_written,
+	get_bytes,
+	write_to_io,
+	load_jls_serialized,
+	serialize_to_jls,
+	load_jld_serialized,
+	serialize_to_jld,
+	load_adjacency_list_from_csv,
+	load_adjacency_list,
+	load_graph_from_pajek,
 	load_triangles
 
 ################################################################################
-# BitWriter — UInt64-accumulator implementation
+# BitWriter — UInt64-accumulator with Vector{UInt8} buffer
 #
 # Bits are packed MSB-first into a 64-bit accumulator (right-aligned: the
 # first bit written occupies the highest position, the most recent bit is
 # at position 0).  When the accumulator fills to 64 bits it is flushed to
-# the underlying IO as 8 big-endian bytes via hton.
+# an internal Vector{UInt8} buffer as 8 big-endian bytes.
+#
+# An optional IO reference can be stored for backward compatibility with
+# tests that write through BitWriter then read back via BitReader.
+# flush_bitwriter syncs the internal buffer to io when present.
 ################################################################################
 
 """
     BitWriter
 
-High-performance bit writer using a UInt64 accumulator.
-Bits are written MSB-first (big-endian bit order).
+High-performance bit writer using a UInt64 accumulator backed by a
+`Vector{UInt8}` byte buffer.  Bits are written MSB-first (big-endian bit order).
 """
 mutable struct BitWriter
-    io::Base.IO
-    accum::UInt64      # accumulator — bits packed right-aligned, MSB-first
-    bits_in::Int       # number of valid bits in accum (0–63)
-    bit_count::Int64   # total bits written since creation / last reset
+    io::Union{Base.IO, Nothing}  # optional IO target (for test backward compat)
+    buf::Vector{UInt8}           # internal byte buffer
+    pos::Int                     # next write position in buf (1-based)
+    accum::UInt64                # accumulator — bits packed right-aligned, MSB-first
+    bits_in::Int                 # number of valid bits in accum (0–63)
+    bit_count::Int64             # total bits written since creation / last reset
 end
+
+"""
+    BitWriter(; capacity=32768)
+
+Construct a buffer-only BitWriter (no IO target).  This is the fast path
+used by production encoders.
+"""
+BitWriter(; capacity::Int=32768) = BitWriter(nothing, Vector{UInt8}(undef, max(capacity, 64)), 1, UInt64(0), 0, 0)
 
 """
     BitWriter(io::Base.IO; capacity=4096*8)
 
-Construct a BitWriter that writes to `io`.
-The `capacity` parameter is accepted for API compatibility but unused.
+Construct a BitWriter with an IO target for backward compatibility.
+Bits are buffered internally; flush_bitwriter syncs to `io`.
 """
 function BitWriter(io::Base.IO; capacity=BUFFER_SIZE*8)
-    BitWriter(io, UInt64(0), 0, 0)
+    BitWriter(io, Vector{UInt8}(undef, max(capacity, 32768)), 1, UInt64(0), 0, 0)
 end
 
-# Flush all 64 accumulator bits to IO as 8 big-endian bytes.
+# Write 8 bytes of the accumulator (big-endian) to internal buffer.
+@inline function _write_accum_to_buf(w::BitWriter)
+    p = w.pos
+    need = p + 7
+    if need > length(w.buf)
+        resize!(w.buf, max(2 * length(w.buf), need))
+    end
+    v = w.accum
+    @inbounds begin
+        w.buf[p]   = (v >> 56) % UInt8
+        w.buf[p+1] = (v >> 48) % UInt8
+        w.buf[p+2] = (v >> 40) % UInt8
+        w.buf[p+3] = (v >> 32) % UInt8
+        w.buf[p+4] = (v >> 24) % UInt8
+        w.buf[p+5] = (v >> 16) % UInt8
+        w.buf[p+6] = (v >> 8) % UInt8
+        w.buf[p+7] = v % UInt8
+    end
+    w.pos = p + 8
+end
+
+# Flush all 64 accumulator bits to internal buffer.
 @inline function _flush_accum(w::BitWriter)
-    write(w.io, hton(w.accum))
+    _write_accum_to_buf(w)
     w.accum = UInt64(0)
     w.bits_in = 0
 end
@@ -127,7 +166,7 @@ Write the lowest `n` bits of `value` in MSB-first order.
         # Split across accumulator boundary
         first_n = 64 - w.bits_in
         w.accum = (w.accum << first_n) | (v >> (n - first_n))
-        write(w.io, hton(w.accum))
+        _write_accum_to_buf(w)
         rest = n - first_n
         w.accum = v & ((UInt64(1) << rest) - 1)
         w.bits_in = rest
@@ -148,37 +187,90 @@ end
 """
     flush_bitwriter(writer::BitWriter; flush_last_bits::Bool = false)
 
-Flush buffered bits to the underlying IO stream.
+Flush buffered bits to the internal byte buffer.
 Full bytes are always written. If `flush_last_bits` is true, the final
 partial byte is zero-padded on the right and written as well.
+When the writer has an IO target, the buffer is synced to IO afterward.
 """
 function flush_bitwriter(w::BitWriter; flush_last_bits::Bool = false)
-    w.bits_in == 0 && return
+    if w.bits_in > 0
+        # Left-align the valid bits for byte extraction
+        aligned = w.accum << (64 - w.bits_in)
+        full_bytes = w.bits_in >> 3          # div by 8
+        remaining_bits = w.bits_in & 7       # mod 8
 
-    # Left-align the valid bits for byte extraction
-    aligned = w.accum << (64 - w.bits_in)
-    full_bytes = w.bits_in >> 3          # div by 8
-    remaining_bits = w.bits_in & 7       # mod 8
-
-    # Write full bytes from the left-aligned value
-    for i in 0:(full_bytes - 1)
-        write(w.io, UInt8((aligned >> (56 - 8 * i)) & 0xff))
-    end
-
-    if flush_last_bits && remaining_bits > 0
-        # Write zero-padded last byte
-        write(w.io, UInt8((aligned >> (56 - 8 * full_bytes)) & 0xff))
-        w.accum = UInt64(0)
-        w.bits_in = 0
-    else
-        # Keep remaining bits (right-aligned in accum)
-        if remaining_bits > 0
-            w.accum = w.accum & ((UInt64(1) << remaining_bits) - 1)
-        else
-            w.accum = UInt64(0)
+        # Ensure buffer capacity
+        extra = full_bytes + (flush_last_bits && remaining_bits > 0 ? 1 : 0)
+        if w.pos + extra - 1 > length(w.buf)
+            resize!(w.buf, max(2 * length(w.buf), w.pos + extra))
         end
-        w.bits_in = remaining_bits
+
+        # Write full bytes to internal buffer
+        @inbounds for i in 0:(full_bytes - 1)
+            w.buf[w.pos] = ((aligned >> (56 - 8 * i)) & 0xff) % UInt8
+            w.pos += 1
+        end
+
+        if flush_last_bits && remaining_bits > 0
+            # Write zero-padded last byte
+            @inbounds w.buf[w.pos] = ((aligned >> (56 - 8 * full_bytes)) & 0xff) % UInt8
+            w.pos += 1
+            w.accum = UInt64(0)
+            w.bits_in = 0
+        else
+            # Keep remaining bits (right-aligned in accum)
+            if remaining_bits > 0
+                w.accum = w.accum & ((UInt64(1) << remaining_bits) - 1)
+            else
+                w.accum = UInt64(0)
+            end
+            w.bits_in = remaining_bits
+        end
     end
+
+    # Sync internal buffer to IO target (for backward compat with tests)
+    if w.io isa IOBuffer
+        truncate(w.io, 0)
+        seekstart(w.io)
+        nb = w.pos - 1
+        nb > 0 && write(w.io, @view w.buf[1:nb])
+    end
+end
+
+"""
+    reset_bitwriter!(w::BitWriter)
+
+Reset the writer for reuse (e.g., trial encoding in greedy search).
+"""
+@inline function reset_bitwriter!(w::BitWriter)
+    w.pos = 1
+    w.accum = UInt64(0)
+    w.bits_in = 0
+    w.bit_count = 0
+end
+
+"""
+    bytes_written(w::BitWriter) -> Int
+
+Number of complete bytes in the internal buffer (excludes accumulator bits).
+"""
+@inline bytes_written(w::BitWriter) = w.pos - 1
+
+"""
+    get_bytes(w::BitWriter) -> SubArray
+
+View of the internal buffer bytes written so far.
+"""
+@inline get_bytes(w::BitWriter) = @view w.buf[1:w.pos - 1]
+
+"""
+    write_to_io(w::BitWriter, io::Base.IO)
+
+Write the internal buffer contents to an IO stream.
+"""
+function write_to_io(w::BitWriter, io::Base.IO)
+    nb = w.pos - 1
+    nb > 0 && write(io, @view w.buf[1:nb])
 end
 
 ################################################################################

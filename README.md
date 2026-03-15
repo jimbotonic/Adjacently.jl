@@ -48,14 +48,13 @@ On the CNR-2000 web graph (325,557 vertices, 3,216,152 edges):
 
 | Method | Ordering | Bits per edge | sec/edge |
 |--------|----------|--------------|----------|
-| **BG** (w=64, multi-ref) | Leiden+LLP | **2.3258** | 6.30e-06 |
-| CG K=2 (w=64) | Original | 2.3287 | 1.558e-05 |
-| CS (w=64) | Leiden+LLP | 2.3643 | 3.97e-06 |
+| **CS** (w=256) | Leiden+LLP | **2.3043** | 5.63e-05 |
+| BG (w=64, multi-ref) | Leiden+LLP | 2.3259 | 1.95e-05 |
+| CG K=2 (w=64) | Original | 2.3286 | 5.63e-06 |
 | WebGraph BV (w=7) | Original | 2.898 | 2.198e-07 |
 | WebGraph BV-HC | Host-compressed | 2.448 | — |
-| *Leiden+LLP ordering* | — | — | *8.741e-08* |
 
-All methods achieve perfect round-trip fidelity. BG with Leiden+LLP ordering beats WebGraph BV by 20% and BV-HC by 5% on this dataset. BG is 2.5× faster and CS is 3.9× faster than CG K=2, thanks to two-phase sorted merge reference search. The Leiden+LLP ordering cost (load + relabel) is negligible compared to compression.
+All methods achieve perfect round-trip fidelity. CS with Leiden+LLP ordering beats WebGraph BV by 21% and BV-HC by 6% on this dataset. CG K=2 is the fastest Adjacently encoder at 5.63e-06 sec/edge thanks to analytical cost estimation. A dual cost model is available: full model (cost_model=0) maximizes compression quality, fast model (cost_model=1) trades modest BPE for significant speedup (e.g. CS: 19× faster at +0.28 BPE).
 
 ### MGS File Format (v3.2)
 

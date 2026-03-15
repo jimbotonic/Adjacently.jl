@@ -20,8 +20,8 @@ using SparseArrays
 using ..NodeTypes: Node, EmptyNode, AbstractNode
 using ..CustomTypes: UInt24, UInt40
 
-using ..IO: BitWriter, BitReader, write_bit, write_bits, read_bit, read_bits, peek_bit, 
-flush, write_value, read_value, flush_bitwriter, write_bytes
+using ..IO: BitWriter, BitReader, write_bit, write_bits, read_bit, read_bits, peek_bit,
+flush, write_value, read_value, flush_bitwriter, write_bytes, reset_bitwriter!, bytes_written, get_bytes
 
 using ..Constants: FIB_NUMBERS, BUFFER_SIZE, ZETA_H_BOUNDS, ZETA_POWER_BASES, ZETA_BASE,
 GOLOMB_BASE, REF_ENCODING_TH, REF_V_MIN_DEGREE, FED_BLOCK_SIZE, MIN_INTERVAL_LENGTH, MIN_RUN_LENGTH, REF_WINDOW_SIZE
@@ -85,7 +85,10 @@ export write_unary_coding,
        read_greedy_graph_data,
        write_cmdstream_graph_data,
        read_cmdstream_graph_data,
-       CommandStream
+       CommandStream,
+       COST_MODEL_FULL,
+       COST_MODEL_FAST,
+       DEFAULT_COST_MODEL
 
 # Lightweight workspace types for reference building
 struct RefBuildWorkspace{T<:Unsigned}
@@ -96,24 +99,47 @@ end
 RefBuildWorkspace{T}() where {T<:Unsigned} = RefBuildWorkspace{T}(Bool[], T[])
 
 # Pre-allocated buffers for exact bit-counting in BG greedy reference search.
-# Avoids creating IOBuffer/BitWriter pairs per candidate per vertex.
+# Uses buffer-only BitWriters (no IO target) for fast reset.
 mutable struct GreedyCostBuffer
-    io1::IOBuffer; w1::BitWriter   # copy encoding trial
-    io2::IOBuffer; w2::BitWriter   # stop-delta / residual trial
-    io3::IOBuffer; w3::BitWriter   # intervals trial
+    w1::BitWriter   # copy encoding trial
+    w2::BitWriter   # stop-delta / residual trial
+    w3::BitWriter   # intervals trial
 end
 
 function GreedyCostBuffer()
-    io1 = IOBuffer(); io2 = IOBuffer(); io3 = IOBuffer()
-    GreedyCostBuffer(io1, BitWriter(io1), io2, BitWriter(io2), io3, BitWriter(io3))
+    GreedyCostBuffer(BitWriter(capacity=1024), BitWriter(capacity=1024), BitWriter(capacity=1024))
 end
 
-@inline function _greedy_reset!(io::IOBuffer, w::BitWriter)
-    truncate(io, 0)
-    seek(io, 0)
-    w.accum = UInt64(0)
-    w.bits_in = 0
-    w.bit_count = 0
+@inline function _greedy_reset!(w::BitWriter)
+    reset_bitwriter!(w)
+end
+
+# Pre-allocated workspace for BG/CS vertex search.
+# Eliminates per-vertex allocation of overlap_candidates, merge buffers, and snapshots.
+mutable struct VertexSearchWorkspace{T<:Unsigned}
+    overlap_candidates::Vector{Tuple{Int,Vector{T},T}}
+    merge_bmp::Vector{Bool}
+    merge_res::Vector{T}
+    best_bmp::Vector{Bool}   # only written on improvement
+    best_res::Vector{T}      # only written on improvement
+end
+
+function VertexSearchWorkspace{T}() where {T<:Unsigned}
+    VertexSearchWorkspace{T}(
+        Vector{Tuple{Int,Vector{T},T}}(),
+        Bool[], T[],
+        Bool[], T[]
+    )
+end
+
+# Resize dst to match src length and copy contents.
+@inline function _copyto_resize!(dst::Vector{T}, src::Vector{T}) where T
+    resize!(dst, length(src))
+    copyto!(dst, src)
+end
+@inline function _copyto_resize!(dst::Vector{Bool}, src::Vector{Bool})
+    resize!(dst, length(src))
+    copyto!(dst, src)
 end
 
 # Two-pointer overlap count on sorted vectors. O(|a|+|b|), zero allocation.
@@ -621,16 +647,13 @@ For example, v = 5 (0b101) -> 2 zeros + 101 -> bits = 0 0 1 0 1
 function write_elias_gamma(w::BitWriter, v::T) where {T<:Unsigned}
     v == 0 && throw(ArgumentError("Elias gamma is undefined for 0"))
 
-    # Determine the number of bits needed to represent v
+    # bits_len = number of significant bits in v
     bits_len = sizeof(T) * 8 - leading_zeros(v)
 
-    # Write prefix of (bits_len - 1) zeros
-    for _ in 1:(bits_len - 1)
-        write_bit(w, false)
-    end
-
-    # Write the actual binary representation of v
-    write_value(w, v, bits_len)
+    # Gamma code = (bits_len-1) zero bits + bits_len bits of v
+    # Total = 2*bits_len - 1 bits. Since v < 2^bits_len, the leading
+    # zeros come from writing v in a wider field.
+    write_value(w, UInt64(v), 2 * bits_len - 1)
 end
 
 """
@@ -1005,16 +1028,52 @@ end
 # Fibonacci code
 ################################################################################
 
+# Precomputed Fibonacci encode table: for values 1..FIB_LUT_SIZE, each entry
+# packs (msb_code << 6) | code_len into a UInt64. Lookup replaces greedy
+# decomposition + bit reversal + write_value loop with a single table lookup.
+const FIB_LUT_SIZE = 8192
+
+const _FIB_ENCODE_TABLE = let
+    table = Vector{UInt64}(undef, FIB_LUT_SIZE)
+    for n in 1:FIB_LUT_SIZE
+        code = UInt64(0); max_idx = 0; remaining = UInt64(n)
+        for i in length(FIB_NUMBERS):-1:1
+            if FIB_NUMBERS[i] <= remaining
+                remaining -= FIB_NUMBERS[i]
+                code |= (UInt64(1) << (i - 1))
+                max_idx = max(max_idx, i)
+                remaining == 0 && break
+            end
+        end
+        code_len = max_idx + 1
+        msb_code = UInt64(0)
+        for i in 0:(max_idx - 1)
+            msb_code = (msb_code << 1) | ((code >> i) & 1)
+        end
+        msb_code = (msb_code << 1) | UInt64(1)  # stop bit
+        table[n] = (msb_code << 6) | UInt64(code_len)
+    end
+    table
+end
+
 """
     write_fibonacci(w::BitWriter, n::T) where {T<:Unsigned}
 
-Write `n` using Fibonacci coding (with '1' stop bit), using precomputed FIB_NUMBERS.
-Zero-allocation: builds a UInt64 bitmask and writes via a single `write_value` call.
+Write `n` using Fibonacci coding (with '1' stop bit).
+Uses a precomputed lookup table for values ≤ $FIB_LUT_SIZE.
 """
-function write_fibonacci(w::BitWriter, n::T) where {T<:Unsigned}
+@inline function write_fibonacci(w::BitWriter, n::T) where {T<:Unsigned}
     n == 0 && throw(ArgumentError("Fibonacci code undefined for 0"))
+    if n <= FIB_LUT_SIZE
+        packed = @inbounds _FIB_ENCODE_TABLE[Int(n)]
+        write_value(w, packed >> 6, Int(packed & 0x3f))
+    else
+        _write_fibonacci_fallback(w, n)
+    end
+end
 
-    # Greedy Fibonacci decomposition into a bitmask (bit i-1 ↔ FIB_NUMBERS[i])
+# Fallback for values > FIB_LUT_SIZE (rare in practice)
+function _write_fibonacci_fallback(w::BitWriter, n::T) where {T<:Unsigned}
     code = UInt64(0)
     max_idx = 0
     remaining = UInt64(n)
@@ -1027,15 +1086,12 @@ function write_fibonacci(w::BitWriter, n::T) where {T<:Unsigned}
         end
     end
 
-    # Fibonacci code is written LSB-first: bit position 1 (FIB[1]) first, then 2, etc.
-    # followed by a '1' stop bit. write_value writes MSB-first, so we reverse.
-    # Build the MSB-first codeword: positions 0..max_idx-1 of `code`, then stop bit.
-    code_len = max_idx + 1   # including stop bit
+    code_len = max_idx + 1
     msb_code = UInt64(0)
     @inbounds for i in 0:(max_idx - 1)
         msb_code = (msb_code << 1) | ((code >> i) & 1)
     end
-    msb_code = (msb_code << 1) | UInt64(1)  # stop bit '1'
+    msb_code = (msb_code << 1) | UInt64(1)
 
     write_value(w, msb_code, code_len)
 end
@@ -1444,37 +1500,25 @@ Write a list of values to the bitwriter, using delta encoding.
 @param encoding::Symbol: the compression coding to use (:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta)
 """
 function write_delta(w::BitWriter, lst::Vector{T}, encoding::Symbol; vertex_id=nothing, positive_gaps::Bool=false) where {T<:Unsigned}
-    # if the list is empty, return
     isempty(lst) && return
 
-    # delta encoding
-    delta_lst = delta_encode_vector(lst)
-    @debug "WRITE delta: lst=$lst, delta_lst=$delta_lst"
-
-    # write the first value (not delta encoded)
+    # Write the first value (absolute or zigzag-relative)
     if vertex_id !== nothing
-        # Relative first-value: zigzag(v₁ - vertex_id) + 1
         offset = Int64(lst[1]) - Int64(vertex_id)
         encoded_first = UInt64(_zigzag_encode(offset) + 1)
         write_encoded_value(w, encoded_first, encoding)
-        @debug "WRITE delta: wrote zigzag first value offset=$offset encoded=$encoded_first"
     else
-        # NB: we assume that the first value is not 0
-        write_encoded_value(w, delta_lst[1], encoding)
-        @debug "WRITE delta: wrote first value delta_lst[1]=$(delta_lst[1])"
+        write_encoded_value(w, lst[1], encoding)
     end
 
-    # write the rest of the values
+    # Write remaining values as inline gaps (no delta vector allocation)
     if positive_gaps
-        # Caller guarantees all gaps ≥ 1 (sorted unique list) — encode directly without +1 shift
-        for i in 2:length(delta_lst)
-            write_encoded_value(w, delta_lst[i], encoding)
+        @inbounds for i in 2:length(lst)
+            write_encoded_value(w, lst[i] - lst[i-1], encoding)
         end
     else
-        for i in 2:length(delta_lst)
-            # NB: we shift by 1 to avoid zeros
-            write_encoded_value(w, delta_lst[i] + T(1), encoding)
-            @debug "WRITE delta: wrote delta_lst[$i]=$(delta_lst[i]) + 1"
+        @inbounds for i in 2:length(lst)
+            write_encoded_value(w, (lst[i] - lst[i-1]) + T(1), encoding)
         end
     end
 end
@@ -2048,15 +2092,14 @@ function estimate_interval_runlength_encoding_cost(neighbors::Vector{T}, integer
 
     # 4. Residuals (delta-encoded, matching write_delta: gaps shifted +1)
     if !isempty(residuals)
-        residual_deltas = delta_encode_vector(residuals)
         if vertex_id !== nothing
             encoded_first = UInt64(_zigzag_encode(Int64(residuals[1]) - Int64(vertex_id)) + 1)
             cost += estimate_encoded_value_cost(encoded_first, integer_encoding)
         else
-            cost += estimate_encoded_value_cost(residual_deltas[1], integer_encoding)
+            cost += estimate_encoded_value_cost(residuals[1], integer_encoding)
         end
-        for i in 2:length(residual_deltas)
-            cost += estimate_encoded_value_cost(residual_deltas[i] + T(1), integer_encoding)
+        @inbounds for i in 2:length(residuals)
+            cost += estimate_encoded_value_cost((residuals[i] - residuals[i-1]) + T(1), integer_encoding)
         end
     end
 
@@ -2780,20 +2823,38 @@ const MIL_OPTIONS = [2, 3, 4, 5]
 # Default encoding for greedy-compressed streams
 const _FIXED_ENCODING = :fibonacci
 
-# Total bits written so far (bytes flushed to IO + buffered bits)
-@inline function _total_bits(w::BitWriter)
-    return Int(position(w.io)) * 8 + w.bits_in
+# ── Cost model levels ────────────────────────────────────────────────────
+# COST_MODEL_FULL (0): evaluate all encoding options (interval×4 MILs + RLE×4 MILs + delta)
+# COST_MODEL_FAST (1): skip RLE, single MIL, simpler copy cost estimation
+const COST_MODEL_FULL = 0
+const COST_MODEL_FAST = 1
+
+# Default cost model — can be overridden via ADJACENTLY_COST_MODEL env var
+const DEFAULT_COST_MODEL = let
+    v = get(ENV, "ADJACENTLY_COST_MODEL", "0")
+    parse(Int, v)
 end
 
-# Flattened Encoding Options (Type, MIL)
+# Total bits written so far (flushed bytes + buffered bits in accumulator)
+@inline function _total_bits(w::BitWriter)
+    return w.bit_count
+end
+
+# Flattened Encoding Options (Type, MIL) — full model
 const ENCODING_OPTIONS = vcat(
     [(:interval, mil) for mil in MIL_OPTIONS],
     [(:rle, mil) for mil in MIL_OPTIONS],
     [(:delta, 0)]
 )
 
+# Fast encoding options: only interval(mil=4) + delta — skips all RLE
+const FAST_ENCODING_OPTIONS = [(:interval, 4), (:delta, 0)]
+
 # Max candidates for phase 2 of two-phase reference search
-const MAX_REF_CANDIDATES_PHASE2 = 8
+# Full model: evaluate all candidates (low cap was causing BPE regression)
+const MAX_REF_CANDIDATES_PHASE2 = 1024
+# Fast model: limit evaluation for speed
+const MAX_REF_CANDIDATES_PHASE2_FAST = 8
 
 # Fixed MIL for adaptive header mode (intervals path)
 const ADAPTIVE_MIL = 4
@@ -2987,7 +3048,8 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         exact_costing::Bool=false,
         lr_split::Bool=false,
         multi_ref::Bool=false,
-        adaptive_header::Bool=false) where {T<:Unsigned}
+        adaptive_header::Bool=false,
+        cost_model::Int=DEFAULT_COST_MODEL) where {T<:Unsigned}
 
     vs = length(keys(neighbor_lists))
     ie = integer_encoding
@@ -3001,6 +3063,9 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
 
     # Create cost buffer for exact bit-counting when requested
     gcb = exact_costing ? GreedyCostBuffer() : nothing
+
+    # Pre-allocated workspace for vertex search
+    _ws = VertexSearchWorkspace{T}()
 
     reference_window = T[]
     function add_to_ref_window!(vertex::T)
@@ -3048,7 +3113,7 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         enc_type = :interval
 
         # Greedy search
-        _, actual_ref_mode, mil, ref_result, enc_type, use_stop, res_enc_type, res_mil = _greedy_vertex_search(current_neighbors, neighbor_lists, reference_window, ie; vertex_id=v, copy_blocks=copy_blocks, adaptive_copy=adaptive_copy, fixwidth_ref=fixwidth_ref, ref_dist_bits=ref_dist_bits, stop_deltas=stop_deltas, adaptive_deltas=adaptive_deltas, split_residual=split_residual, bv_blocks=bv_blocks, compact_copy=compact_copy, tight_intervals=tight_intervals, buf=gcb, lr_split=lr_split, multi_ref=multi_ref, adaptive_header=adaptive_header)
+        _, actual_ref_mode, mil, ref_result, enc_type, use_stop, res_enc_type, res_mil = _greedy_vertex_search(current_neighbors, neighbor_lists, reference_window, ie; vertex_id=v, copy_blocks=copy_blocks, adaptive_copy=adaptive_copy, fixwidth_ref=fixwidth_ref, ref_dist_bits=ref_dist_bits, stop_deltas=stop_deltas, adaptive_deltas=adaptive_deltas, split_residual=split_residual, bv_blocks=bv_blocks, compact_copy=compact_copy, tight_intervals=tight_intervals, buf=gcb, lr_split=lr_split, multi_ref=multi_ref, adaptive_header=adaptive_header, ws=_ws, cost_model=cost_model)
 
         # Write vertex header
         _write_vertex_header_vlc(wr, actual_ref_mode, enc_type, mil; adaptive=adaptive_header)
@@ -3140,8 +3205,7 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
 
     if idx_mode
         # Two-pass encoding: encode per-vertex data to buffer, then write offset table + data
-        buf_io = IOBuffer()
-        buf_bw = BitWriter(buf_io)
+        buf_bw = BitWriter()
         vertex_offsets = Vector{Int}(undef, vs + 1)
 
         for v_idx in 1:vs
@@ -3151,7 +3215,7 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
             _encode_vertex!(buf_bw, v, current_neighbors)
         end
         flush_bitwriter(buf_bw; flush_last_bits=true)
-        vertex_offsets[vs + 1] = Int(position(buf_io)) * 8
+        vertex_offsets[vs + 1] = bytes_written(buf_bw) * 8
 
         # Compute entry width
         max_offset = vertex_offsets[vs + 1]
@@ -3164,8 +3228,7 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         end
 
         # Write buffered encoded data
-        seekstart(buf_io)
-        buf_data = take!(buf_io)
+        buf_data = collect(get_bytes(buf_bw))
         write_bytes(w, buf_data)
     else
         # Children mode: legacy degree-count index table (not used) + sequential encoding
@@ -3576,6 +3639,11 @@ function _estimate_adaptive_copy_cost(bitmap::Vector{Bool}, ie::Symbol; bv_block
     return min(bm_cost, cb_cost, cc_cost)
 end
 
+# Fast copy cost: just bitmap length, no copy-blocks analysis (O(1) instead of O(n))
+@inline function _estimate_copy_cost_fast(bitmap::Vector{Bool})::Int
+    return 1 + length(bitmap)  # 1-bit mode flag + raw bitmap bits
+end
+
 function _write_adaptive_copy(w::BitWriter, bitmap::Vector{Bool}, ie::Symbol; bv_blocks::Bool=false, compact_copy::Bool=false)
     ref_len = length(bitmap)
     complement = Bool[!b for b in bitmap]
@@ -3969,34 +4037,37 @@ end
 
 function _estimate_delta_cost(neighbors::Vector{T}, ie::Symbol; vertex_id=nothing) where {T<:Unsigned}
     isempty(neighbors) && return 0
-    deltas = delta_encode_vector(neighbors)
     cost = 0
     if vertex_id !== nothing
         encoded_first = UInt64(_zigzag_encode(Int64(neighbors[1]) - Int64(vertex_id)) + 1)
         cost += estimate_encoded_value_cost(encoded_first, ie)
     else
-        cost += estimate_encoded_value_cost(deltas[1], ie)
+        cost += estimate_encoded_value_cost(neighbors[1], ie)
     end
-    for i in 2:length(deltas)
-        cost += estimate_encoded_value_cost(deltas[i] + T(1), ie)
+    @inbounds for i in 2:length(neighbors)
+        cost += estimate_encoded_value_cost((neighbors[i] - neighbors[i-1]) + T(1), ie)
     end
     return cost
 end
 
 function _estimate_rle_cost(neighbors::Vector{T}, ie::Symbol, mil::Int; vertex_id=nothing) where {T<:Unsigned}
     isempty(neighbors) && return 0
-    deltas = delta_encode_vector(neighbors)
     cost = 1 # hybrid flag
     if vertex_id !== nothing
         encoded_first = UInt64(_zigzag_encode(Int64(neighbors[1]) - Int64(vertex_id)) + 1)
         cost += estimate_encoded_value_cost(encoded_first, ie)
     else
-        cost += estimate_encoded_value_cost(deltas[1], ie)
+        cost += estimate_encoded_value_cost(neighbors[1], ie)
     end
-    
-    if length(deltas) > 1
-        rem_deltas = deltas[2:end]
-        sections = analyze_delta_patterns_hybrid(rem_deltas, neighbors[2:end], mil)
+
+    n = length(neighbors)
+    if n > 1
+        # Compute remaining deltas inline (avoids delta_encode_vector allocation)
+        rem_deltas = Vector{T}(undef, n - 1)
+        @inbounds for i in 2:n
+            rem_deltas[i-1] = neighbors[i] - neighbors[i-1]
+        end
+        sections = analyze_delta_patterns_hybrid(rem_deltas, @view(neighbors[2:end]), mil)
         cost += estimate_encoded_value_cost(T(length(sections)), ie)
         for s in sections
             if s.type == :delta
@@ -4038,7 +4109,7 @@ function _estimate_base_cost(target::Vector{T}, ie::Symbol, mil::Int, enc_type::
 end
 
 function _greedy_vertex_search(neighbors::Vector{T}, neighbor_lists::Dict{T,Vector{T}},
-                                   ref_window::Vector{T}, ie::Symbol; vertex_id=nothing, copy_blocks::Bool=false, adaptive_copy::Bool=false, fixwidth_ref::Bool=false, ref_dist_bits::Int=0, stop_deltas::Bool=false, adaptive_deltas::Bool=false, split_residual::Bool=false, bv_blocks::Bool=false, compact_copy::Bool=false, tight_intervals::Bool=false, buf::Union{GreedyCostBuffer,Nothing}=nothing, lr_split::Bool=false, multi_ref::Bool=false, adaptive_header::Bool=false) where {T<:Unsigned}
+                                   ref_window::Vector{T}, ie::Symbol; vertex_id=nothing, copy_blocks::Bool=false, adaptive_copy::Bool=false, fixwidth_ref::Bool=false, ref_dist_bits::Int=0, stop_deltas::Bool=false, adaptive_deltas::Bool=false, split_residual::Bool=false, bv_blocks::Bool=false, compact_copy::Bool=false, tight_intervals::Bool=false, buf::Union{GreedyCostBuffer,Nothing}=nothing, lr_split::Bool=false, multi_ref::Bool=false, adaptive_header::Bool=false, ws::Union{VertexSearchWorkspace{T},Nothing}=nothing, cost_model::Int=COST_MODEL_FULL) where {T<:Unsigned}
     if isempty(neighbors)
         return (ie, :none, MIL_OPTIONS[1], nothing, :interval, false, :interval, MIL_OPTIONS[1])
     end
@@ -4056,7 +4127,7 @@ function _greedy_vertex_search(neighbors::Vector{T}, neighbor_lists::Dict{T,Vect
     @inline function _cost_for_list(target::Vector{T}, mil::Int, enc_type::Symbol, use_stop::Bool)
         if buf !== nothing
             # Exact bit-counting via trial encoding
-            _greedy_reset!(buf.io2, buf.w2)
+            _greedy_reset!(buf.w2)
             if enc_type == :interval
                 if lr_split
                     _write_intervals_lr(buf.w2, target, ie, mil; vertex_id=vertex_id, tight_intervals=tight_intervals)
@@ -4087,8 +4158,11 @@ function _greedy_vertex_search(neighbors::Vector{T}, neighbor_lists::Dict{T,Vect
 
     # Helper: compute copy cost for a bitmap
     @inline function _copy_cost(bmp::Vector{Bool})
+        if cost_model == COST_MODEL_FAST
+            return _estimate_copy_cost_fast(bmp)
+        end
         if buf !== nothing
-            _greedy_reset!(buf.io1, buf.w1)
+            _greedy_reset!(buf.w1)
             if adaptive_copy && copy_blocks
                 _write_adaptive_copy(buf.w1, bmp, ie; bv_blocks=bv_blocks, compact_copy=compact_copy)
             elseif copy_blocks
@@ -4110,7 +4184,8 @@ function _greedy_vertex_search(neighbors::Vector{T}, neighbor_lists::Dict{T,Vect
 
     # Standard encoding options loop (always runs)
     # In adaptive header mode, only evaluate STOP-delta and intervals(ADAPTIVE_MIL)
-    _enc_options = adaptive_header ? ADAPTIVE_ENCODING_OPTIONS : ENCODING_OPTIONS
+    # In fast cost model, use reduced encoding options (skip RLE, single MIL)
+    _enc_options = adaptive_header ? ADAPTIVE_ENCODING_OPTIONS : (cost_model == COST_MODEL_FAST ? FAST_ENCODING_OPTIONS : ENCODING_OPTIONS)
     for (enc_type, mil) in _enc_options
             delta_variants = if adaptive_deltas && enc_type == :delta
                 [(false, true), (true, true)]
@@ -4141,37 +4216,38 @@ function _greedy_vertex_search(neighbors::Vector{T}, neighbor_lists::Dict{T,Vect
 
     # ── Two-phase reference search ─────────────────────────────────────────
     if !isempty(ref_window) && length(neighbors) >= 1
-        # Phase 1: cheap overlap screening for all candidates
-        overlap_candidates = Vector{Tuple{Int,Vector{T},T}}()  # (overlap, ref_nl, distance)
+        # Phase 1: cheap overlap screening (reuse workspace vectors)
+        _oc = ws !== nothing ? ws.overlap_candidates : Vector{Tuple{Int,Vector{T},T}}()
+        empty!(_oc)
         for (i, ref_v) in enumerate(ref_window)
             ref_nl = get(neighbor_lists, ref_v, T[])
             isempty(ref_nl) && continue
             ov = _sorted_overlap_count(neighbors, ref_nl)
             ov < 1 && continue
             distance = T(length(ref_window) - i + 1)
-            push!(overlap_candidates, (ov, ref_nl, distance))
+            push!(_oc, (ov, ref_nl, distance))
         end
 
         # Sort by overlap descending, take top-K for full evaluation
-        sort!(overlap_candidates, by=x -> x[1], rev=true)
-        phase2_k = min(length(overlap_candidates), MAX_REF_CANDIDATES_PHASE2)
+        sort!(_oc, by=x -> x[1], rev=true)
+        _max_k = cost_model == COST_MODEL_FAST ? MAX_REF_CANDIDATES_PHASE2_FAST : MAX_REF_CANDIDATES_PHASE2
+        phase2_k = min(length(_oc), _max_k)
 
         # Pre-allocated workspace for merge
-        _merge_bmp = Bool[]
-        _merge_res = T[]
+        _merge_bmp = ws !== nothing ? ws.merge_bmp : Bool[]
+        _merge_res = ws !== nothing ? ws.merge_res : T[]
+        _best_bmp = ws !== nothing ? ws.best_bmp : Bool[]
+        _best_res = ws !== nothing ? ws.best_res : T[]
+        best_dist = zero(T)
 
         # Phase 2: full evaluation of top-K candidates
         for ci in 1:phase2_k
-            _, ref_nl, distance = overlap_candidates[ci]
+            _, ref_nl, distance = _oc[ci]
             _sorted_merge_ref!(_merge_bmp, _merge_res, neighbors, ref_nl)
 
             # Copy cost (computed once per candidate)
             dist_cost = fixwidth_ref ? ref_dist_bits : estimate_encoded_value_cost(distance, ie)
             copy_c = _copy_cost(_merge_bmp)
-
-            # Save bitmap/residuals for potential best update (copy once)
-            bmp_snapshot = copy(_merge_bmp)
-            res_snapshot = copy(_merge_res)
 
             for (enc_type, mil) in _enc_options
                 delta_variants = if adaptive_deltas && enc_type == :delta
@@ -4190,8 +4266,8 @@ function _greedy_vertex_search(neighbors::Vector{T}, neighbor_lists::Dict{T,Vect
                     for (res_et, res_mil) in res_options
                         res_use_stop = res_et == :delta ? actual_stop : false
                         res_c = base_ref_c
-                        if !isempty(res_snapshot)
-                            res_c += _cost_for_list(res_snapshot, res_mil, res_et, res_use_stop)
+                        if !isempty(_merge_res)
+                            res_c += _cost_for_list(_merge_res, res_mil, res_et, res_use_stop)
                         end
                         if split_residual
                             if res_et == enc_type && (res_mil == mil || res_et == :delta)
@@ -4207,25 +4283,33 @@ function _greedy_vertex_search(neighbors::Vector{T}, neighbor_lists::Dict{T,Vect
                             best_ref_mode = :reference
                             best_mil = mil
                             best_enc_type = enc_type
-                            best_ref_result = (distance, bmp_snapshot, res_snapshot)
                             best_use_stop = use_stop
                             best_res_enc_type = res_et
                             best_res_mil = res_mil
+                            # Deferred copy: only copy on improvement
+                            _copyto_resize!(_best_bmp, _merge_bmp)
+                            _copyto_resize!(_best_res, _merge_res)
+                            best_dist = distance
                         end
                     end
                 end
             end
         end
 
+        if best_ref_mode == :reference
+            best_ref_result = (best_dist, copy(_best_bmp), copy(_best_res))
+        end
+
         # ── Multi-reference search ─────────────────────────────────────────
         if multi_ref && !adaptive_header && length(neighbors) >= 6
             # Reuse phase 1 overlap data for ref1 top-5 selection
-            top_k1 = min(length(overlap_candidates), 5)
+            top_k1 = min(length(_oc), 5)
 
             # Build ref1 candidates with full merge data
-            ref1_data = Vector{Tuple{T, Vector{Bool}, Vector{T}, Int}}()  # (dist, bmp, res, base_cost)
+            # (ref1 copies are necessary since they're iterated over for ref2 pairing)
+            ref1_data = Vector{Tuple{T, Vector{Bool}, Vector{T}, Int}}()
             for k in 1:top_k1
-                _, ref_nl, dist1 = overlap_candidates[k]
+                _, ref_nl, dist1 = _oc[k]
                 _sorted_merge_ref!(_merge_bmp, _merge_res, neighbors, ref_nl)
                 length(_merge_res) < 3 && continue
                 bmp1 = copy(_merge_bmp)
@@ -4245,7 +4329,6 @@ function _greedy_vertex_search(neighbors::Vector{T}, neighbor_lists::Dict{T,Vect
             _merge_res2 = T[]
 
             for (dist1, bmp1, res1, ref1_base) in ref1_data
-                # Phase 1 for ref2: overlap with res1 (already sorted)
                 for (i, ref_v) in enumerate(ref_window)
                     ref2_nl = get(neighbor_lists, ref_v, T[])
                     isempty(ref2_nl) && continue
@@ -4258,20 +4341,17 @@ function _greedy_vertex_search(neighbors::Vector{T}, neighbor_lists::Dict{T,Vect
                     ref2_dist_cost = fixwidth_ref ? ref_dist_bits : estimate_encoded_value_cost(dist2, ie)
                     ref2_copy_cost = _copy_cost(_merge_bmp2)
 
-                    bmp2_snap = copy(_merge_bmp2)
-                    res2_snap = copy(_merge_res2)
-
-                    for (enc_type, mil) in ENCODING_OPTIONS
+                    for (enc_type, mil) in _enc_options
                         use_stop = (enc_type == :delta) ? stop_deltas : false
                         multi_header = _vlc_header_cost(:multi_ref, enc_type, mil)
                         total = multi_header + ref1_base + ref2_dist_cost + ref2_copy_cost
-                        if !isempty(res2_snap)
-                            total += _cost_for_list(res2_snap, mil, enc_type, use_stop)
+                        if !isempty(_merge_res2)
+                            total += _cost_for_list(_merge_res2, mil, enc_type, use_stop)
                         end
 
                         if total < best_multi_cost
                             best_multi_cost = total
-                            best_multi_result = (dist1, bmp1, dist2, bmp2_snap, res2_snap)
+                            best_multi_result = (dist1, bmp1, dist2, copy(_merge_bmp2), copy(_merge_res2))
                             best_multi_enc_type = enc_type
                             best_multi_mil = mil
                             best_multi_use_stop = use_stop
@@ -4385,7 +4465,9 @@ function _cs_vertex_search(neighbors::Vector{T}, neighbor_lists::Dict{T,Vector{T
                            vertex_id=nothing, compact_copy::Bool=true,
                            tight_intervals::Bool=true,
                            lr_split::Bool=false, fixwidth_ref::Bool=false,
-                           ref_dist_bits::Int=0) where {T<:Unsigned}
+                           ref_dist_bits::Int=0,
+                           ws::Union{VertexSearchWorkspace{T},Nothing}=nothing,
+                           cost_model::Int=COST_MODEL_FULL) where {T<:Unsigned}
     if isempty(neighbors)
         return (ie, :none, MIL_OPTIONS[1], nothing, :interval, false)
     end
@@ -4398,7 +4480,8 @@ function _cs_vertex_search(neighbors::Vector{T}, neighbor_lists::Dict{T,Vector{T
     best_use_stop = false
 
     # No-ref evaluation
-    for (enc_type, mil) in ENCODING_OPTIONS
+    _cs_enc_options = cost_model == COST_MODEL_FAST ? FAST_ENCODING_OPTIONS : ENCODING_OPTIONS
+    for (enc_type, mil) in _cs_enc_options
         use_stop = enc_type == :delta
         noref_header = _cs_header_cost(:none, enc_type, mil, false)
         base_cost = noref_header + _estimate_base_cost(neighbors, ie, mil, enc_type;
@@ -4417,40 +4500,42 @@ function _cs_vertex_search(neighbors::Vector{T}, neighbor_lists::Dict{T,Vector{T
 
     # ── Two-phase reference search ─────────────────────────────────────
     if !isempty(ref_window) && length(neighbors) >= 1
-        # Phase 1: cheap overlap screening
-        overlap_candidates = Vector{Tuple{Int,Vector{T},T}}()
+        # Phase 1: cheap overlap screening (reuse workspace vectors)
+        _oc = ws !== nothing ? ws.overlap_candidates : Vector{Tuple{Int,Vector{T},T}}()
+        empty!(_oc)
         for (i, ref_v) in enumerate(ref_window)
             ref_nl = get(neighbor_lists, ref_v, T[])
             isempty(ref_nl) && continue
             ov = _sorted_overlap_count(neighbors, ref_nl)
             ov < 1 && continue
             distance = T(length(ref_window) - i + 1)
-            push!(overlap_candidates, (ov, ref_nl, distance))
+            push!(_oc, (ov, ref_nl, distance))
         end
 
-        sort!(overlap_candidates, by=x -> x[1], rev=true)
-        phase2_k = min(length(overlap_candidates), MAX_REF_CANDIDATES_PHASE2)
+        sort!(_oc, by=x -> x[1], rev=true)
+        _max_k_cs = cost_model == COST_MODEL_FAST ? MAX_REF_CANDIDATES_PHASE2_FAST : MAX_REF_CANDIDATES_PHASE2
+        phase2_k = min(length(_oc), _max_k_cs)
 
-        _merge_bmp = Bool[]
-        _merge_res = T[]
+        _merge_bmp = ws !== nothing ? ws.merge_bmp : Bool[]
+        _merge_res = ws !== nothing ? ws.merge_res : T[]
+        _best_bmp = ws !== nothing ? ws.best_bmp : Bool[]
+        _best_res = ws !== nothing ? ws.best_res : T[]
+        best_dist = zero(T)
 
         # Phase 2: full evaluation of top-K candidates
         for ci in 1:phase2_k
-            _, ref_nl, distance = overlap_candidates[ci]
+            _, ref_nl, distance = _oc[ci]
             _sorted_merge_ref!(_merge_bmp, _merge_res, neighbors, ref_nl)
 
             dist_cost = fixwidth_ref ? ref_dist_bits : estimate_encoded_value_cost(distance, ie)
-            copy_c = _estimate_adaptive_copy_cost(_merge_bmp, ie; compact_copy=compact_copy)
+            copy_c = cost_model == COST_MODEL_FAST ? _estimate_copy_cost_fast(_merge_bmp) : _estimate_adaptive_copy_cost(_merge_bmp, ie; compact_copy=compact_copy)
 
-            bmp_snapshot = copy(_merge_bmp)
-            res_snapshot = copy(_merge_res)
-
-            for (enc_type, mil) in ENCODING_OPTIONS
+            for (enc_type, mil) in _cs_enc_options
                 use_stop = enc_type == :delta
                 ref_header = _cs_header_cost(:reference, enc_type, mil, false)
                 ref_c = ref_header + dist_cost + copy_c
-                if !isempty(res_snapshot)
-                    ref_c += _estimate_base_cost(res_snapshot, ie, mil, enc_type;
+                if !isempty(_merge_res)
+                    ref_c += _estimate_base_cost(_merge_res, ie, mil, enc_type;
                         vertex_id=vertex_id, stop_deltas=use_stop, tight_intervals=tight_intervals,
                         lr_split=lr_split)
                 end
@@ -4460,10 +4545,17 @@ function _cs_vertex_search(neighbors::Vector{T}, neighbor_lists::Dict{T,Vector{T
                     best_ref_mode = :reference
                     best_mil = mil
                     best_enc_type = enc_type
-                    best_ref_result = (distance, bmp_snapshot, res_snapshot)
                     best_use_stop = use_stop
+                    # Deferred copy: only copy on improvement
+                    _copyto_resize!(_best_bmp, _merge_bmp)
+                    _copyto_resize!(_best_res, _merge_res)
+                    best_dist = distance
                 end
             end
+        end
+
+        if best_ref_mode == :reference
+            best_ref_result = (best_dist, copy(_best_bmp), copy(_best_res))
         end
     end
 
@@ -4476,7 +4568,8 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         integer_encoding::Symbol=:fibonacci,
         compact_copy::Bool=true,
         tight_intervals::Bool=true,
-        lr_split::Bool=false) where {T<:Unsigned}
+        lr_split::Bool=false,
+        cost_model::Int=DEFAULT_COST_MODEL) where {T<:Unsigned}
 
     vs = length(keys(neighbor_lists))
     ie = integer_encoding
@@ -4484,6 +4577,9 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
 
     fixwidth_ref = lr_split  # fixed-width ref distances when lr_split active (same as BG)
     ref_dist_bits = fixwidth_ref ? max(Int(ceil(log2(ref_window_size + 1))), 1) : 0
+
+    # Pre-allocated workspace for vertex search (avoids per-vertex allocations)
+    _ws = VertexSearchWorkspace{T}()
 
     reference_window = T[]
     function add_to_ref_window!(vertex::T)
@@ -4512,7 +4608,8 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         _, ref_mode, mil, ref_result, enc_type, use_stop = _cs_vertex_search(
             current_neighbors, neighbor_lists, reference_window, ie;
             vertex_id=v, compact_copy=compact_copy, tight_intervals=tight_intervals,
-            lr_split=lr_split, fixwidth_ref=fixwidth_ref, ref_dist_bits=ref_dist_bits)
+            lr_split=lr_split, fixwidth_ref=fixwidth_ref, ref_dist_bits=ref_dist_bits,
+            ws=_ws, cost_model=cost_model)
 
         # Write CS header
         _write_cs_header(wr, ref_mode, enc_type, mil, false)
@@ -4560,8 +4657,7 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
 
     if idx_mode
         # Two-pass encoding: encode per-vertex data to buffer, then write offset table + data
-        buf_io = IOBuffer()
-        buf_bw = BitWriter(buf_io)
+        buf_bw = BitWriter()
         vertex_offsets = Vector{Int}(undef, vs + 1)
 
         for v_idx in 1:vs
@@ -4571,7 +4667,7 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
             _encode_cs_vertex!(buf_bw, v, current_neighbors)
         end
         flush_bitwriter(buf_bw; flush_last_bits=true)
-        vertex_offsets[vs + 1] = Int(position(buf_io)) * 8
+        vertex_offsets[vs + 1] = bytes_written(buf_bw) * 8
 
         # Compute entry width
         max_offset = vertex_offsets[vs + 1]
@@ -4584,8 +4680,7 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         end
 
         # Write buffered encoded data
-        seekstart(buf_io)
-        buf_data = take!(buf_io)
+        buf_data = collect(get_bytes(buf_bw))
         write_bytes(w, buf_data)
     else
         # Children mode: sequential encoding

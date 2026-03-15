@@ -99,8 +99,7 @@ function run_instrumented_bg(nls, vs, T_v, ie, ref_window_size, ref_dist_bits, t
         end
     end
 
-    io_out = IOBuffer()
-    bw_out = BitWriter(io_out)
+    bw_out = BitWriter()
     write_bit(bw_out, false)
     for _ in 1:3; write_bit(bw_out, false); end
 
@@ -173,7 +172,7 @@ function run_instrumented_bg(nls, vs, T_v, ie, ref_window_size, ref_dist_bits, t
     end
 
     flush_bitwriter(bw_out; flush_last_bits=true)
-    total_data_bits = Int(position(io_out)) * 8
+    total_data_bits = bw_out.bit_count
 
     return (header_bits_total=header_bits_total, ref_dist_bits_total=ref_dist_bits_total,
             copy_bits_total=copy_bits_total, add_bits_total=add_bits_total,
@@ -272,8 +271,7 @@ function run_instrumented_bg_cg_style(nls, vs, T_v, ie, ref_window_size, ref_dis
         end
     end
 
-    io_out = IOBuffer()
-    bw_out = BitWriter(io_out)
+    bw_out = BitWriter()
     write_bit(bw_out, false)
     for _ in 1:3; write_bit(bw_out, false); end
 
@@ -336,7 +334,7 @@ function run_instrumented_bg_cg_style(nls, vs, T_v, ie, ref_window_size, ref_dis
         add_to_ref_window!(v)
     end
     flush_bitwriter(bw_out; flush_last_bits=true)
-    total_data_bits = Int(position(io_out)) * 8
+    total_data_bits = bw_out.bit_count
     return (ref_count=ref_count, noref_count=noref_count, empty_count=empty_count,
             total_data_bits=total_data_bits, header_bits_total=header_bits_total,
             ref_dist_bits_total=ref_dist_bits_total, copy_bits_total=copy_bits_total,

@@ -18,7 +18,7 @@
 # Each method: write .mgz → load .mgz → verify graph restored
 #
 # Usage:
-#   julia --project test/run_tests_webgraph_best_compression.jl [DATASET] [METHOD] [K] [MAX_CLUSTER_SIZE] [LLP_PASSES]
+#   julia --project test/run_tests_webgraph_best_compression.jl [DATASET] [METHOD] [K] [MAX_CLUSTER_SIZE] [LLP_PASSES] [COST_MODEL]
 #
 # DATASET           name of a subdirectory under datasets/webgraph/ that contains
 #                   a CSV file named DATASET.csv (e.g. "cnr-2000", "in-2004").
@@ -37,6 +37,10 @@
 #
 # LLP_PASSES        number of label-propagation passes per resolution level
 #                   for LLP reordering (BG/CS). Default: 10.
+#
+# COST_MODEL        cost estimation model: 0=full (all encoding options),
+#                   1=fast (skip RLE, single MIL, simpler copy cost).
+#                   Default: 0.
 #
 # Examples:
 #   julia --project test/run_tests_webgraph_best_compression.jl
@@ -70,6 +74,7 @@ const AUTO_K           = lowercase(K_ARG) == "auto"
 const K                = AUTO_K ? 0 : parse(Int, K_ARG)   # 0 = placeholder, resolved after loading graph
 const MAX_CLUSTER_SIZE = length(ARGS) >= 4 ? parse(Int, ARGS[4]) : 0
 const LLP_PASSES       = length(ARGS) >= 5 ? parse(Int, ARGS[5]) : 10
+const COST_MODEL_ARG   = length(ARGS) >= 6 ? parse(Int, ARGS[6]) : 0  # 0=full, 1=fast
 
 # Sanitised short name for file prefixes (e.g. "cnr-2000" → "cnr2000", "in-2004" → "in2004")
 const PREFIX  = replace(DATASET, "-" => "")
@@ -84,6 +89,7 @@ const RUN_CG = METHOD in ("all", "cg")
 @info "Method:  $METHOD  (BG=$RUN_BG, CS=$RUN_CS, CG=$RUN_CG)"
 @info "CG: K=$(AUTO_K ? "auto" : K), max_cluster_size=$(MAX_CLUSTER_SIZE == 0 ? "disabled" : MAX_CLUSTER_SIZE)"
 @info "LLP: passes=$LLP_PASSES"
+@info "Cost model: $(COST_MODEL_ARG == 0 ? "full" : "fast") ($COST_MODEL_ARG)"
 @info "  CSV:   $DS_CSV"
 @info "  Out:   $DS_DIR"
 
@@ -94,9 +100,9 @@ const DATASET_PARAMS = Dict(
     "cnr-2000" => (
         bg_write = (coding_scheme=:children, integer_encoding=:fibonacci,
                      ref_window_size=64, copy_blocks=true,
-                     stop_deltas=true, lr_split=true, multi_ref=true),
+                     stop_deltas=true, lr_split=false, multi_ref=true),
         cs_write  = (coding_scheme=:children, integer_encoding=:fibonacci,
-                     ref_window_size=64, compact_copy=true, tight_intervals=true),
+                     ref_window_size=256, compact_copy=true, tight_intervals=true),
         cg_params = CGParams(
             L=128,
             varint=:fibonacci, count_varint=:fibonacci,
@@ -326,8 +332,18 @@ n_orig = nv(g_original)
 m_orig = ne(g_original)
 @info "  Loaded in $(round(time()-t_load, digits=1))s: $n_orig vertices, $m_orig edges"
 
-# Compute (or load cached) global LLP ordering — shared by BG, CS, and CG K=1
-if LLP_PASSES > 0
+# Compute (or load cached) ordering for BG/CS/CG-K=1.
+# Prefer Leiden+LLP ordering if available (produces best BPE for BG/CS).
+# Falls back to plain LLP, or original ordering if LLP_PASSES=0.
+leiden_llp_path = joinpath(DS_DIR, "$(PREFIX)_leiden_llp_order.bin")
+if isfile(leiden_llp_path)
+    @info "Using cached Leiden+LLP ordering: $leiden_llp_path"
+    t_rel = time()
+    TV = eltype(g_original)
+    vertex_map = load_llp_ordering(leiden_llp_path, TV)
+    g_rel = relabel_graph(g_original, vertex_map)
+    @info "  Leiden+LLP ready in $(round(time()-t_rel, digits=1))s"
+elseif LLP_PASSES > 0
     @info "Global LLP ordering (passes=$LLP_PASSES)..."
     t_rel = time()
     vertex_map = get_global_llp(g_original, DS_DIR, PREFIX; passes=LLP_PASSES)
@@ -369,7 +385,7 @@ if RUN_BG
 
     # Write .mgz
     t_enc = time()
-    write_bg_mgs3_graph(g_rel, bg_base; PARAMS.bg_write...)
+    write_bg_mgs3_graph(g_rel, bg_base; PARAMS.bg_write..., cost_model=COST_MODEL_ARG)
     dt_enc = round(time() - t_enc, digits=2)
 
     @test isfile(bg_mgz)
@@ -403,7 +419,7 @@ if RUN_CS
 
     # Write .mgz
     t_enc = time()
-    write_cs_mgs3_graph(g_rel, cs_base; PARAMS.cs_write...)
+    write_cs_mgs3_graph(g_rel, cs_base; PARAMS.cs_write..., cost_model=COST_MODEL_ARG)
     dt_enc = round(time() - t_enc, digits=2)
 
     @test isfile(cs_mgz)
@@ -429,7 +445,10 @@ end # RUN_CS
 # ============================================================================
 
 if RUN_CG
-    cg_params = PARAMS.cg_params
+    # Merge cost_model from CLI into CG params
+    cg_params = let p = PARAMS.cg_params
+        CGParams(; (fn => getfield(p, fn) for fn in fieldnames(CGParams) if fn != :cost_model)..., cost_model=COST_MODEL_ARG)
+    end
 
     # Resolve K: auto-select or use CLI value
     CG_K = if AUTO_K

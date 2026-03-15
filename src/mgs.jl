@@ -21,14 +21,15 @@ using ..NodeTypes: Node, EmptyNode
 using ..CustomLightGraphs: SimpleDiGraph, SimpleGraph, SimpleEdge
 using ..Util: infer_uint_custom_type, to_bytes
 using ..IO: BitWriter, write_bytes, flush_bitwriter, BitReader,
-	write_value, read_value
+	write_value, read_value, write_to_io, bytes_written, get_bytes, reset_bitwriter!
 
 using ..Compression: huffman_encoding, get_huffman_codes!, decode_huffman_values,
 	delta_encode_vector, write_elias_coding, read_elias_coding,
 	write_golomb, read_golomb, write_fibonacci, read_fibonacci,
 	write_zeta, read_zeta, write_compressed_graph_data, read_compressed_graph_data,
 	write_greedy_graph_data, read_greedy_graph_data,
-	write_cmdstream_graph_data, read_cmdstream_graph_data
+	write_cmdstream_graph_data, read_cmdstream_graph_data,
+	COST_MODEL_FULL, COST_MODEL_FAST, DEFAULT_COST_MODEL
 
 using ..Compression.CG: encode_level, decode_level, CGParams, CGStats
 
@@ -861,7 +862,8 @@ function write_bg_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString;
 		stop_deltas::Bool=true,
 		lr_split::Bool=false, exact_costing::Bool=false,
 		multi_ref::Bool=false,
-		adaptive_header::Bool=false) where {T<:Unsigned}
+		adaptive_header::Bool=false,
+		cost_model::Int=DEFAULT_COST_MODEL) where {T<:Unsigned}
 	vs = vertices(g)
 	gs = convert(UInt64, length(vs))
 
@@ -884,8 +886,7 @@ function write_bg_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString;
 		(gs & 0xff), ((gs >> 8) & 0xff), ((gs >> 16) & 0xff), ((gs >> 24) & 0xff), ((gs >> 32) & 0xff)
 	]
 
-	f = open(filename * ".mgz", "w")
-	bw = BitWriter(f)
+	bw = BitWriter()
 
 	write_bytes(bw, header_bytes)
 
@@ -902,10 +903,13 @@ function write_bg_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString;
 		compact_copy=true,
 		tight_intervals=true, fixwidth_ref=lr_split,
 		exact_costing=exact_costing, lr_split=lr_split,
-		multi_ref=multi_ref, adaptive_header=adaptive_header)
+		multi_ref=multi_ref, adaptive_header=adaptive_header,
+		cost_model=cost_model)
 
 	flush_bitwriter(bw; flush_last_bits=true)
-	close(f)
+	open(filename * ".mgz", "w") do f
+		write_to_io(bw, f)
+	end
 end
 
 ################################################################################
@@ -921,7 +925,8 @@ Produces a `.mgz` file with v3.1 header (params encoded in byte2).
 function write_cs_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString;
 		coding_scheme::Symbol=:children, integer_encoding::Symbol=:fibonacci,
 		ref_window_size::Int=64, compact_copy::Bool=true,
-		tight_intervals::Bool=true, lr_split::Bool=false) where {T<:Unsigned}
+		tight_intervals::Bool=true, lr_split::Bool=false,
+		cost_model::Int=DEFAULT_COST_MODEL) where {T<:Unsigned}
 	vs = vertices(g)
 	gs = convert(UInt64, length(vs))
 
@@ -944,8 +949,7 @@ function write_cs_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString;
 		(gs & 0xff), ((gs >> 8) & 0xff), ((gs >> 16) & 0xff), ((gs >> 24) & 0xff), ((gs >> 32) & 0xff)
 	]
 
-	f = open(filename * ".mgz", "w")
-	bw = BitWriter(f)
+	bw = BitWriter()
 
 	write_bytes(bw, header_bytes)
 
@@ -958,10 +962,13 @@ function write_cs_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString;
 	@info("writing CS compressed graph data")
 	write_cmdstream_graph_data(bw, nls, coding_scheme, ref_window_size;
 		integer_encoding=integer_encoding, compact_copy=compact_copy,
-		tight_intervals=tight_intervals, lr_split=lr_split)
+		tight_intervals=tight_intervals, lr_split=lr_split,
+		cost_model=cost_model)
 
 	flush_bitwriter(bw; flush_last_bits=true)
-	close(f)
+	open(filename * ".mgz", "w") do f
+		write_to_io(bw, f)
+	end
 end
 
 ################################################################################
@@ -1001,8 +1008,7 @@ function write_cg_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString,
 		(gs & 0xff), ((gs >> 8) & 0xff), ((gs >> 16) & 0xff), ((gs >> 24) & 0xff), ((gs >> 32) & 0xff)
 	]
 
-	f = open(filename * ".mgz", "w")
-	bw = BitWriter(f)
+	bw = BitWriter()
 
 	write_bytes(bw, header_bytes)
 
@@ -1010,8 +1016,7 @@ function write_cg_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString,
 	if coding_scheme == :index
 		# Two-pass encoding: encode to buffer, then write offset table + data
 		@info("writing CG compressed graph data (index mode, two-pass)")
-		buf_io = IOBuffer()
-		buf_bw = BitWriter(buf_io)
+		buf_bw = BitWriter()
 
 		# Pass 1: encode to buffer, record cluster start bit offsets
 		K = length(clusters)
@@ -1019,7 +1024,6 @@ function write_cg_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString,
 		encode_level(buf_bw, g, clusters; params=params, stats=stats, progress=progress,
 			cluster_offsets=cg_offsets)
 		flush_bitwriter(buf_bw; flush_last_bits=true)
-		total_encoded_bits = Int(position(buf_io)) * 8
 
 		# Compute entry width (must cover all offsets including inter per-source)
 		max_offset = maximum(cg_offsets[1:(K+1)])  # intra + inter start are absolute
@@ -1038,16 +1042,17 @@ function write_cg_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString,
 		end
 
 		# Write buffered encoded data
-		seekstart(buf_io)
-		buf_data = take!(buf_io)
-		write_bytes(bw, buf_data)
+		buf_data = get_bytes(buf_bw)
+		write_bytes(bw, collect(buf_data))
 	else
 		@info("writing CG compressed graph data")
 		encode_level(bw, g, clusters; params=params, stats=stats, progress=progress)
 	end
 
 	flush_bitwriter(bw; flush_last_bits=true)
-	close(f)
+	open(filename * ".mgz", "w") do f
+		write_to_io(bw, f)
+	end
 
 	# Log bit budget breakdown
 	m = ne(g)

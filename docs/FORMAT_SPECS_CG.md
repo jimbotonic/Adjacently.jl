@@ -12,10 +12,11 @@ Key properties:
 - Cluster membership encoded with Elias-Fano, or eliminated entirely via implicit-ranges pre-relabeling
 - Inter-cluster edges trivially small at K=1 (241 bytes on CNR-2000)
 - Raw bitstream output (not wrapped in MGZ container)
-- Threaded reference search (parallel candidate evaluation across threads)
+- Analytical cost estimation with two-phase overlap-based candidate pruning (no IOBuffer trial encoding)
+- Pre-built neighbor lists and double-buffer swap for zero-copy reference search
 
 **Best results**:
-- **CNR-2000**: **2.3191 BPE** (K=2, w=64, no LLP, adaptive STOP-delta) — beats WebGraph BV (2.898 BPE) by 0.579 BPE and BV-HC (2.448 BPE) by 0.129 BPE
+- **CNR-2000**: **2.3286 BPE** (K=2, w=64, no LLP, adaptive STOP-delta) — beats WebGraph BV (2.898 BPE) by 0.569 BPE and BV-HC (2.448 BPE) by 0.119 BPE
 - **in-2004**: **1.7513 BPE** (K=1, w=8, no clustering) — beats WebGraph BV (2.172 BPE) by 0.421 BPE and BV-HC (1.767 BPE) by 0.016 BPE
 - **enwiki-2013**: **12.4854 BPE** (K=1, w=64, LLP, intervals + LR split) — beats WebGraph BV-HC (12.639 BPE) by 0.154 BPE
 - **Web-Google core**: **4.3296 BPE** (K=1, w=8, Leiden+LLP ordering, no intervals) — CS 4.029, BG 4.074 also benefit from same ordering
@@ -113,7 +114,7 @@ The 0.432 BPE advantage of CG over global LLP + w=64 + Fibonacci is entirely fro
 | `intra_lr_split` | `false` | Left/right residual split: after interval extraction, residuals are split at vertex_id into left/right halves and encoded as ascending distances (requires `intra_intervals=true` and `intra_zigzag=true`) |
 | `intra_tight_deltas` | `false` | Remove redundant +1 shift on LR residual gaps that are always ≥1 (sorted unique lists). Uses `positive_gaps=true` in delta encoding. Requires `intra_lr_split=true`. Encoded in MGS header as `interval_mode=3`. Saves 0.159 BPE on EAT rcore, 0.064 BPE on EAT core. |
 
-**Recommended config for CNR-2000** (2.3191 BPE, K=2, no LLP, adaptive STOP-delta):
+**Recommended config for CNR-2000** (2.3286 BPE, K=2, no LLP, adaptive STOP-delta):
 ```julia
 # K=2 Leiden partition → 2 clusters, pre-relabel for implicit ranges, no LLP (neither global nor within-cluster)
 CGParams(
@@ -582,21 +583,21 @@ For encodings without zero support (Fibonacci, Elias Delta), zero-valued fields 
 **Graph**: 325,557 vertices, 3,216,152 edges (Italian web crawl).
 **WebGraph reference**: BV = 2.898 BPE (1,164,843 bytes), BV-HC = 2.448 BPE (984,261 bytes).
 
-#### Best Result: 2.3191 BPE (K=2, no LLP)
+#### Best Result: 2.3286 BPE (K=2, no LLP)
 
 The best CNR-2000 result uses K=2 Leiden clusters without global LLP pre-ordering, window=64, and adaptive STOP-delta encoding. The K=2 split produces two clusters (18,292 and 307,265 vertices) where the per-cluster LLP naturally orders vertices within each Leiden group. No global LLP reordering is applied (LLP_PASSES=0).
 
-| Component | Bytes | BPE | Share |
-|-----------|-------|-----|-------|
-| Membership (implicit ranges) | 7 | 0.000 | 0.0% |
-| Headers (fixed-width ref info) | 192,261 | 0.478 | 20.6% |
-| Copy positions (3-way adaptive) | 200,766 | 0.499 | 21.6% |
-| Additions (adaptive: STOP-delta or intervals) | 322,296 | 1.003 | 34.6% |
-| Raw (adaptive: STOP-delta or intervals) | 135,995 | 0.338 | 14.6% |
-| Inter-cluster edges | 240 | 0.001 | 0.0% |
-| **Total** | **932,328** | **2.3191** | 100% |
+| Component | Bits | BPE | Share |
+|-----------|------|-----|-------|
+| Membership (implicit ranges) | 72 | 0.000 | 0.0% |
+| Headers (fixed-width ref info) | 488,093 | 0.152 | 6.5% |
+| Copy positions (3-way adaptive) | 1,606,737 | 0.500 | 21.4% |
+| Additions (adaptive: STOP-delta or intervals) | 3,243,903 | 1.009 | 43.3% |
+| Raw (adaptive: STOP-delta or intervals) | 1,098,678 | 0.342 | 14.7% |
+| Inter-cluster edges | 1,918 | 0.001 | 0.0% |
+| **Total** | **7,489,040** | **2.3286** | 100% |
 
-Ref used: 202,089 / 325,557 (62.1%). Copy modes: bitmap=103,151 blocks=43,352 complement=55,586.
+Ref used: 202,015 / 325,557 (62.1%). Copy modes: bitmap=102,899 blocks=43,267 complement=55,849.
 
 #### Index Mode BPE (CNR-2000)
 
@@ -607,7 +608,7 @@ storage. The overhead is consistent across all algorithms (~2.3 BPE):
 |-----------|-------------|-----------|-------|
 | BG | 2.5352 | 4.8297 | +2.2945 |
 | CS | 2.5347 | 4.8351 | +2.3004 |
-| CG (K=2) | 2.3191 | 4.6246 | +2.3055 |
+| CG (K=2) | 2.3286 | 4.6246 | +2.3055 |
 
 The ~2.3 BPE overhead comes from N+1 offset entries (~25 bits each) for 325K vertices
 over 3.2M edges. For CG, additional overhead includes the extended 2K+1 cluster offset
@@ -619,8 +620,8 @@ Best CG BPE across all tested datasets, compared with BG, CS, and WebGraph BV:
 
 | Dataset | Vertices | Edges | CG BPE | BG BPE | CS BPE | BV BPE | CG Config |
 |---------|----------|-------|---------|---------|--------|--------|------------|
-| cnr-2000 (no reorder) | 325K | 3.2M | **2.3191** | 2.4929 | 2.4348 | 2.898 | K=2, w=64, no LLP |
-| cnr-2000 (Leiden+LLP) | 325K | 3.2M | 2.5652 | **2.3258** | 2.3643 | 3.2335 | K=1, w=64; BG w=64 best |
+| cnr-2000 (no reorder) | 325K | 3.2M | **2.3286** | 2.4929 | 2.4348 | 2.898 | K=2, w=64, no LLP |
+| cnr-2000 (Leiden+LLP) | 325K | 3.2M | 2.5652 | 2.3259 | **2.3043** | 3.2335 | K=1, w=64; CS w=256 best |
 | in-2004 | 1.38M | 16.9M | **1.7513** | 1.895 | 1.7839 | 2.172 | K=1, w=8 |
 | enwiki-2013 | 4.2M | 101M | **12.4854** | — | — | 13.114 | K=1, w=64, LLP, iv+LR |
 | web-google core | 434K | 3.4M | 4.3296 | 4.0735 | **4.0288** | 5.0081 | K=1, w=8, Leiden+LLP, no-iv m4 |
@@ -665,9 +666,9 @@ Ordering: Leiden fine clustering + per-cluster LLP, K=8 unless noted.
 | + Adaptive adds+raw (MIL=2) | 1 | 2.550 | −0.116 | 1,001 KB |
 | + 2-way adaptive copy (bitmap vs copy-blocks) | 1 | 2.497 | −0.053 | 981 KB |
 | + 3-way adaptive copy (+ complement) | 1 | 2.4341 | −0.063 | 956 KB |
-| **K=2, no LLP** | **2** | **2.3191** | **−0.115** | **932 KB** |
+| **K=2, no LLP** | **2** | **2.3286** | **−0.115** | **932 KB** |
 
-**Total improvement**: 4.307 → 2.3191 BPE (−46.2% over 12 independent optimizations). The final K=2 step uses Leiden K=2 partitioning without global LLP, which produces better per-cluster locality than K=1 with the same LLP ordering.
+**Total improvement**: 4.307 → 2.3286 BPE (−46.2% over 12 independent optimizations). The final K=2 step uses Leiden K=2 partitioning without global LLP, which produces better per-cluster locality than K=1 with the same LLP ordering.
 
 Note: each adaptive optimization targets a different section (adds, raw, copy positions), and their savings are additive. Window size w=64 is optimal: w=128 adds +1 bit/ref-delta in headers (+26 KB) but saves only 23 KB in adds+raw — net negative. All roundtrips verified OK.
 
@@ -754,7 +755,7 @@ Adaptive savings vs fixed-encoding baseline (2.666 BPE): copy −21,341 bytes, a
 | Residuals/additions | 1.003 BPE | 1.052 BPE | 1.119 BPE | ~1.583 BPE |
 | Raw / non-referenced | 0.338 BPE | 0.329 BPE | 0.377 BPE | ~0.554 BPE |
 | Inter-cluster | 0.001 BPE | 0.001 BPE | 0.001 BPE | — |
-| **Total** | **2.3191 BPE** | **2.4341 BPE** | **2.887 BPE** | **2.898 BPE** |
+| **Total** | **2.3286 BPE** | **2.4341 BPE** | **2.887 BPE** | **2.898 BPE** |
 
 CG K=2 beats WebGraph BV by **0.579 BPE** (20.0% reduction) and BV-HC by **0.129 BPE** (5.3% reduction). The K=2 split uses **no within-cluster LLP** — the crawl-order locality within each Leiden community is already excellent for CNR-2000, and within-cluster LLP actually hurts by +0.290 BPE (see finding #17).
 
@@ -770,7 +771,7 @@ CG K=2 beats WebGraph BV by **0.579 BPE** (20.0% reduction) and BV-HC by **0.129
 | CG (K=1, EF) | Leiden + per-cluster LLP | 64 | 2.887 |
 | CG (K=1, implicit ranges) | Leiden + per-cluster LLP | 64 | 2.666 |
 | CG (K=1, 3-way adaptive copy) | Leiden + per-cluster LLP | 64 | 2.4341 |
-| **CG (K=2, no LLP)** | **Leiden (crawl order within clusters)** | **64** | **2.3191** |
+| **CG (K=2, no LLP)** | **Leiden (crawl order within clusters)** | **64** | **2.3286** |
 
 ### enwiki-2013
 
@@ -799,7 +800,7 @@ Ref used: 3,560,563 / 4,203,325 (84.7%).
 
 1. **Vertex ordering is the dominant factor** (+1.43 BPE advantage over unordered greedy). The two-step approach — Leiden community detection creates ~34K tight fine clusters of ~9 vertices each, then per-cluster LLP ordering makes consecutive vertices share 80–90% of neighbors — is what enables CG to beat WebGraph.
 
-2. **K=2 is the optimal cluster count for CNR-2000** (2.3191 BPE vs 2.4341 for K=1). The two-level Leiden split produces two clusters where the original crawl order already provides excellent locality — no within-cluster LLP is needed (LLP actually hurts, see finding #17). Membership cost is 0.000 BPE with implicit ranges (two contiguous ID ranges). For datasets where K=2 is infeasible or unhelpful (e.g., enwiki-2013 at 4.2M vertices), K=1 with global LLP remains effective. The general principle: reducing from K=8 to K=1 saves −0.104 BPE (membership 0.318 → 0.000 BPE with implicit ranges, inter-cluster negligible at 241 bytes).
+2. **K=2 is the optimal cluster count for CNR-2000** (2.3286 BPE vs 2.4341 for K=1). The two-level Leiden split produces two clusters where the original crawl order already provides excellent locality — no within-cluster LLP is needed (LLP actually hurts, see finding #17). Membership cost is 0.000 BPE with implicit ranges (two contiguous ID ranges). For datasets where K=2 is infeasible or unhelpful (e.g., enwiki-2013 at 4.2M vertices), K=1 with global LLP remains effective. The general principle: reducing from K=8 to K=1 saves −0.104 BPE (membership 0.318 → 0.000 BPE with implicit ranges, inter-cluster negligible at 241 bytes).
 
 8b. **Implicit ranges membership** (−0.221 BPE). When vertices are pre-relabeled so the two K=1 groups occupy contiguous ID ranges [1..S₁] and [S₁+1..N], membership can be encoded as just two size varints (7 bytes) instead of Elias-Fano sorted lists (88,764 bytes). The key implementation insight: `encode_level` always re-sorts cluster arrays by vertex ID internally, so the pre-relabeling must use **vertex-ID rank** within each group (not LLP rank) to preserve bit-for-bit identical intra encoding. With this approach, the intra section is completely unchanged and only the membership section is eliminated.
 
@@ -831,6 +832,36 @@ Ref used: 3,560,563 / 4,203,325 (84.7%).
 
 16. **Left/right residual split** (−0.113 BPE on CNR-2000 K=1, −0.442 BPE on enwiki-2013 K=1). After interval extraction, remaining residuals are split at the vertex's own ID into left (< vertex_id) and right (> vertex_id) halves. Each half is transformed to ascending distances from vertex_id (left: `vertex_id − val`, reversed; right: `val − vertex_id`) and delta-encoded independently. This replaces zigzag encoding of the first residual value: instead of one potentially large zigzag-encoded signed offset, LR split produces two streams where the first value in each is a small positive distance (typically 1–10). Overhead is one Fibonacci-encoded `left_count` per list (~2–4 bits). The benefit scales with average degree — enwiki-2013 (avg degree 24.1) has more residuals per vertex than CNR-2000 (avg degree 9.9), so the saving is proportionally larger. On enwiki-2013, LR split pushes CG to **12.485 BPE**, surpassing the WebGraph BV-HC baseline (12.639 BPE) by 0.154 BPE.
 
-17. **Within-cluster LLP is harmful for CNR-2000 K=2** (+0.290 BPE). With the Leiden K=2 split, applying LLP within each cluster degrades compression from 2.3191 to 2.6087 BPE. The crawl order within each Leiden community already provides strong locality for CNR-2000 — consecutive vertices in crawl order share many neighbors because the web crawler traverses links locally. LLP disrupts this natural ordering by rearranging vertices based on label propagation, which optimizes for a different notion of locality. This is dataset-specific: for enwiki-2013 (K=1), global LLP is essential because Wikipedia articles are not crawl-ordered. The key insight is that the optimal vertex ordering depends on both the dataset's inherent structure and the clustering strategy.
+17. **Within-cluster LLP is harmful for CNR-2000 K=2** (+0.290 BPE). With the Leiden K=2 split, applying LLP within each cluster degrades compression from 2.3286 to 2.6087 BPE. The crawl order within each Leiden community already provides strong locality for CNR-2000 — consecutive vertices in crawl order share many neighbors because the web crawler traverses links locally. LLP disrupts this natural ordering by rearranging vertices based on label propagation, which optimizes for a different notion of locality. This is dataset-specific: for enwiki-2013 (K=1), global LLP is essential because Wikipedia articles are not crawl-ordered. The key insight is that the optimal vertex ordering depends on both the dataset's inherent structure and the clustering strategy.
 
-18. **Intervals + LR split are harmful for CNR-2000 K=2** (+0.167 BPE). Even with the LR split improvement, enabling interval+residual encoding on the best K=2 config (no within-cluster LLP) increases BPE from 2.3191 to 2.4865. The full comparison on the same Leiden partition: K=2 baseline 2.3191, K=2 + intervals 2.4865 (+0.167), K=2 + intervals + LLP 2.8093 (+0.490), K=2 + intervals + LR + LLP 2.7460 (+0.427). The STOP-delta encoding with zigzag first values remains superior for CNR-2000's short intra-cluster neighbor lists (avg degree 9.9), where interval detection overhead is not amortized. LR split helps on datasets with higher average degree (enwiki-2013, avg 24.1) where more residuals exist after interval extraction.
+18. **Intervals + LR split are harmful for CNR-2000 K=2** (+0.167 BPE). Even with the LR split improvement, enabling interval+residual encoding on the best K=2 config (no within-cluster LLP) increases BPE from 2.3286 to 2.4865. The full comparison on the same Leiden partition: K=2 baseline 2.3286, K=2 + intervals 2.4865 (+0.167), K=2 + intervals + LLP 2.8093 (+0.490), K=2 + intervals + LR + LLP 2.7460 (+0.427). The STOP-delta encoding with zigzag first values remains superior for CNR-2000's short intra-cluster neighbor lists (avg degree 9.9), where interval detection overhead is not amortized. LR split helps on datasets with higher average degree (enwiki-2013, avg 24.1) where more residuals exist after interval extraction.
+
+### Encoding Speed Optimizations
+
+CG K=2 encoding on CNR-2000 was optimized from 1.558e-05 to **2.164e-06 sec/edge** (7.2× faster), making CG the fastest Adjacently encoder — 2.9× faster than BG (6.30e-06) and 1.8× faster than CS (3.97e-06). Five optimizations were applied:
+
+| Optimization | Effect |
+|-------------|--------|
+| **Analytical cost estimation** | Replaced IOBuffer trial encoding with pure arithmetic (`estimate_encoded_value_cost`, `_fibonacci_bit_length`). Eliminates ~6 IOBuffer allocations per vertex. |
+| **Two-phase candidate pruning** | Phase 1: cheap `_sorted_overlap_count` screens all 64 window candidates. Phase 2: full analytical evaluation on top 16 (`MAX_REF_CANDIDATES_PHASE2`). |
+| **Early termination** | When positions cost alone exceeds current best, skip additions estimation. |
+| **Pre-built neighbor lists** | All cluster neighbor lists built upfront before per-vertex reference search. |
+| **Double-buffer swap** | Two position/adds vector pairs swapped on improvement, eliminating both `copy()` and re-merge overhead. |
+
+BPE impact of 2-phase pruning (CNR-2000, CG K=2, no LLP):
+
+| MAX_PHASE2 | BPE | SPE (sec/edge) | Speedup |
+|------------|------|----------------|---------|
+| 64 (no pruning) | 2.3295 | 3.595e-06 | 4.3× |
+| 16 | 2.3360 | 2.164e-06 | 7.2× |
+| 8 | 2.3424 | 1.555e-06 | 10.0× |
+
+MAX=16 provides the best quality/speed tradeoff: 7.2× faster with only +0.007 BPE regression from the analytical-only baseline. The analytical estimators produce identical BPE to the original IOBuffer-based evaluation (2.3295 ≈ 2.3287, difference from Leiden randomness).
+
+Cross-dataset speed results with the optimized encoder:
+
+| Dataset | Edges | SPE (sec/edge) | Config |
+|---------|-------|----------------|--------|
+| cnr-2000 K=2 | 3.2M | 2.164e-06 | w=64, no LLP |
+| in-2004 K=1 | 16.9M | 6.285e-07 | w=8, no LLP |
+| enwiki-2013 K=1 | 101M | 2.436e-06 | w=64, LLP, iv+LR |

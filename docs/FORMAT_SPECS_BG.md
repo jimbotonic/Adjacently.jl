@@ -448,9 +448,9 @@ Two-step ordering: Leiden community detection (K=1, producing 2 groups) followed
 
 Global LLP with 10 passes and `:sym` mode across all vertices. Produces slightly worse locality than Leiden+LLP for the greedy encoder because it ignores community structure when ordering vertices.
 
-### Key Finding: Greedy Beats BV and CG K=1
+### Key Finding: Greedy Beats BV and BV-HC
 
-The greedy approach surpasses both WebGraph BV (2.493 vs 2.898 BPE) and CG K=1 (2.493 vs 2.638 BPE) through a combination of per-vertex adaptive encoding, larger reference windows, multi-reference copying, aggressive low-degree reference search, and micro-optimizations (compact copy prefix, VLC, tight intervals, LR-split residuals). WebGraph BV-HC (2.448 BPE) still leads by ~0.04 BPE via host-aware compression. The ~0.17 BPE gap from BG to CG K=2 (2.319 BPE) is structural:
+With Leiden+LLP ordering, BG (2.326 BPE) surpasses both WebGraph BV (2.898 BPE) and BV-HC (2.448 BPE) through a combination of per-vertex adaptive encoding, larger reference windows, multi-reference copying, aggressive low-degree reference search, and micro-optimizations (compact copy prefix, VLC, tight intervals). CS (2.304 BPE) is the overall best single-pass method at w=256. The ~0.003 BPE gap from BG to CG K=2 (2.329 BPE) is minimal:
 - CG's **per-cluster local vertex indexing** (vertices renumbered 1...|C| within each cluster) enables much tighter intra-cluster reference encoding
 - The greedy approach uses global vertex IDs throughout, limiting the locality gains achievable
 
@@ -515,17 +515,17 @@ Note: Fix 1, 2, and 3 improved all configurations simultaneously. The numbers ab
 
 | Config | Ordering | Features | BPE |
 |--------|----------|----------|-----|
-| **Best v3.2** | **Leiden+LLP** | **copy_blocks+stop_deltas+lr_split+multi_ref+low_deg_ref** | **2.493** |
+| **CS best (w=256)** | **Leiden+LLP** | **stop_deltas+adaptive_copy+low_deg_ref** | **2.304** |
+| **BG best (w=64)** | **Leiden+LLP** | **copy_blocks+stop_deltas+multi_ref+low_deg_ref** | **2.326** |
+| CG K=2 best | Original | all adaptive, w=64 | 2.329 |
 | Pre-low-deg | Leiden+LLP | copy_blocks+stop_deltas+lr_split+multi_ref+merged_vlc | 2.792 |
 | Best v3.1 (legacy) | Leiden+LLP | empty+compact+vlc2+tight | 2.881 |
 | WebGraph BV | LLP | zeta-3, w=7 | 2.898 |
 | WebGraph BV-HC | host-compressed | zeta-3, w=7 | 2.448 |
-| CG K=1 | LLP | stop_deltas+adaptive, w=64 | 2.638 |
-| CG K=2 best | Leiden | all adaptive, w=64 | 2.319 |
 
-**BG beats WebGraph BV**: 2.493 vs 2.898 BPE (-0.405 BPE)
-**BG beats CG K=1**: 2.493 vs 2.638 BPE (-0.145 BPE)
-**WebGraph BV-HC beats BG**: 2.448 vs 2.493 BPE (-0.045 BPE) — HC uses host-aware compression
+**CS beats WebGraph BV-HC**: 2.304 vs 2.448 BPE (-0.144 BPE)
+**BG beats WebGraph BV**: 2.326 vs 2.898 BPE (-0.572 BPE)
+**BG beats CG K=1**: 2.326 vs 2.638 BPE (-0.312 BPE) — HC uses host-aware compression
 
 ### Multi-Dataset Benchmark
 
@@ -533,8 +533,8 @@ Best BG BPE across all tested datasets:
 
 | Dataset | BG BPE | CG BPE | CS BPE | BV BPE | BG Config |
 |---------|---------|---------|--------|--------|------------|
-| cnr-2000 (no reorder) | 2.4929 | **2.3191** | 2.4348 | 2.898 | w=64, lr+mr |
-| cnr-2000 (Leiden+LLP) | **2.3258** | 2.5652 | 2.3643 | 3.2335 | w=64, no-lr, mr |
+| cnr-2000 (no reorder) | 2.4929 | **2.3286** | 2.4348 | 2.898 | w=64, lr+mr |
+| cnr-2000 (Leiden+LLP) | 2.3259 | 2.5652 | **2.3043** | 3.2335 | w=64, no-lr, mr |
 | in-2004 | 1.895 | **1.7513** | 1.7839 | 2.172 | w=64, lr+mr |
 | web-google core (Leiden+LLP) | 4.0735 | 4.3296 | **4.0288** | 5.0081 | w=64, no-lr, mr |
 | web-google rcore (Leiden+LLP) | 3.7626 | 3.9359 | **3.7337** | 4.1751 | w=64, no-lr, mr |
@@ -597,7 +597,7 @@ Shannon entropy of action distribution: **~1.7 bits** (theoretical minimum). The
 
 ### Comparison with WebGraph BV
 
-The greedy encoder **beats** both WebGraph BV and CG K=1 (2.493 vs 2.898 vs 2.638 BPE). The key structural differences:
+With Leiden+LLP ordering, BG **beats** both WebGraph BV and BV-HC (2.326 vs 2.898 vs 2.448 BPE). The key structural differences:
 
 | Aspect | Greedy | WebGraph BV |
 |--------|--------|-------------|
@@ -614,12 +614,12 @@ The greedy encoder's advantage comes from eliminating explicit outdegree encodin
 
 ### Potential Further Improvements
 
-The greedy encoder has surpassed both WebGraph BV and CG K=1. Remaining opportunities to close the gap to CG K=2 (2.319 BPE) and WebGraph BV-HC (2.448 BPE):
+BG (2.326) and CS (2.304) have surpassed both WebGraph BV (2.898) and BV-HC (2.448), and are within 0.003-0.025 BPE of CG K=2 (2.329). The three methods have effectively converged on CNR-2000 with Leiden+LLP ordering:
 
 | Opportunity | Est. savings | Feasibility |
 |-------------|-------------|-------------|
-| Per-cluster local IDs | 0.05-0.10 BPE | Requires architectural change (CG-style) |
+| Per-cluster local IDs | 0.005-0.01 BPE | Requires architectural change (CG-style) |
 | Arithmetic coding of headers | 0.005-0.01 BPE | Complexity vs marginal gain |
 | Window size tuning per-cluster | 0.005 BPE | Adaptive window based on cluster density |
 
-The remaining ~0.17 BPE gap to CG K=2 is largely structural — CG's per-cluster local vertex indexing and hierarchical encoding enable fundamentally tighter compression that the single-pass greedy approach cannot match. BG is now within 0.045 BPE of WebGraph BV-HC.
+The near-convergence of all three methods suggests that the Leiden+LLP ordering is the dominant factor at this compression level, with diminishing returns from encoder improvements.

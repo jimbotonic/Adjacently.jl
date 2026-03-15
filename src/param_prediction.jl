@@ -37,7 +37,7 @@ using BSON: @save, @load
 using ..CustomLightGraphs: SimpleDiGraph
 using ..GNN: GNNModel, gnn_forward, gnn_backward_rl!,
              save_gnn_model, load_gnn_weights!
-using ..IO: BitWriter, flush_bitwriter
+using ..IO: BitWriter, flush_bitwriter, bytes_written
 using ..Compression: CG
 
 export ParamPredictor, MasterGNNWeights,
@@ -260,12 +260,11 @@ function compute_bpe(g::AbstractGraph{T}, cg_params::CG.CGParams,
         return 0.0
     end
 
-    io = IOBuffer()
-    w = BitWriter(io)
+    w = BitWriter()
     CG.encode_level(w, g, clusters; params=cg_params)
     flush_bitwriter(w)
 
-    total_bytes = position(io)
+    total_bytes = bytes_written(w)
     return 8.0 * total_bytes / m
 end
 

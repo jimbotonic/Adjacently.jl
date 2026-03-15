@@ -76,12 +76,38 @@ const _FIB_TABLE = let
 end
 
 """
+Precomputed Fibonacci bit-length LUT: for values 1..8192, maps value → bit length.
+Replaces binary search with O(1) lookup for the common case.
+"""
+const _FIB_BIT_LENGTH_LUT_SIZE = 8192
+
+const _FIB_BIT_LENGTH_LUT = let
+    lut = Vector{Int8}(undef, _FIB_BIT_LENGTH_LUT_SIZE)
+    for n in 1:_FIB_BIT_LENGTH_LUT_SIZE
+        lo, hi = 1, length(_FIB_TABLE)
+        while lo < hi
+            mid = (lo + hi + 1) >> 1
+            if _FIB_TABLE[mid] <= UInt64(n)
+                lo = mid
+            else
+                hi = mid - 1
+            end
+        end
+        lut[n] = Int8(lo + 1)
+    end
+    lut
+end
+
+"""
 Exact bit length of Fibonacci coding for value n ≥ 1.
+Uses precomputed LUT for values ≤ 8192 (O(1)), falls back to binary search.
 """
 @inline function _fibonacci_bit_length(n::Integer)::Int
     n <= 0 && return 1
-    # Binary search for k such that _FIB_TABLE[k] ≤ n < _FIB_TABLE[k+1]
-    # _FIB_TABLE[i] = F(i+1), so bit length = i + 1
+    if n <= _FIB_BIT_LENGTH_LUT_SIZE
+        return @inbounds Int(_FIB_BIT_LENGTH_LUT[Int(n)])
+    end
+    # Fallback: binary search for large values
     lo, hi = 1, length(_FIB_TABLE)
     while lo < hi
         mid = (lo + hi + 1) >> 1
@@ -91,7 +117,7 @@ Exact bit length of Fibonacci coding for value n ≥ 1.
             hi = mid - 1
         end
     end
-    return lo + 1  # _FIB_TABLE index lo corresponds to F(lo+1), bit length = lo + 1
+    return lo + 1
 end
 
 function estimate_encoded_value_cost(value::T, encoding::Symbol) where {T<:Unsigned}
@@ -185,7 +211,7 @@ function reconstruct_from_delta(delta_values::Vector{T}) where {T<:Unsigned}
     return result
 end
 
-function find_consecutive_length(neighbors::Vector{T}, start::Int) where {T<:Unsigned}
+function find_consecutive_length(neighbors::AbstractVector{T}, start::Int) where {T<:Unsigned}
     if start > length(neighbors)
         return 0
     end
@@ -199,7 +225,7 @@ function find_consecutive_length(neighbors::Vector{T}, start::Int) where {T<:Uns
     return len
 end
 
-function count_consecutive(values::Vector{T}, start::Int) where {T<:Unsigned}
+function count_consecutive(values::AbstractVector{T}, start::Int) where {T<:Unsigned}
     if start > length(values)
         return 0
     end
@@ -213,7 +239,7 @@ function count_consecutive(values::Vector{T}, start::Int) where {T<:Unsigned}
     return count
 end
 
-function find_run_length_patterns(delta_values::Vector{T}) where {T<:Unsigned}
+function find_run_length_patterns(delta_values::AbstractVector{T}) where {T<:Unsigned}
     sections = []
     i = 1
     
@@ -251,7 +277,7 @@ function find_run_length_patterns(delta_values::Vector{T}) where {T<:Unsigned}
     return sections
 end
 
-function analyze_delta_patterns_hybrid(delta_values::Vector{T}, original_neighbors::Vector{T}, min_interval_length::Int=MIN_INTERVAL_LENGTH) where {T<:Unsigned}
+function analyze_delta_patterns_hybrid(delta_values::AbstractVector{T}, original_neighbors::AbstractVector{T}, min_interval_length::Int=MIN_INTERVAL_LENGTH) where {T<:Unsigned}
     if isempty(delta_values)
         return []
     end
