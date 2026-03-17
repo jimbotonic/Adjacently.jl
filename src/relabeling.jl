@@ -25,6 +25,7 @@ using ..PageRank: PR
 export relabel_graph, relabel_vertices, relabel_vertices_score, relabel_vertices_lexicographic, relabel_vertices_rcm, relabel_vertices_webgraph_lex,
        relabel_vertices_llp, relabel_vertices_minhash, relabel_vertices_bisection,
        relabel_graph_llp, relabel_graph_leiden_llp,
+       relabel_graph_leiden_greedy, relabel_graph_rgb, relabel_graph_leiden_rgb,
        save_llp_ordering, load_llp_ordering,
        ordering_quality_metrics, print_ordering_metrics, compare_ordering_metrics
 
@@ -978,6 +979,363 @@ function relabel_graph_leiden_llp(g::AbstractGraph{T}; llp_mode::Symbol=:sym, ll
     end
 
     # Step 4: Build vertex mapping and relabel
+    vertex_map = Dict{T,T}()
+    for (new_id, old_id) in enumerate(new_order)
+        vertex_map[old_id] = T(new_id)
+    end
+    return relabel_graph(g, vertex_map), vertex_map
+end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Leiden + Greedy Gap Minimization
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+    relabel_graph_leiden_greedy(g; sort_clusters=:size_desc)
+
+Reorder vertices using Leiden community detection followed by a greedy
+within-cluster ordering that maximizes consecutive neighbor overlap.
+
+Unlike Leiden+LLP which uses label propagation (optimizing modularity),
+this method directly optimizes for reference-copy quality by greedily
+placing the vertex with maximum neighbor overlap to the last-placed vertex.
+This preserves both first-order locality (high consecutive Jaccard) and
+second-order locality (compact residuals after reference copy).
+
+Algorithm:
+1. Leiden partition → fine clusters
+2. Sort clusters by size descending
+3. Within each cluster (>2 vertices): build induced subgraph, then
+   greedily order starting from the highest-degree vertex, always
+   picking the unplaced vertex with maximum overlap to the last placed.
+4. Concatenate ordered clusters → global vertex mapping
+
+Returns `(relabeled_graph, vertex_mapping)`.
+"""
+function relabel_graph_leiden_greedy(g::AbstractGraph{T};
+        sort_clusters::Symbol=:size_desc) where {T<:Unsigned}
+    n = nv(g)
+
+    # Step 1: Leiden partition
+    part = leiden_partition(g)
+    label_to_idx = Dict{Int,Int}()
+    fine_clusters = Vector{Vector{T}}()
+    for v in vertices(g)
+        l = part[Int(v)]
+        if !haskey(label_to_idx, l)
+            label_to_idx[l] = length(label_to_idx) + 1
+            push!(fine_clusters, T[])
+        end
+        push!(fine_clusters[label_to_idx[l]], T(v))
+    end
+
+    if sort_clusters == :size_desc
+        sort!(fine_clusters, by=length, rev=true)
+    end
+
+    n_clusters = length(fine_clusters)
+    top_sizes = sort([length(C) for C in fine_clusters], rev=true)[1:min(5, n_clusters)]
+    @info "Leiden+Greedy: $n_clusters fine clusters, largest: $top_sizes"
+
+    # Step 2: Greedy ordering within each cluster
+    new_order = T[]
+    sizehint!(new_order, n)
+
+    for C in fine_clusters
+        if length(C) <= 2
+            append!(new_order, sort(C))
+        else
+            ordered = _greedy_overlap_order(g, C)
+            append!(new_order, ordered)
+        end
+    end
+
+    # Step 3: Build mapping
+    vertex_map = Dict{T,T}()
+    for (new_id, old_id) in enumerate(new_order)
+        vertex_map[old_id] = T(new_id)
+    end
+    return relabel_graph(g, vertex_map), vertex_map
+end
+
+"""Greedy ordering of vertices in `cluster`: start from highest-degree vertex,
+then always pick the unplaced vertex with maximum neighbor overlap to last placed."""
+function _greedy_overlap_order(g::AbstractGraph{T}, cluster::Vector{T}) where {T<:Unsigned}
+    # Build neighbor sets for cluster members
+    member_set = Set{T}(cluster)
+    adj = Dict{T, Set{T}}()
+    for v in cluster
+        adj[v] = Set{T}(u for u in outneighbors(g, v))
+    end
+
+    # Start from highest-degree vertex in cluster
+    remaining = Set{T}(cluster)
+    start_v = cluster[1]
+    best_deg = 0
+    for v in cluster
+        d = length(adj[v])
+        if d > best_deg
+            best_deg = d
+            start_v = v
+        end
+    end
+
+    order = T[start_v]
+    delete!(remaining, start_v)
+    last_nbrs = adj[start_v]
+
+    while !isempty(remaining)
+        best_v = first(remaining)
+        best_ov = -1
+
+        for v in remaining
+            ov = length(intersect(adj[v], last_nbrs))
+            if ov > best_ov
+                best_ov = ov
+                best_v = v
+            end
+        end
+
+        push!(order, best_v)
+        delete!(remaining, best_v)
+        last_nbrs = adj[best_v]
+    end
+
+    return order
+end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Recursive Graph Bisection (RGB)
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+    relabel_graph_rgb(g; max_iters=20, min_partition=64)
+
+Reorder vertices using Recursive Graph Bisection (Dhulipala et al., KDD 2016).
+
+Directly optimizes the log-gap compression cost: Σ log₂(gap) across all
+adjacency lists, where gap = difference between consecutive sorted neighbors.
+At each recursion level, vertices are swapped between two halves if the swap
+reduces the total log-gap cost.
+
+Algorithm:
+1. Split vertices into two halves (initialized by degree sorting)
+2. Iteratively swap vertices between halves to minimize log-gap cost
+3. Recurse on each half until partition size < min_partition
+4. Concatenate final orderings
+
+Parameters:
+- `max_iters`: maximum swap iterations per recursion level (default: 20)
+- `min_partition`: stop recursing below this size (default: 64)
+
+Returns `(relabeled_graph, vertex_mapping)`.
+
+Reference: Dhulipala, Kabiljo, Karrer, Ottaviano, Pupyrev, Shalita.
+"Compressing Graphs and Indexes with Recursive Graph Bisection." KDD 2016.
+"""
+function relabel_graph_rgb(g::AbstractGraph{T};
+        max_iters::Int=20, min_partition::Int=64) where {T<:Unsigned}
+    n = Int(nv(g))
+
+    # Build sorted neighbor lists (using Int for speed)
+    adj = Vector{Vector{Int}}(undef, n)
+    for v in vertices(g)
+        adj[Int(v)] = sort(Int.(outneighbors(g, v)))
+    end
+
+    # Initial order: sort by degree descending (heuristic initialization)
+    order = sortperm([length(adj[v]) for v in 1:n], rev=true)
+
+    # Recursive bisection
+    _rgb_recurse!(adj, order, 1, n, max_iters, min_partition)
+
+    # Build mapping: order[position] = old_vertex_id
+    vertex_map = Dict{T,T}()
+    for (new_id, old_id) in enumerate(order)
+        vertex_map[T(old_id)] = T(new_id)
+    end
+    return relabel_graph(g, vertex_map), vertex_map
+end
+
+"""Recursive bisection: optimize log-gap cost for order[lo:hi]."""
+function _rgb_recurse!(adj::Vector{Vector{Int}}, order::Vector{Int},
+                       lo::Int, hi::Int, max_iters::Int, min_partition::Int)
+    size = hi - lo + 1
+    size <= min_partition && return
+
+    mid = lo + size ÷ 2
+
+    # Build position lookup: vertex_id → current position
+    pos = Dict{Int,Int}()
+    for i in lo:hi
+        pos[order[i]] = i
+    end
+
+    # Iterative swapping to minimize log-gap cost
+    for iter in 1:max_iters
+        n_swaps = 0
+
+        for i in lo:mid
+            v_left = order[i]
+
+            # Find best swap partner in right half
+            best_j = 0
+            best_gain = 0.0
+
+            for j in (mid+1):hi
+                v_right = order[j]
+                gain = _rgb_swap_gain(adj, pos, v_left, v_right, mid)
+                if gain > best_gain
+                    best_gain = gain
+                    best_j = j
+                end
+            end
+
+            if best_j > 0
+                # Perform swap
+                v_right = order[best_j]
+                order[i], order[best_j] = order[best_j], order[i]
+                pos[v_right] = i
+                pos[v_left] = best_j
+                n_swaps += 1
+            end
+        end
+
+        n_swaps == 0 && break
+    end
+
+    # Recurse on each half
+    _rgb_recurse!(adj, order, lo, mid, max_iters, min_partition)
+    _rgb_recurse!(adj, order, mid + 1, hi, max_iters, min_partition)
+end
+
+"""Compute the log-gap cost reduction from swapping v_left (in left half)
+with v_right (in right half). Positive = beneficial swap."""
+function _rgb_swap_gain(adj::Vector{Vector{Int}}, pos::Dict{Int,Int},
+                        v_left::Int, v_right::Int, mid::Int)
+    gain = 0.0
+
+    # For each neighbor of v_left: moving v_left to right half
+    # means its neighbors that are in the left half get a larger gap cost
+    for u in adj[v_left]
+        haskey(pos, u) || continue
+        p_u = pos[u]
+        if p_u <= mid
+            gain += 0.5  # neighbor in same half as v_right (after swap)
+        else
+            gain -= 0.5  # neighbor in different half
+        end
+    end
+
+    # For each neighbor of v_right: moving v_right to left half
+    for u in adj[v_right]
+        haskey(pos, u) || continue
+        p_u = pos[u]
+        if p_u <= mid
+            gain -= 0.5  # was in same half, now different
+        else
+            gain += 0.5  # was in different half, now same
+        end
+    end
+
+    return gain
+end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Leiden + Recursive Graph Bisection
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+    relabel_graph_leiden_rgb(g; max_iters=20, min_partition=32, sort_clusters=:size_desc)
+
+Reorder vertices using Leiden community detection followed by Recursive Graph
+Bisection within each cluster. Combines community-aware grouping with
+log-gap-optimal local ordering.
+
+Algorithm:
+1. Leiden partition → fine clusters
+2. Sort clusters by size descending
+3. Within each cluster (>min_partition vertices): apply RGB to optimize
+   the log-gap cost locally on the induced subgraph
+4. Small clusters: sort by vertex ID
+5. Concatenate ordered clusters → global vertex mapping
+
+This hybrid approach preserves the community structure (good for inter-cluster
+encoding) while using RGB's direct cost optimization within each community
+(better residual locality than LLP).
+
+Returns `(relabeled_graph, vertex_mapping)`.
+"""
+function relabel_graph_leiden_rgb(g::AbstractGraph{T};
+        max_iters::Int=20, min_partition::Int=32,
+        sort_clusters::Symbol=:size_desc) where {T<:Unsigned}
+    n = nv(g)
+
+    # Step 1: Leiden partition
+    part = leiden_partition(g)
+    label_to_idx = Dict{Int,Int}()
+    fine_clusters = Vector{Vector{T}}()
+    for v in vertices(g)
+        l = part[Int(v)]
+        if !haskey(label_to_idx, l)
+            label_to_idx[l] = length(label_to_idx) + 1
+            push!(fine_clusters, T[])
+        end
+        push!(fine_clusters[label_to_idx[l]], T(v))
+    end
+
+    if sort_clusters == :size_desc
+        sort!(fine_clusters, by=length, rev=true)
+    end
+
+    n_clusters = length(fine_clusters)
+    top_sizes = sort([length(C) for C in fine_clusters], rev=true)[1:min(5, n_clusters)]
+    @info "Leiden+RGB: $n_clusters fine clusters, largest: $top_sizes"
+
+    # Step 2: RGB within each cluster
+    new_order = T[]
+    sizehint!(new_order, n)
+
+    for C in fine_clusters
+        if length(C) <= 2
+            append!(new_order, sort(C))
+        else
+            # Build local adjacency for this cluster
+            member_set = Set{Int}(Int.(C))
+            local_n = length(C)
+            old_to_local = Dict{Int,Int}()
+            local_to_old = Vector{Int}(undef, local_n)
+            for (i, v) in enumerate(C)
+                old_to_local[Int(v)] = i
+                local_to_old[i] = Int(v)
+            end
+
+            # Build local neighbor lists (only intra-cluster edges)
+            local_adj = Vector{Vector{Int}}(undef, local_n)
+            for i in 1:local_n
+                v = T(local_to_old[i])
+                nbrs = Int[]
+                for u in outneighbors(g, v)
+                    u_int = Int(u)
+                    if haskey(old_to_local, u_int)
+                        push!(nbrs, old_to_local[u_int])
+                    end
+                end
+                local_adj[i] = sort(nbrs)
+            end
+
+            # Apply RGB on local ordering
+            local_order = sortperm([length(local_adj[i]) for i in 1:local_n], rev=true)
+            _rgb_recurse!(local_adj, local_order, 1, local_n, max_iters, min_partition)
+
+            # Map back to global vertex IDs
+            for pos in 1:local_n
+                push!(new_order, T(local_to_old[local_order[pos]]))
+            end
+        end
+    end
+
+    # Step 3: Build mapping
     vertex_map = Dict{T,T}()
     for (new_id, old_id) in enumerate(new_order)
         vertex_map[old_id] = T(new_id)

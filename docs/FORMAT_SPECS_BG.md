@@ -551,6 +551,46 @@ Best BG BPE across all tested datasets:
 - LLP reordering is critical for SNAP datasets with poor original ordering (Web-Google: 1.2-1.4 BPE gain)
 - lr_split helps on most datasets but hurts on cnr-2000 and Web-Google (crawl-ordered graphs)
 
+### Synthetic Web Graph Benchmark (N=10000, original ordering)
+
+BG parameter sweep against BV (w=64) on `random_web_digraph` graphs.
+Sweep: 4 windows × 2 lr_split × 2 multi_ref × 2 encodings = 32 configs per degree.
+
+| avg_deg | BV (w=64) | BG best | Config | Delta |
+|---------|-----------|---------|--------|-------|
+| 12 | 9.944 | **9.691** | fibonacci, w=8, lr=true, mr=true | -0.254 |
+| 24 | 9.417 | **9.306** | zeta, w=8, lr=true, mr=false | -0.111 |
+| 32 | 9.375 | **9.288** | zeta, w=8, lr=true, mr=false | -0.088 |
+| 64 | 9.445 | **9.390** | zeta, w=64, lr=true, mr=false | -0.054 |
+
+**Key findings**:
+- **lr_split=true is required to beat BV** — same pattern as CS and CG; no lr_split=false config beats BV
+- **Fibonacci wins at low degree (deg=12)**, zeta wins at medium-high degree (deg 24-64) — the crossover point is around deg~16
+- **multi_ref has negligible impact** (<0.001 BPE difference) on synthetic web graphs — the tight locality means the best ref is always the immediate predecessor
+- **Small window (w=8) is optimal for deg 12-32** — same pattern as CS and CG
+- BG beats BV by less than CS (-0.25 vs -0.38 at deg=12) and much less than CG grid (-0.25 vs -0.63)
+- **BG ranking**: worst of the three Adjacently methods on synthetic web graphs (BG < CS < CG grid)
+- **Caveat**: tuned BV (zeta-5, i=2, m=-1) beats BG at all degrees, and beats all Adjacently methods at deg=64 (9.201 vs BG 9.390). BV's zeta-5 encoding is particularly effective for web-like gap distributions at higher density.
+
+### LFR Benchmark (N=10000, avg_degree=15, tau1=2.5, tau2=1.5)
+
+BG parameter sweep on LFR modular graphs with original and Leiden+LLP ordering.
+
+| μ | Ordering | BV | BG best | Config | Delta |
+|------|----------|------|---------|--------|-------|
+| 0.05 | Original | 13.89 | **13.84** | zeta, w=64, lr, mr | -0.05 |
+| 0.05 | Leiden+LLP | 8.44 | **8.36** | fib, w=64, lr, mr | -0.09 |
+| 0.10 | Leiden+LLP | 9.13 | **9.06** | fib, w=64, lr, mr | -0.07 |
+| 0.20 | Leiden+LLP | 9.95 | **9.91** | zeta, w=64, lr, mr | -0.04 |
+| 0.30 | Leiden+LLP | 10.61 | **10.58** | zeta, w=64, lr, mr | -0.03 |
+| 0.50 | Leiden+LLP | 11.60 | **11.56** | zeta, w=64, lr, mr | -0.04 |
+
+**Key findings**:
+- BG beats BV with Leiden+LLP at every μ, but margins are small (0.03-0.09 BPE)
+- BG is the weakest Adjacently method on LFR (BG < CS < CG at every μ)
+- Best config: zeta + w=64 + lr + mr (original) or fib + w=64 + lr + mr (Leiden+LLP at low μ)
+- Fibonacci wins at low μ with Leiden+LLP (tight locality); zeta wins otherwise
+
 ### Best Greedy Config (v3.2)
 
 ```

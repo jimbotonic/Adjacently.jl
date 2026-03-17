@@ -59,9 +59,9 @@ include("graph.jl")
 using .Graph
 export Graph
 
-include("graph_generators.jl")
-using .GraphGenerators
-export GraphGenerators
+include("generators.jl")
+using .Generators
+export Generators
 
 include("compression/utils.jl")
 using .CompressionUtils
@@ -94,6 +94,10 @@ export MGS
 include("distribution.jl")
 using .Distribution
 export Distribution
+
+include("metrics.jl")
+using .Metrics
+export Metrics
 
 include("param_prediction.jl")
 using .ParamPrediction

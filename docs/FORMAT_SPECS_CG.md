@@ -796,6 +796,65 @@ Ref used: 3,560,563 / 4,203,325 (84.7%).
 
 ---
 
+## Synthetic Web Graph Benchmark (N=10000, original ordering)
+
+CG parameter sweep against BV (w=64) on `random_web_digraph` graphs.
+Four strategies compared: hand-tuned baseline, GNN-predicted params, auto_select_K, and exhaustive grid search (512 combos).
+
+| avg_deg | BV (w=64) | CG baseline | CG GNN | CG K=auto | CG grid | Grid config |
+|---------|-----------|-------------|--------|-----------|---------|-------------|
+| 12 | 9.944 | 10.130 | 10.371 | 10.130 (K=1) | **9.318** (-0.627) | w=8, iv+lr, mil=3, zz, no-sd |
+| 24 | 9.417 | 9.515 | 9.084 | 9.515 (K=1) | **9.074** (-0.343) | w=8, iv+lr, mil=4, zz, no-sd |
+| 32 | 9.375 | 9.469 | 9.143 | 9.469 (K=1) | **9.132** (-0.244) | w=8, iv+lr, mil=5, zz, no-sd |
+| 64 | 9.445 | 9.579 | 9.405 | 9.579 (K=1) | **9.390** (-0.055) | w=64, iv+lr, mil=5, zz, no-sd |
+
+**Key findings**:
+- **CG grid search beats BV by 0.05-0.63 BPE** across all densities — the largest gains of any method
+- **intervals=true + lr_split=true is the critical combination** — the hand-tuned baseline (no intervals, no lr_split) loses to BV, but grid search with iv+lr wins decisively
+- **GNN prediction is near-optimal at deg 24-64** (within 0.01-0.02 BPE of grid), correctly predicting iv+lr+w=8; overshoots at deg=12 (intervals=false)
+- **auto_select_K always returns K=1** — synthetic web graphs lack community structure (coarse granularity <0.01), so Leiden clustering cannot help
+- **Small window (w=8) is optimal for deg 12-32** — tight sequential locality in web graphs; w=64 wins only at deg=64 where locality is diluted
+- **stop_deltas=false is consistently best** — the STOP-delta overhead isn't amortized when intervals+lr_split handles the encoding more efficiently
+- CG grid search (-0.63 BPE at deg=12) outperforms CS zeta+lr (-0.38 BPE) — CG's fixwidth ref + adaptive copy is more effective than CS's prefix codes when properly tuned
+- **Caveat**: tuned BV (zeta-5, i=2, m=-1) beats all Adjacently methods at deg=64 (9.201 vs CG 9.390) and nearly ties CG at deg=32 (9.152 vs 9.132). CG's advantage is largest at low degree where BV's fixed pipeline cannot adapt.
+
+## LFR Benchmark (N=10000, avg_degree=15, tau1=2.5, tau2=1.5)
+
+CG compression on LFR graphs with planted community structure, sweeping mixing parameter μ.
+
+### Without reordering — CG K-sweep
+
+| μ | BV | CG K=1 | CG K=2 | CG K=4 | CG K=8 | CG K=16 | Best |
+|------|------|--------|--------|--------|--------|---------|------|
+| 0.05 | 13.89 | 14.03 | 13.49 | 12.54 | 10.86 | **9.67** | K=16 (-4.21) |
+| 0.10 | 13.81 | 13.97 | 13.84 | 13.39 | 12.10 | **10.99** | K=16 (-2.82) |
+| 0.20 | 13.66 | 13.84 | 14.11 | 14.23 | 13.70 | **12.77** | K=16 (-0.89) |
+| 0.30 | 13.53 | **13.73** | 14.26 | 14.87 | 14.77 | 14.09 | K=1 (+0.20) |
+| 0.50 | **13.28** | 13.50 | 14.36 | 15.55 | 16.26 | 16.31 | BV |
+
+### With Leiden+LLP — all methods comparison
+
+| μ | BV | BG best | CS best | CG K=1 grid | CG config |
+|------|------|---------|---------|-------------|-----------|
+| 0.05 | 8.44 | 8.36 | 8.30 | **8.08** | w=32, iv+lr, mil=4, zz |
+| 0.10 | 9.13 | 9.06 | 9.00 | **8.77** | w=32, iv+lr, mil=3, zz |
+| 0.20 | 9.95 | 9.91 | 9.83 | **9.63** | w=32, iv+lr, mil=3, zz |
+| 0.30 | 10.61 | 10.58 | 10.51 | **10.35** | w=64, iv+lr, mil=4, zz, sd |
+| 0.50 | 11.60 | 11.56 | 11.49 | **11.42** | w=64, iv+lr, mil=4, zz |
+
+### With Leiden+LLP — CG K-sweep (K=1 always best)
+
+| μ | CG K=1 | CG K=2 | CG K=4 | CG K=8 | CG K=16 |
+|------|--------|--------|--------|--------|---------|
+| 0.05 | **7.94** | 8.07 | 8.25 | 8.36 | 8.33 |
+
+**Key LFR findings**:
+- **Leiden+LLP is the dominant factor**: 3.5-5.4 BPE gain at low μ, dwarfing all method differences
+- **Without reordering, CG K=16 at μ=0.05 saves 4.2 BPE over BV** — per-cluster encoding exploits community structure directly
+- **With Leiden+LLP, K=1 is always best** — reordering handles communities globally, making multi-cluster encoding counterproductive
+- **CG K=1 grid beats all methods with Leiden+LLP** by 0.07-0.37 BPE at every μ
+- **auto_select_K always returns K=1** (10K < 100K threshold) — misses the K=16 opportunity on unordered graphs
+
 ## Key Findings
 
 1. **Vertex ordering is the dominant factor** (+1.43 BPE advantage over unordered greedy). The two-step approach — Leiden community detection creates ~34K tight fine clusters of ~9 vertices each, then per-cluster LLP ordering makes consecutive vertices share 80–90% of neighbors — is what enables CG to beat WebGraph.

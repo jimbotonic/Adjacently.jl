@@ -246,12 +246,12 @@ For each option, both no-reference and reference modes are evaluated, yielding u
 
 ## Parameters
 
-| Parameter | Default | Best (CNR-2000) | Description |
-|-----------|---------|-----------------|-------------|
-| `integer_encoding` | `:fibonacci` | `:fibonacci` | Integer encoding for all varints |
-| `ref_window_size` | 64 | 256 | Reference window size (recent vertices) |
-| `coding_scheme` | `:children` | `:children` | Stop-delimited vertex encoding |
-| `lr_split` | `false` | `false` | LR-split residual encoding for intervals |
+| Parameter | Default | Best (CNR-2000) | Best (web-synthetic) | Description |
+|-----------|---------|-----------------|----------------------|-------------|
+| `integer_encoding` | `:fibonacci` | `:fibonacci` | `:zeta` | Integer encoding for all varints |
+| `ref_window_size` | 64 | 256 | 4 | Reference window size (recent vertices) |
+| `coding_scheme` | `:children` | `:children` | `:children` | Stop-delimited vertex encoding |
+| `lr_split` | `false` | `false` | `true` | LR-split residual encoding for intervals |
 
 ### Hardcoded Options (Always On)
 
@@ -379,13 +379,41 @@ CS beats BG by 0.022 BPE with Leiden+LLP ordering despite lacking multi-ref supp
 
 3. **CS beats BG despite fewer features.** CS lacks multi-ref support but beats BG (2.3043 vs 2.3259) thanks to shorter prefix codes and a larger window (w=256 vs w=64).
 
-4. **LR-split is dataset-dependent.** On CNR-2000, lr_split hurts CS by +0.14 BPE (same pattern as CG). On datasets with more interval-friendly structure (e.g., enwiki), lr_split may help.
+4. **LR-split is dataset-dependent.** On CNR-2000, lr_split hurts CS by +0.14 BPE (same pattern as CG). On synthetic web graphs and datasets with more interval-friendly structure (e.g., enwiki), lr_split helps significantly. On synthetic web graphs, lr_split=true is **required** to beat BV.
+
+7. **Zeta encoding matches BV's native encoding.** On web-like graphs, switching from Fibonacci to Zeta-3 encoding saves ~0.05 BPE, closing most of the gap with BV. Combined with lr_split=true, CS beats BV (w=64) by 0.07-0.38 BPE across all tested densities.
+
+8. **Optimal window size is graph-dependent.** CNR-2000 (real web crawl) benefits from large windows (w=256), while synthetic web graphs with tight locality prefer small windows (w=4). The difference is that real web graphs have long-range reference opportunities that synthetic generators don't produce.
+
+9. **CG with grid-searched params outperforms CS on synthetic web graphs.** CG grid search beats BV by 0.05-0.63 BPE (vs CS zeta+lr: 0.07-0.38 BPE). The key: CG with intervals+lr_split+w=8 combines fixwidth ref headers with adaptive copy more efficiently than CS's prefix codes for web-like locality. However, CS requires no grid search — the simple `lr_split=true` toggle is sufficient to beat BV.
+
+10. **Tuned BV (zeta-5) reclaims the lead at high degree.** BV with k=5, i=2, m=-1 achieves 9.152 BPE at deg=32 and 9.201 at deg=64, beating all Adjacently methods. CS zeta+lr still wins at deg=12-24 where adaptive per-vertex encoding matters more. The implication: BV's fixed pipeline is near-optimal for dense web graphs when its integer encoding parameter is properly tuned.
+
+11. **On LFR modular graphs, CS beats BV at every μ with Leiden+LLP** (by 0.10-0.14 BPE). Best config: fibonacci w=64 lr at low μ (tight locality), zeta w=256 lr at high μ. Without reordering, CS with zeta w=256 lr beats BV by up to 0.56 BPE at low μ, but loses at μ=0.5. CG K=1 grid still outperforms CS by 0.2-0.3 BPE across all μ with Leiden+LLP.
 
 5. **All three methods have converged on CNR-2000.** CS (2.304), BG (2.326), and CG K=2 (2.329) are within 0.025 BPE of each other, suggesting that Leiden+LLP ordering is the dominant factor at this compression level.
 
 6. **Hardcoding best-known options is cleaner.** CS uses 4 parameters vs BG's 8, by hardcoding `copy_blocks`, `adaptive_copy`, `compact_copy`, `tight_intervals`, and `stop_deltas`. The simpler API maintains the best compression quality.
 
-### Multi-Dataset Benchmark
+### Synthetic Web Graph Benchmark (N=10000, original ordering)
+
+CS parameter sweep against BV (w=64) on `random_web_digraph` graphs:
+
+| avg_deg | BV (w=64) | CS best (zeta) | CS best (fib) | Best config |
+|---------|-----------|----------------|---------------|-------------|
+| 12 | 9.9443 | **9.5691** (-0.375) | 9.6216 (-0.323) | zeta, w=4, lr=true |
+| 24 | 9.4168 | **9.2045** (-0.212) | 9.2699 (-0.147) | zeta, w=4, lr=true |
+| 32 | 9.3754 | **9.2177** (-0.158) | 9.2879 (-0.088) | zeta, w=4, lr=true |
+| 64 | 9.4446 | **9.3772** (-0.067) | 9.3772 (-0.067) | zeta, w=4, lr=true |
+
+**Key findings**:
+- **`lr_split=true` is the crucial parameter** — every lr_split=true config beats BV; no lr_split=false config does
+- **Smallest window (w=4) is consistently best** — tight locality means small windows minimize per-ref header overhead
+- **Zeta encoding saves ~0.05 BPE over Fibonacci** with lr_split=true (web-like gap distributions favor zeta)
+- Window size barely matters when lr_split=true — only ~0.03 BPE spread across w=4 to w=256
+- Advantage largest at medium degree (deg=12: -0.38 BPE) and shrinks at high degree (deg=64: -0.07 BPE)
+
+### Multi-Dataset Benchmark (Real Datasets)
 
 Best CS BPE across all tested datasets:
 
