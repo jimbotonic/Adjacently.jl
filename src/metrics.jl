@@ -310,21 +310,26 @@ graph will compress with reference-based encoders (BV, BG, CS, CG).
 The score is derived from empirical correlation analysis (17 data points
 across CNR-2000, LFR, Web, and Erdős-Rényi graphs with multiple orderings):
 
-| Component          | Weight | Pearson r with BPE | Normalization                |
-|--------------------|--------|--------------------|-----------------------------|
-| gap_entropy        | 0.35   | +0.990             | Calibrated to [0, 12] range |
-| avg_copy_fraction  | 0.25   | -0.982             | Direct [0, 1]               |
-| avg_log_gap        | 0.20   | +0.981             | Calibrated to [0, 12] range |
-| residual_gap1_frac | 0.10   | -0.839             | Direct [0, 1]               |
-| residuals/vertex   | 0.10   | +0.892             | Normalized by avg degree     |
+| Component          | Weight | Pearson r with BPE | Normalization                    |
+|--------------------|--------|--------------------|---------------------------------|
+| gap_entropy        | 0.30   | +0.990             | Sigmoid, midpoint=6.0, k=0.6    |
+| avg_copy_fraction  | 0.20   | -0.982             | Direct [0, 1]                   |
+| avg_log_gap        | 0.15   | +0.981             | Sigmoid, midpoint=5.0, k=0.7    |
+| residual_gap1_frac | 0.20   | -0.839             | Direct [0, 1] (boosted weight)  |
+| residuals/vertex   | 0.15   | +0.892             | Normalized by avg degree         |
+
+The residual_gap1 weight is boosted (0.20 vs correlation-proportional 0.10) because
+it is the key discriminator between orderings with similar gap metrics — e.g., CNR-2000
+crawl order (res_gap1=0.66) vs Leiden+LLP (res_gap1=0.46) have nearly identical gap
+entropy but 8% different BPE.
 
 Calibration reference points (known BPE → score):
-- CNR-2000 crawl order:   BPE ≈ 2.5  → score ≈ 0.94
-- CNR-2000 Leiden+LLP:    BPE ≈ 2.7  → score ≈ 0.93
-- LFR μ=0.05 Leiden+LLP:  BPE ≈ 8.0  → score ≈ 0.44
-- Web deg=16 original:     BPE ≈ 9.0  → score ≈ 0.41
-- LFR μ=0.50 Leiden+LLP:  BPE ≈ 11.3 → score ≈ 0.16
-- ER p=0.005:             BPE ≈ 15.0 → score ≈ 0.10
+- CNR-2000 crawl order:   BPE ≈ 2.5  → score ≈ 0.92
+- CNR-2000 Leiden+LLP:    BPE ≈ 2.7  → score ≈ 0.89
+- LFR μ=0.05 Leiden+LLP:  BPE ≈ 8.0  → score ≈ 0.40
+- Web deg=16 original:     BPE ≈ 9.0  → score ≈ 0.37
+- LFR μ=0.50 Leiden+LLP:  BPE ≈ 11.3 → score ≈ 0.15
+- ER p=0.005:             BPE ≈ 15.0 → score ≈ 0.09
 - LFR random ordering:    BPE ≈ 14.0 → score ≈ 0.05
 
 Score interpretation:
@@ -449,11 +454,13 @@ function compressibility_score(g::AbstractGraph; window::Int=64)
     s_residuals   = avg_deg > 0 ? clamp(1.0 - avg_residuals_per_v / avg_deg, 0.0, 1.0) : 0.0
 
     # ── Weighted combination ────────────────────────────────────────────
-    w_gap_entropy = 0.35
-    w_copy_frac   = 0.25
-    w_log_gap     = 0.20
-    w_res_gap1    = 0.10
-    w_residuals   = 0.10
+    # Primary weights from correlation |r|, with residual_gap1 boosted
+    # to discriminate orderings with similar gap metrics (e.g. CNR orig vs L+L)
+    w_gap_entropy = 0.30
+    w_copy_frac   = 0.20
+    w_log_gap     = 0.15
+    w_res_gap1    = 0.20   # boosted: key tiebreaker for top-quality orderings
+    w_residuals   = 0.15
 
     raw = w_gap_entropy * s_gap_entropy +
           w_copy_frac   * s_copy_frac +
@@ -461,9 +468,8 @@ function compressibility_score(g::AbstractGraph; window::Int=64)
           w_res_gap1    * s_res_gap1 +
           w_residuals   * s_residuals
 
-    # Rescale from empirical [0.04, 0.82] range to [0.02, 0.95]:
-    # score = (raw - 0.04) / (0.82 - 0.04) * (0.95 - 0.02) + 0.02
-    score = clamp((raw - 0.04) / 0.78 * 0.93 + 0.02, 0.0, 1.0)
+    # Rescale from empirical [0.03, 0.82] range to [0.02, 0.95]
+    score = clamp((raw - 0.03) / 0.79 * 0.93 + 0.02, 0.0, 1.0)
 
     components = Dict{Symbol,Float64}(
         :gap_entropy_raw      => gap_entropy,

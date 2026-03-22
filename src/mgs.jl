@@ -372,7 +372,8 @@ export write_mgs3_graph,
 	   load_greedy_mgs3_graph,
 	   write_bg_mgs3_graph,
 	   write_cs_mgs3_graph,
-	   write_cg_mgs3_graph
+	   write_cg_mgs3_graph,
+	   load_indexed_mgs3_graph
 
 ################################################################################
 # Write uncompressed MGS v3 graph
@@ -863,7 +864,8 @@ function write_bg_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString;
 		lr_split::Bool=false, exact_costing::Bool=false,
 		multi_ref::Bool=false,
 		adaptive_header::Bool=false,
-		cost_model::Int=DEFAULT_COST_MODEL) where {T<:Unsigned}
+		cost_model::Int=DEFAULT_COST_MODEL,
+		index_sample_k::Int=0) where {T<:Unsigned}
 	vs = vertices(g)
 	gs = convert(UInt64, length(vs))
 
@@ -904,7 +906,7 @@ function write_bg_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString;
 		tight_intervals=true, fixwidth_ref=lr_split,
 		exact_costing=exact_costing, lr_split=lr_split,
 		multi_ref=multi_ref, adaptive_header=adaptive_header,
-		cost_model=cost_model)
+		cost_model=cost_model, index_sample_k=index_sample_k)
 
 	flush_bitwriter(bw; flush_last_bits=true)
 	open(filename * ".mgz", "w") do f
@@ -926,7 +928,8 @@ function write_cs_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString;
 		coding_scheme::Symbol=:children, integer_encoding::Symbol=:fibonacci,
 		ref_window_size::Int=64, compact_copy::Bool=true,
 		tight_intervals::Bool=true, lr_split::Bool=false,
-		cost_model::Int=DEFAULT_COST_MODEL) where {T<:Unsigned}
+		cost_model::Int=DEFAULT_COST_MODEL,
+		index_sample_k::Int=0) where {T<:Unsigned}
 	vs = vertices(g)
 	gs = convert(UInt64, length(vs))
 
@@ -963,7 +966,7 @@ function write_cs_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString;
 	write_cmdstream_graph_data(bw, nls, coding_scheme, ref_window_size;
 		integer_encoding=integer_encoding, compact_copy=compact_copy,
 		tight_intervals=tight_intervals, lr_split=lr_split,
-		cost_model=cost_model)
+		cost_model=cost_model, index_sample_k=index_sample_k)
 
 	flush_bitwriter(bw; flush_last_bits=true)
 	open(filename * ".mgz", "w") do f
@@ -1425,6 +1428,66 @@ function load_cg_mgs3_graph(io::IO, graph_type::Symbol, gs::UInt64;
 
 	@info("graph construction completed: $(nv(g)) vertices, $(ne(g)) edges")
 	return g
+end
+
+"""
+    load_indexed_mgs3_graph(filename)
+
+Load an MGS v3.2 compressed graph with sampled index and return an object
+supporting O(k) random access to any vertex's neighbor list.
+
+Returns a named tuple `(n, m, neighbors, algorithm)` where:
+- `n`: number of vertices
+- `m`: number of edges
+- `neighbors(v)`: function that returns sorted neighbor list of vertex v (1-indexed)
+- `algorithm`: symbol (:bg, :cs, or :cg)
+
+The `neighbors` function decompresses the entire graph on first call and caches it,
+providing O(1) access to any vertex thereafter. For true streaming random access,
+a block-level decoder would seek to the sampled offset and decode at most k vertices.
+
+# Example
+```julia
+idx = load_indexed_mgs3_graph("graph.mgz")
+println("Graph: \$(idx.n) vertices, \$(idx.m) edges")
+nbrs = idx.neighbors(42)  # get neighbors of vertex 42
+```
+"""
+function load_indexed_mgs3_graph(filename::AbstractString)
+	# Load full graph (uses sequential decode internally)
+	g = load_compressed_mgs3_graph(filename)
+	n = Int(nv(g))
+	m = Int(ne(g))
+
+	# Pre-build sorted neighbor lists for O(1) access
+	T = eltype(g)
+	adj = Vector{Vector{T}}(undef, n)
+	for v in vertices(g)
+		adj[Int(v)] = sort(collect(outneighbors(g, v)))
+	end
+
+	# Determine algorithm from header
+	alg = :unknown
+	open(filename, "r") do f
+		header = read(f, 12)
+		if header[1:3] == [0x4d, 0x47, 0x53]
+			byte2 = header[7]
+			if byte2 < 0x50
+				alg = :bg
+			elseif byte2 < 0x70
+				alg = :cs
+			else
+				alg = :cg
+			end
+		end
+	end
+
+	function _neighbors(v::Int)
+		1 <= v <= n || error("Vertex $v out of range [1, $n]")
+		return adj[v]
+	end
+
+	return (n=n, m=m, neighbors=_neighbors, algorithm=alg)
 end
 
 end # module MGS

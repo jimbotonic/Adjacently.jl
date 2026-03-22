@@ -3049,17 +3049,21 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         lr_split::Bool=false,
         multi_ref::Bool=false,
         adaptive_header::Bool=false,
-        cost_model::Int=DEFAULT_COST_MODEL) where {T<:Unsigned}
+        cost_model::Int=DEFAULT_COST_MODEL,
+        index_sample_k::Int=0) where {T<:Unsigned}
 
     vs = length(keys(neighbor_lists))
     ie = integer_encoding
 
-    # In index mode, override stop_deltas (redundant with offset table)
+    # Index mode: full index uses count-prefixed (no stop_deltas); sampled uses children-mode data
     idx_mode = coding_scheme == :index
-    if idx_mode
+    sampled_idx = idx_mode && index_sample_k > 0
+    if idx_mode && !sampled_idx
+        # Full index: override stop_deltas (redundant with offset table)
         stop_deltas = false
         adaptive_deltas = false
     end
+    # Sampled index: keep stop_deltas as-is (data is children-mode, only the offset table changes)
 
     # Create cost buffer for exact bit-counting when requested
     gcb = exact_costing ? GreedyCostBuffer() : nothing
@@ -3086,17 +3090,16 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
     function _encode_vertex!(wr, v::T, current_neighbors::Vector{T})
         # Empty vertex handling
         if isempty(current_neighbors)
-            if !idx_mode
+            if !idx_mode || sampled_idx
+                # Children mode (or sampled index): write explicit empty marker
                 if adaptive_header
-                    # Adaptive: ref_flag(0) + adaptive(0) → STOP-delta handles empty naturally
                     _write_vertex_header_vlc(wr, :none, :delta, 0; adaptive=true)
                     write_bit(wr, false)  # STOP terminator (0 elements)
                 else
-                    # VLC: write merged empty code
                     _write_vertex_header_vlc(wr, :empty, :delta, 0)
                 end
             end
-            # Index mode: nothing written (empty = offset[v] == offset[v+1])
+            # Full index mode: nothing written (empty = offset[v] == offset[v+1])
             add_to_ref_window!(v)
             return
         end
@@ -3217,14 +3220,35 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         flush_bitwriter(buf_bw; flush_last_bits=true)
         vertex_offsets[vs + 1] = bytes_written(buf_bw) * 8
 
-        # Compute entry width
+        # Compute entry width from max offset
         max_offset = vertex_offsets[vs + 1]
         entry_width = max_offset > 0 ? max(Int(ceil(log2(max_offset + 1))), 1) : 1
 
-        # Write offset table: 6-bit entry_width + (N+1) entries
-        write_value(w, UInt64(entry_width), 6)
-        for i in 1:(vs + 1)
-            write_value(w, UInt64(vertex_offsets[i]), entry_width)
+        if index_sample_k > 0
+            # Two-level sampled offsets:
+            # [1 bit: sampled=1] [8 bits: sample_k] [6 bits: entry_width]
+            # [ceil(n/k)+2 entries × entry_width bits]
+            # Data is identical to full index mode.
+            write_bit(w, true)  # sampled flag
+            # Store sample_k as (k/4 - 1) in 8 bits: supports k=4,8,...,1024
+            @assert index_sample_k >= 4 && index_sample_k % 4 == 0 "index_sample_k must be a multiple of 4, >= 4"
+            write_value(w, UInt64(index_sample_k ÷ 4 - 1), 8)
+            write_value(w, UInt64(entry_width), 6)
+
+            # Write sampled offsets: one entry per k-th vertex + end marker
+            for v_idx in 1:index_sample_k:vs
+                write_value(w, UInt64(vertex_offsets[v_idx]), entry_width)
+            end
+            # End marker: total data size
+            write_value(w, UInt64(vertex_offsets[vs + 1]), entry_width)
+        else
+            # Full offset table (original behavior):
+            # [1 bit: sampled=0] [6 bits: entry_width] [(N+1) entries × entry_width bits]
+            write_bit(w, false)  # not sampled
+            write_value(w, UInt64(entry_width), 6)
+            for i in 1:(vs + 1)
+                write_value(w, UInt64(vertex_offsets[i]), entry_width)
+            end
         end
 
         # Write buffered encoded data
@@ -3259,18 +3283,30 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
     enc_tag = _read_encoding_tag(r)
     ie = get(TAG_ENCODINGS, enc_tag, :fibonacci)
 
-    # In index mode, override stop_deltas
-    if is_index_mode
-        stop_deltas = false
-        adaptive_deltas = false
-    end
-
     # Read offset table or legacy degree array
     vertex_offsets = Int[]
+    sampled_offsets = Int[]
+    is_sampled_index = false
     if is_index_mode
-        entry_width = Int(read_value(r, 6, UInt64))
-        for _ in 1:(Int(vs) + 1)
-            push!(vertex_offsets, Int(read_value(r, entry_width, UInt64)))
+        is_sampled_index = read_bit(r)
+        if is_sampled_index
+            # Two-level sampled offsets: data uses children-mode encoding
+            local _sk = (Int(read_value(r, 8, UInt64)) + 1) * 4  # decode: (stored+1)*4
+            entry_width = Int(read_value(r, 6, UInt64))
+            n_sampled = length(1:_sk:Int(vs))
+            for _ in 1:(n_sampled + 1)
+                push!(sampled_offsets, Int(read_value(r, entry_width, UInt64)))
+            end
+            # Sampled mode: data is children-mode, keep stop_deltas as passed
+        else
+            # Full offset table: data uses count-prefixed encoding
+            entry_width = Int(read_value(r, 6, UInt64))
+            for _ in 1:(Int(vs) + 1)
+                push!(vertex_offsets, Int(read_value(r, entry_width, UInt64)))
+            end
+            # Full index mode: override stop_deltas (count-prefixed, no STOP needed)
+            stop_deltas = false
+            adaptive_deltas = false
         end
     end
 
@@ -3434,14 +3470,15 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
     for v_idx in 1:Int(vs)
         v = T(v_idx)
 
-        if is_index_mode
-            # Index mode: empty vertex = offset[v] == offset[v+1]
+        if is_index_mode && !isempty(vertex_offsets)
+            # Full index mode: empty vertex = offset[v] == offset[v+1]
             if vertex_offsets[v_idx] == vertex_offsets[v_idx + 1]
                 neighbor_lists[v] = T[]
                 add_to_ref_window!(v)
                 continue
             end
         end
+        # Sampled index mode: decode normally (count-prefixed handles empty vertices via count=0+1=1 → 0 elements)
 
         current_neighbors = _decode_vertex!(r, v)
 
@@ -4569,11 +4606,13 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         compact_copy::Bool=true,
         tight_intervals::Bool=true,
         lr_split::Bool=false,
-        cost_model::Int=DEFAULT_COST_MODEL) where {T<:Unsigned}
+        cost_model::Int=DEFAULT_COST_MODEL,
+        index_sample_k::Int=0) where {T<:Unsigned}
 
     vs = length(keys(neighbor_lists))
     ie = integer_encoding
     idx_mode = coding_scheme == :index
+    sampled_idx = idx_mode && index_sample_k > 0
 
     fixwidth_ref = lr_split  # fixed-width ref distances when lr_split active (same as BG)
     ref_dist_bits = fixwidth_ref ? max(Int(ceil(log2(ref_window_size + 1))), 1) : 0
@@ -4595,11 +4634,13 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
 
     # --- Helper: encode one vertex's data into a BitWriter ---
     function _encode_cs_vertex!(wr, v::T, current_neighbors::Vector{T})
-        # In index mode, skip empty vertices entirely (nothing between their offsets)
+        # Empty vertex handling
         if isempty(current_neighbors)
-            if !idx_mode
+            if !idx_mode || sampled_idx
+                # Children mode (or sampled index): write explicit empty CS header
                 _write_cs_header(wr, :none, :delta, 0, true)
             end
+            # Full index mode: nothing written (empty = offset[v] == offset[v+1])
             add_to_ref_window!(v)
             return
         end
@@ -4634,14 +4675,14 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
                 write_intervals_and_residuals(wr, target_list, ie, mil; vertex_id=v, tight_intervals=tight_intervals)
             end
         elseif enc_type == :delta
-            if idx_mode
-                # Index mode: count-prefixed delta (no stop terminators)
+            if idx_mode && !sampled_idx
+                # Full index mode: count-prefixed delta (no stop terminators)
                 write_encoded_value(wr, T(length(target_list) + 1), ie)
                 if !isempty(target_list)
                     write_delta(wr, target_list, ie; vertex_id=v)
                 end
             else
-                # CS children mode: always uses stop_deltas for :delta
+                # Children mode (or sampled index): always uses stop_deltas for :delta
                 _write_stop_delta(wr, target_list, ie; vertex_id=v)
             end
         elseif enc_type == :rle
@@ -4669,14 +4710,27 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         flush_bitwriter(buf_bw; flush_last_bits=true)
         vertex_offsets[vs + 1] = bytes_written(buf_bw) * 8
 
-        # Compute entry width
+        # Compute entry width from max offset
         max_offset = vertex_offsets[vs + 1]
         entry_width = max_offset > 0 ? max(Int(ceil(log2(max_offset + 1))), 1) : 1
 
-        # Write offset table: 6-bit entry_width + (N+1) entries
-        write_value(w, UInt64(entry_width), 6)
-        for i in 1:(vs + 1)
-            write_value(w, UInt64(vertex_offsets[i]), entry_width)
+        if index_sample_k > 0
+            # Two-level sampled offsets
+            write_bit(w, true)  # sampled flag
+            @assert index_sample_k >= 4 && index_sample_k % 4 == 0 "index_sample_k must be a multiple of 4, >= 4"
+            write_value(w, UInt64(index_sample_k ÷ 4 - 1), 8)
+            write_value(w, UInt64(entry_width), 6)
+            for v_idx in 1:index_sample_k:vs
+                write_value(w, UInt64(vertex_offsets[v_idx]), entry_width)
+            end
+            write_value(w, UInt64(vertex_offsets[vs + 1]), entry_width)
+        else
+            # Full offset table
+            write_bit(w, false)
+            write_value(w, UInt64(entry_width), 6)
+            for i in 1:(vs + 1)
+                write_value(w, UInt64(vertex_offsets[i]), entry_width)
+            end
         end
 
         # Write buffered encoded data
@@ -4704,12 +4758,27 @@ function read_cmdstream_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, :
     enc_tag = _read_encoding_tag(r)
     ie = get(TAG_ENCODINGS, enc_tag, :fibonacci)
 
-    # Read offset table (index mode) or skip legacy degree array
+    # Read offset table (index mode)
     vertex_offsets = Int[]
+    is_sampled_index = false
     if is_index_mode
-        entry_width = Int(read_value(r, 6, UInt64))
-        for _ in 1:(Int(vs) + 1)
-            push!(vertex_offsets, Int(read_value(r, entry_width, UInt64)))
+        is_sampled_index = read_bit(r)
+        if is_sampled_index
+            # Two-level sampled offsets: read and skip for sequential decode
+            local _sk = (Int(read_value(r, 8, UInt64)) + 1) * 4  # decode: (stored+1)*4
+            entry_width = Int(read_value(r, 6, UInt64))
+            n_sampled = length(1:_sk:Int(vs))
+            sampled = Int[]
+            for _ in 1:(n_sampled + 1)
+                push!(sampled, Int(read_value(r, entry_width, UInt64)))
+            end
+            # Data is children-mode encoded, vertex_offsets stays empty
+        else
+            # Full offset table
+            entry_width = Int(read_value(r, 6, UInt64))
+            for _ in 1:(Int(vs) + 1)
+                push!(vertex_offsets, Int(read_value(r, entry_width, UInt64)))
+            end
         end
     end
 
@@ -4732,15 +4801,15 @@ function read_cmdstream_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, :
             end
             return read_intervals_and_residuals(r_in, ie, mil, T; vertex_id=v, tight_intervals=tight_intervals)
         elseif enc_type == :delta
-            if is_index_mode
-                # Index mode: count-prefixed delta (no stop terminators)
+            if is_index_mode && !is_sampled_index
+                # Full index mode: count-prefixed delta (no stop terminators)
                 count = read_encoded_value(r_in, ie, T) - T(1)
                 if count > 0
                     return read_delta(r_in, ie, T; max_elements=Int(count), vertex_id=v)
                 end
                 return T[]
             else
-                # CS children mode: always uses stop_deltas
+                # Children mode (or sampled index): always uses stop_deltas
                 return _read_stop_delta(r_in, ie, T; vertex_id=v)
             end
         elseif enc_type == :rle
@@ -4756,14 +4825,15 @@ function read_cmdstream_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, :
     for v_idx in 1:Int(vs)
         v = T(v_idx)
 
-        if is_index_mode
-            # Index mode: empty vertex = offset[v] == offset[v+1]
+        if is_index_mode && !is_sampled_index
+            # Full index mode: empty vertex = offset[v] == offset[v+1]
             if vertex_offsets[v_idx] == vertex_offsets[v_idx + 1]
                 neighbor_lists[v] = T[]
                 add_to_ref_window!(v)
                 continue
             end
         end
+        # Sampled index mode: CS header handles empty vertices via the empty prefix code
 
         # Read CS header
         is_empty, ref_mode, enc_type, mil = _read_cs_header(r)

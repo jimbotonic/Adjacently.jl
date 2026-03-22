@@ -148,6 +148,7 @@ Base.@kwdef struct CGParams
     intra_lr_split::Bool = false       # Left/right residual split: split residuals at vertex_id after interval extraction
     intra_tight_deltas::Bool = false  # Skip +1 shift on delta gaps in LR residuals (gaps are always ≥ 1 for sorted unique lists)
     cost_model::Int = Compression.DEFAULT_COST_MODEL  # 0=full analytical, 1=fast (skip interval/LR, pure delta cost)
+    index_sample_k::Int = 0  # Two-level sampled offsets: 0=full, >0=sample every k-th vertex (must be multiple of 4)
 end
 
 # --------------------------
@@ -1898,23 +1899,36 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                 _vtx_offsets[s + 1] = _payload_total_bits
                 flush_bitwriter(_vtx_payload_bw; flush_last_bits=true)
 
-                # Write offset table: 6-bit vtx_entry_width + (s+1) entries
                 local _max_vtx_offset = _vtx_offsets[s + 1]
                 local _vtx_ew = _max_vtx_offset > 0 ? max(Int(ceil(log2(_max_vtx_offset + 1))), 1) : 1
-                write_value(w, UInt64(_vtx_ew), 6)
-                for _vi in 1:(s + 1)
-                    write_value(w, UInt64(_vtx_offsets[_vi]), _vtx_ew)
+
+                local _sk = params.index_sample_k
+                if _sk > 0 && s > _sk
+                    # Two-level sampled offsets within cluster
+                    write_bit(w, true)  # sampled flag
+                    @assert _sk >= 4 && _sk % 4 == 0
+                    write_value(w, UInt64(_sk ÷ 4 - 1), 8)
+                    write_value(w, UInt64(_vtx_ew), 6)
+                    for _vi in 1:_sk:s
+                        write_value(w, UInt64(_vtx_offsets[_vi]), _vtx_ew)
+                    end
+                    write_value(w, UInt64(_vtx_offsets[s + 1]), _vtx_ew)
+                else
+                    # Full offset table
+                    write_bit(w, false)
+                    write_value(w, UInt64(_vtx_ew), 6)
+                    for _vi in 1:(s + 1)
+                        write_value(w, UInt64(_vtx_offsets[_vi]), _vtx_ew)
+                    end
                 end
 
                 # Write buffered payload data precisely (avoid byte-padding corruption)
                 local _vtx_data = get_bytes(_vtx_payload_bw)
                 local _full_bytes = _payload_total_bits ÷ 8
                 local _remaining_bits = _payload_total_bits % 8
-                # Write full bytes via write_bytes (MSB-first per byte)
                 if _full_bytes > 0
                     write_bytes(w, _vtx_data[1:_full_bytes])
                 end
-                # Write remaining bits from the last byte (MSB-first)
                 if _remaining_bits > 0 && _full_bytes < length(_vtx_data)
                     local _last_byte = _vtx_data[_full_bytes + 1]
                     for _bi in 0:(_remaining_bits - 1)
@@ -2207,9 +2221,20 @@ function decode_level(r::BitReader, params::CGParams; T::Type{<:Unsigned}=UInt32
 
             # In index mode, read intra-vertex offset table (skip for sequential decode)
             if coding_scheme == :index
-                local _vtx_ew = Int(read_value(r, 6, UInt64))
-                local _vtx_offsets = [Int(read_value(r, _vtx_ew, UInt64)) for _ in 1:(s + 1)]
-                # Offsets available for future random access; sequential decode just skips them
+                local _is_sampled_vtx = read_bit(r)
+                if _is_sampled_vtx
+                    local _sk_vtx = (Int(read_value(r, 8, UInt64)) + 1) * 4
+                    local _vtx_ew = Int(read_value(r, 6, UInt64))
+                    local _n_sampled_vtx = length(1:_sk_vtx:s)
+                    for _ in 1:(_n_sampled_vtx + 1)
+                        read_value(r, _vtx_ew, UInt64)  # skip sampled offsets
+                    end
+                else
+                    local _vtx_ew = Int(read_value(r, 6, UInt64))
+                    for _ in 1:(s + 1)
+                        read_value(r, _vtx_ew, UInt64)  # skip full offsets
+                    end
+                end
             end
 
             # Read per-vertex payloads
