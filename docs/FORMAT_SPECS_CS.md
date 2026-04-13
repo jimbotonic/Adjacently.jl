@@ -318,7 +318,7 @@ g = load_compressed_mgs3_graph("output_base.mgz")
 | **CS best (w=256)** | **Leiden+LLP** | **2.3043** | OK |
 | BG best (w=64, lr+mr) | Leiden+LLP | 2.3259 | OK |
 | CG K=2 (w=64) | Original | 2.3286 | OK |
-| WebGraph BV-HC | host-compressed | 2.448 | — |
+| WebGraph BV-HC | high compression (seq. access) | 2.448 | — |
 | CS (w=64, no reorder) | Original | 2.4348 | OK |
 | WebGraph BV | LLP | 2.898 | — |
 
@@ -375,7 +375,7 @@ CS beats BG by 0.022 BPE with Leiden+LLP ordering despite lacking multi-ref supp
 
 1. **Low-degree reference search is the single biggest win.** Lowering the minimum degree threshold from 3→1 and overlap from 3→1 saves 0.427 BPE on CNR-2000. The 66K degree 1-2 vertices (20% of non-empty) were previously forced into expensive raw encoding despite having perfectly good reference candidates nearby.
 
-2. **CS is the overall best method on CNR-2000.** At 2.3043 BPE (w=256, Leiden+LLP), CS surpasses BG (2.3259), CG K=2 (2.3286), and WebGraph BV-HC (2.448) without needing host-aware compression or multi-reference encoding.
+2. **CS is the overall best method on CNR-2000.** At 2.3043 BPE (w=256, Leiden+LLP), CS surpasses BG (2.3259), CG K=2 (2.3286), and WebGraph BV-HC (2.448) without needing BV's high-compression sequential-access mode or multi-reference encoding.
 
 3. **CS beats BG despite fewer features.** CS lacks multi-ref support but beats BG (2.3043 vs 2.3259) thanks to shorter prefix codes and a larger window (w=256 vs w=64).
 
@@ -422,24 +422,30 @@ Best CS BPE across all tested datasets:
 | cnr-2000 (no reorder) | 2.4348 | **2.3286** | 2.4929 | 2.898 | w=64, no-lr |
 | cnr-2000 (Leiden+LLP) | **2.3043** | 2.5652 | 2.3259 | 3.2335 | w=256, no-lr |
 | in-2004 | 1.7839 | **1.7513** | 1.895 | 2.172 | w=64, no-lr |
+| enwiki-2013 (Leiden+LLP) | 12.222 | 12.485 | **12.161** | 13.114 | w=128, lr |
+| enwiki-2013 (no reorder) | — | 15.718 | — | 13.114 | — |
 | web-google core (Leiden+LLP) | **4.0288** | 4.3296 | 4.0735 | 5.0081 | w=256, no-lr |
 | web-google rcore (Leiden+LLP) | **3.7337** | 3.9359 | 3.7626 | 4.1751 | w=256, no-lr |
 | eat-core | 10.8679 | **10.5768** | 10.9191 | 10.705 | w=256, lr |
+| eat-core (Leiden+LLP) | 9.773 | **9.558** | 9.767 | 9.729 (HC) | w=256, lr |
 | eat-rcore | 9.5674 | **9.3192** | 9.5726 | 9.391 | w=256, lr |
 | arxiv-hep-ph core | 10.0767 | **9.8187** | 10.0910 | 10.262 | w=256, lr |
+| arxiv-hep-ph core (Leiden+LLP) | 7.269 | **7.162** | 7.252 | 7.706 (HC) | w=256, lr |
 | arxiv-hep-ph rcore | 8.9855 | **8.9406** | 9.0946 | 9.684 | w=256, no-lr |
 | amazon-0601 core | 12.5235 | **12.1853** | 12.4444 | 13.001 | w=8, lr |
+| amazon-0601 core (Leiden+LLP) | 8.095 | **7.903** | 8.058 | 8.722 (HC) | w=64, lr |
 | amazon-0601 rcore | 11.8497 | **11.7069** | 11.7310 | 12.064 | w=8, lr |
 
 **Bold** = best among Adjacently methods for that dataset.
 
 **Key findings**:
-- CS is the best single-pass method, consistently beating or matching BG
+- CS is the best single-pass method on CNR-2000 (2.304 BPE) and Web-Google (4.029/3.734 BPE)
+- **enwiki-2013**: CS (12.222, w=128, Leiden+LLP) is close to BG (12.161) but behind; both beat CG (12.485, LLP). BG's multi-ref advantage is decisive on the high-degree Wikipedia graph (avg degree 24.1). CS w=256 estimated ~12.15.
 - Leiden+LLP ordering improves CS on Web-Google by ~0.37 BPE (core: 4.399→4.029, rcore: 4.064→3.734)
 - CS w=256 remains the best single-pass method on Web-Google with Leiden+LLP ordering, beating BG and CG K=1
 - On most other datasets, CG K=1 beats CS via per-cluster local indexing
 - CS benefits from larger windows (w=256) on Web-Google and other moderate-locality graphs
-- lr_split is dataset-dependent: helps on EAT, Arxiv, Amazon; hurts on cnr-2000 and Web-Google
+- lr_split is dataset-dependent: helps on EAT, Arxiv, Amazon, enwiki; hurts on cnr-2000 and Web-Google
 
 ---
 

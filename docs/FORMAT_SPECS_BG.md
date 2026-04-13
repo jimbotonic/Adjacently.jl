@@ -521,11 +521,11 @@ Note: Fix 1, 2, and 3 improved all configurations simultaneously. The numbers ab
 | Pre-low-deg | Leiden+LLP | copy_blocks+stop_deltas+lr_split+multi_ref+merged_vlc | 2.792 |
 | Best v3.1 (legacy) | Leiden+LLP | empty+compact+vlc2+tight | 2.881 |
 | WebGraph BV | LLP | zeta-3, w=7 | 2.898 |
-| WebGraph BV-HC | host-compressed | zeta-3, w=7 | 2.448 |
+| WebGraph BV-HC | high compression (seq. access) | zeta-3, w=7 | 2.448 |
 
 **CS beats WebGraph BV-HC**: 2.304 vs 2.448 BPE (-0.144 BPE)
 **BG beats WebGraph BV**: 2.326 vs 2.898 BPE (-0.572 BPE)
-**BG beats CG K=1**: 2.326 vs 2.638 BPE (-0.312 BPE) — HC uses host-aware compression
+**BG beats CG K=1**: 2.326 vs 2.638 BPE (-0.312 BPE) — HC uses high-compression sequential-access settings
 
 ### Multi-Dataset Benchmark
 
@@ -536,18 +536,24 @@ Best BG BPE across all tested datasets:
 | cnr-2000 (no reorder) | 2.4929 | **2.3286** | 2.4348 | 2.898 | w=64, lr+mr |
 | cnr-2000 (Leiden+LLP) | 2.3259 | 2.5652 | **2.3043** | 3.2335 | w=64, no-lr, mr |
 | in-2004 | 1.895 | **1.7513** | 1.7839 | 2.172 | w=64, lr+mr |
+| enwiki-2013 (Leiden+LLP) | **12.161** | 12.485 | 12.222 | 13.114 | w=64, lr+mr |
+| enwiki-2013 (no reorder) | — | 15.718 | — | 13.114 | — |
 | web-google core (Leiden+LLP) | 4.0735 | 4.3296 | **4.0288** | 5.0081 | w=64, no-lr, mr |
 | web-google rcore (Leiden+LLP) | 3.7626 | 3.9359 | **3.7337** | 4.1751 | w=64, no-lr, mr |
 | eat-core | 10.9191 | **10.5768** | 10.8679 | 10.705 | w=64, lr+mr |
+| eat-core (Leiden+LLP) | 9.767 | **9.558** | 9.773 | 9.729 (HC) | w=64, lr+mr |
 | eat-rcore | 9.5726 | **9.3192** | 9.5674 | 9.391 | w=64, lr+mr |
 | arxiv-hep-ph core | 10.0910 | **9.8187** | 10.0767 | 10.262 | w=64, lr+mr |
+| arxiv-hep-ph core (Leiden+LLP) | **7.252** | 7.162 | 7.269 | 7.706 (HC) | w=64, lr+mr |
 | arxiv-hep-ph rcore | 9.0946 | **8.9406** | 8.9855 | 9.684 | w=64, lr+mr |
 | amazon-0601 core | 12.4444 | **12.1853** | 12.5235 | 13.001 | w=8, lr+mr |
+| amazon-0601 core (Leiden+LLP) | 8.058 | **7.903** | 8.095 | 8.722 (HC) | w=64, lr+mr |
 | amazon-0601 rcore | 11.7310 | **11.7069** | 11.8497 | 12.064 | w=8, lr+mr |
 
 **Key findings**:
+- **enwiki-2013: BG beats CG** — BG (12.161, Leiden+LLP) outperforms CG (12.485, LLP) by 0.324 BPE. Multi-ref is valuable on the high-degree Wikipedia graph (avg degree 24.1). CG without reordering degrades to 15.718 BPE.
 - Leiden+LLP ordering improves BG on Web-Google by ~0.3 BPE (core: 4.427→4.074, rcore: 4.080→3.763)
-- BG still beats CG K=1 on Web-Google (core: 4.074 vs 4.330, rcore: 3.763 vs 3.936) but CG K=1 beats BG on most other datasets
+- BG still beats CG K=1 on Web-Google (core: 4.074 vs 4.330, rcore: 3.763 vs 3.936) and enwiki-2013, but CG K=1 beats BG on most other datasets
 - LLP reordering is critical for SNAP datasets with poor original ordering (Web-Google: 1.2-1.4 BPE gain)
 - lr_split helps on most datasets but hurts on cnr-2000 and Web-Google (crawl-ordered graphs)
 

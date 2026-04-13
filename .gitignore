@@ -1,5 +1,3 @@
-
-
 # =========================
 
 # Julia
@@ -39,6 +37,20 @@ deps/build.log
 
 datasets/Web_Google/web-Google.txt
 datasets/Amazon_0601/Amazon0601.txt
+
+# Dataset binary and generated files (too large for git)
+
+datasets/**/*.graph-txt
+datasets/**/*.graph
+datasets/**/*.offsets
+datasets/**/*.properties
+datasets/**/*.indegree
+datasets/**/*.outdegree
+datasets/**/*.stats
+datasets/**/*.mgs
+datasets/**/*.mgz
+datasets/**/*.bin
+datasets/**/*.bson
 
 # Webgraph source datasets (large files — see README.md in each subfolder)
 
@@ -147,8 +159,26 @@ Thumbs.db
 
 # =========================
 
-# Latex
+# Latex build artifacts
 
 # =========================
 
-/paper
+paper/*.aux
+paper/*.bbl
+paper/*.blg
+paper/*.log
+paper/*.out
+paper/*.toc
+paper/*.fls
+paper/*.fdb_latexmk
+paper/*.synctex.gz
+paper/*.pdf
+
+# =========================
+
+# Misc
+
+# =========================
+
+/apps
+/claude

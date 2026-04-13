@@ -18,7 +18,7 @@ Key properties:
 **Best results**:
 - **CNR-2000**: **2.3286 BPE** (K=2, w=64, no LLP, adaptive STOP-delta) — beats WebGraph BV (2.898 BPE) by 0.569 BPE and BV-HC (2.448 BPE) by 0.119 BPE
 - **in-2004**: **1.7513 BPE** (K=1, w=8, no clustering) — beats WebGraph BV (2.172 BPE) by 0.421 BPE and BV-HC (1.767 BPE) by 0.016 BPE
-- **enwiki-2013**: **12.4854 BPE** (K=1, w=64, LLP, intervals + LR split) — beats WebGraph BV-HC (12.639 BPE) by 0.154 BPE
+- **enwiki-2013**: **12.161 BPE** (BG w=64, lr+mr, Leiden+LLP) — beats BV-HC (12.639) by 3.8%. CG 12.485 (LLP), CS 12.222 (Leiden+LLP). CG original ordering: 15.718
 - **Web-Google core**: **4.3296 BPE** (K=1, w=8, Leiden+LLP ordering, no intervals) — CS 4.029, BG 4.074 also benefit from same ordering
 - **Web-Google rcore**: **3.9359 BPE** (K=1, w=8, Leiden+LLP ordering, no intervals) — CS 3.734, BG 3.763 also benefit from same ordering
 - **EAT core**: **10.5768 BPE** (K=1, w=256, intervals + LR + tight_deltas, gamma)
@@ -623,14 +623,19 @@ Best CG BPE across all tested datasets, compared with BG, CS, and WebGraph BV:
 | cnr-2000 (no reorder) | 325K | 3.2M | **2.3286** | 2.4929 | 2.4348 | 2.898 | K=2, w=64, no LLP |
 | cnr-2000 (Leiden+LLP) | 325K | 3.2M | 2.5652 | 2.3259 | **2.3043** | 3.2335 | K=1, w=64; CS w=256 best |
 | in-2004 | 1.38M | 16.9M | **1.7513** | 1.895 | 1.7839 | 2.172 | K=1, w=8 |
-| enwiki-2013 | 4.2M | 101M | **12.4854** | — | — | 13.114 | K=1, w=64, LLP, iv+LR |
+| enwiki-2013 (LLP) | 4.2M | 101M | 12.4854 | — | — | 13.114 | K=1, w=64, LLP, iv+LR |
+| enwiki-2013 (Leiden+LLP) | 4.2M | 101M | — | **12.161** | 12.222 | 13.114 | BG w=64 lr+mr; CS w=128 lr |
+| enwiki-2013 (no reorder) | 4.2M | 101M | 15.7183 | — | — | 13.114 | K=1, w=64, iv+LR |
 | web-google core | 434K | 3.4M | 4.3296 | 4.0735 | **4.0288** | 5.0081 | K=1, w=8, Leiden+LLP, no-iv m4 |
 | web-google rcore | 434K | 3.4M | 3.9359 | 3.7626 | **3.7337** | 4.1751 | K=1, w=8, Leiden+LLP, no-iv m4 |
 | eat-core | 7.8K | 247K | **10.5768** | 10.9191 | 10.8679 | 10.705 | K=1, w=256, iv+LR+td, gamma |
+| eat-core (Leiden+LLP) | 7.8K | 247K | **9.558** | 9.767 | 9.773 | 9.729 (HC) | K=1, w=256, iv+LR |
 | eat-rcore | 7.8K | 247K | **9.3192** | 9.5726 | 9.5674 | 9.391 | K=1, w=256, iv+LR+td, gamma |
 | arxiv-hep-ph core | 34.5K | 422K | **9.8187** | 10.0910 | 10.0767 | 10.262 | K=1, w=256, iv+LR+td |
+| arxiv-hep-ph core (Leiden+LLP) | 34.5K | 422K | **7.162** | 7.252 | 7.269 | 7.706 (HC) | K=1, w=256, iv+LR |
 | arxiv-hep-ph rcore | 12.7K | 140K | **8.9406** | 9.0946 | 8.9855 | 9.684 | K=1, w=256, iv+LR+td |
 | amazon-0601 core | 395K | 3.3M | **12.1853** | 12.4444 | 12.5235 | 13.001 | K=1, w=8, iv+LR+td |
+| amazon-0601 core (Leiden+LLP) | 395K | 3.3M | **7.903** | 8.058 | 8.095 | 8.722 (HC) | K=1, w=8, iv+LR |
 | amazon-0601 rcore | 395K | 3.3M | **11.7069** | 11.7310 | 11.8497 | 12.064 | K=1, w=8, iv+LR+td |
 
 **Bold** = best among Adjacently methods for that dataset.
@@ -638,6 +643,7 @@ Best CG BPE across all tested datasets, compared with BG, CS, and WebGraph BV:
 **Key findings**:
 - CG K=1 beats BG and CS on most datasets thanks to per-cluster local vertex indexing and adaptive encoding
 - **Web-Google exception**: CS and BG still beat CG K=1 even with Leiden+LLP ordering. CG's fixwidth ref header overhead (1+ceil(log2(w)) bits per vertex) outweighs its advantages. All methods benefit equally (~0.3 BPE) from Leiden+LLP ordering.
+- **enwiki-2013 exception**: BG (12.161, Leiden+LLP) beats CG (12.485, LLP). Multi-ref is valuable on the high-degree Wikipedia graph (avg degree 24.1). CG without reordering degrades to 15.718 BPE.
 - **Leiden+LLP ordering** improves all methods: LLP→Leiden fine clusters→per-cluster LLP→concatenate. Improves CG by 0.35 BPE, CS by 0.37 BPE, BG by 0.35 BPE, BV by 0.34 BPE over plain LLP.
 - CG w=8 beats w=64 on Web-Google: the +3 bits/ref-vertex for w=64 fixwidth outweighs payload savings
 - `no-iv m4` mode (no intervals, mil=4) beats intervals+LR at high locality (Leiden+LLP produces very tight clusters)
@@ -778,21 +784,27 @@ CG K=2 beats WebGraph BV by **0.579 BPE** (20.0% reduction) and BV-HC by **0.129
 **Graph**: 4,203,325 vertices (4,206,785 with isolates), 101,355,853 edges (English Wikipedia 2013 link graph).
 **WebGraph reference**: BV standard = 13.114 BPE, BV-HC (high compression) = 12.639 BPE.
 
-#### Best Result: 12.4854 BPE (K=1, LLP, intervals + LR split)
+#### Best Result: 12.161 BPE (BG, w=64, lr+mr, Leiden+LLP)
 
-Uses K=1 (single cluster) with global LLP reordering (10 passes), interval+residual encoding (`intra_intervals=true`), and left/right residual split (`intra_lr_split=true`). The reference window is 64.
+BG with Leiden+LLP ordering beats CG on enwiki-2013 — a reversal from most other datasets. BG's multi-reference feature is valuable on the high-degree Wikipedia graph (avg degree 24.1).
 
 | Configuration | BPE | Bytes | vs BV-HC |
 |---------------|-----|-------|----------|
+| CG K=1, iv+LR, original ordering | 15.718 | 199,143,062 | +3.079 |
 | WebGraph BV standard (w=7, zeta-3) | 13.114 | 166,148,696 | +0.475 |
 | WebGraph BV-HC (high compression) | 12.639 | — | — |
-| CG K=1, intervals, no LR split | 12.927 | 163,782,982 | +0.288 |
-| **CG K=1, intervals + LR split** | **12.485** | **158,184,071** | **−0.154** |
+| CG K=1, intervals + LR split (LLP) | 12.485 | 158,184,071 | −0.154 |
+| CS w=128, lr (Leiden+LLP) | 12.222 | — | −0.417 |
+| **BG w=64, lr+mr (Leiden+LLP)** | **12.161** | — | **−0.478** |
+
+LLP ordering saves **3.233 BPE** (20.6%) over original ordering for CG K=1 with intervals+LR-split. Without LLP, CG (15.718) is worse than even BV standard (13.114), showing that enwiki-2013's original ordering has very weak sequential locality.
+
+With Leiden+LLP, BG (12.161) beats CG (12.485) by 0.324 BPE. CS w=128 (12.222) is also ahead. CS w=256 is estimated at ~12.15 BPE.
 
 The LR split saves **0.442 BPE** on enwiki-2013 (3.4% reduction), pushing CG below the WebGraph BV-HC baseline. This is a larger saving than on CNR-2000 because enwiki-2013 has higher average degree (24.1 vs 9.9) and more residuals per vertex after interval extraction, amplifying the benefit of better first-value encoding.
 
-Encoding time: ~38 minutes with 16 threads (Julia `--threads=auto`).
-Ref used: 3,560,563 / 4,203,325 (84.7%).
+Encoding time: ~5 min (CG original ordering), ~38 min (CG LLP, Julia `--threads=auto`).
+Ref used (CG original): 3,526,081 / 4,203,325 (83.9%). Ref used (CG LLP): 3,560,563 / 4,203,325 (84.7%).
 
 ---
 
@@ -923,4 +935,5 @@ Cross-dataset speed results with the optimized encoder:
 |---------|-------|----------------|--------|
 | cnr-2000 K=2 | 3.2M | 2.164e-06 | w=64, no LLP |
 | in-2004 K=1 | 16.9M | 6.285e-07 | w=8, no LLP |
-| enwiki-2013 K=1 | 101M | 2.436e-06 | w=64, LLP, iv+LR |
+| enwiki-2013 K=1 (LLP) | 101M | 2.436e-06 | w=64, LLP, iv+LR |
+| enwiki-2013 K=1 (original) | 101M | 3.072e-06 | w=64, iv+LR, no reorder |
