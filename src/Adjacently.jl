@@ -59,6 +59,10 @@ include("graph.jl")
 using .Graph
 export Graph
 
+include("paths.jl")
+using .Paths
+export Paths
+
 include("generators.jl")
 using .Generators
 export Generators
@@ -102,5 +106,9 @@ export Metrics
 include("param_prediction.jl")
 using .ParamPrediction
 export ParamPrediction
+
+include("metabolic/Metabolic.jl")
+using .Metabolic
+export Metabolic
 
 end # module Adjacently
