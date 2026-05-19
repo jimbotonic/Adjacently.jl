@@ -163,16 +163,16 @@ Thumbs.db
 
 # =========================
 
-paper/*.aux
-paper/*.bbl
-paper/*.blg
-paper/*.log
-paper/*.out
-paper/*.toc
-paper/*.fls
-paper/*.fdb_latexmk
-paper/*.synctex.gz
-paper/*.pdf
+research/**/*.aux
+research/**/*.bbl
+research/**/*.blg
+research/**/*.log
+research/**/*.out
+research/**/*.toc
+research/**/*.fls
+research/**/*.fdb_latexmk
+research/**/*.synctex.gz
+research/**/*.pdf
 
 # =========================
 
@@ -182,3 +182,12 @@ paper/*.pdf
 
 /apps
 /claude
+
+# Claude Code local config / instructions — do not commit
+CLAUDE.md
+.claude/
+
+# Local-only project workspaces / scratch — do not commit
+docs/deprecated/
+docs/artifacts.md
+research/

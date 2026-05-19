@@ -111,4 +111,8 @@ include("metabolic/Metabolic.jl")
 using .Metabolic
 export Metabolic
 
+include("fingerprints/Fingerprints.jl")
+using .Fingerprints
+export Fingerprints
+
 end # module Adjacently
