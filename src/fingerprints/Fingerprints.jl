@@ -24,6 +24,7 @@ K→∞ limit of NDF.
 module Fingerprints
 
 using BSON
+using JLD2
 using ChainRulesCore
 using Flux
 using LinearAlgebra
@@ -44,13 +45,14 @@ include("text_gcn.jl")
 
 export NDF, NDFEncoder, propagate, prepare_adjacency,
        prepare_adjacency_directed_ppr, default_node_features,
-       Document, TrainConfig, train!, fingerprints,
+       top_central_nodes,
+       Document, TrainConfig, train!, fingerprints, load_ndf_state,
        BlogDoc, read_blog_corpus, build_vocab,
        compute_ppmi, compute_v1_collocation,
        build_domain_graph, blogdocs_to_documents,
        porter_stem_lite,
        TextGcnDoc, read_text_gcn_corpus,
        textgcn_to_documents, build_text_gcn_vocab,
-       load_bert_word_features
+       load_bert_word_features, read_blog_posts
 
 end # module

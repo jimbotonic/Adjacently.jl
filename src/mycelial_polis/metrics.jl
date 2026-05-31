@@ -1,0 +1,459 @@
+"""
+    metrics
+
+Viability metrics for the Mycelial Polis (roadmap §14). Item 7 replaces
+the item-2 skeleton with the full §14 form:
+
+| Metric        | Range    | Source       | Φ-weight (default) |
+|---------------|----------|--------------|--------------------|
+| `core_frac`   | [0,1]    | committed / N | 0.25              |
+| `giant_frac`  | [0,1]    | weakly-connected component on G_S, active vertices only / N | 0.25 |
+| `kcore_norm`  | [0,1]    | k_core_depth / `params.kcore_scale` | 0.10  |
+| `Ψ_T`         | [0,1]    | §12 weighted infra indicator           | 0.20  |
+| `Λ_sat`       | [0,1)    | Λ / (1+Λ), Λ = mean(L_int) / mean(L_ext) | 0.20 |
+
+`params.phi_weights` is an `NamedTuple` keyed by `(:core, :giant, :kcore,
+:psi_T, :lambda_sat)`. Override at construction to retune.
+
+All individual metric functions are exported so they can be inspected and
+tested independently.
+"""
+
+# --- counts ------------------------------------------------------------------
+
+active_count(world::World)    = count(is_active,    world.agents)
+committed_count(world::World) = count(is_committed, world.agents)
+
+mean_field(world::World, f::Function) =
+    isempty(world.agents) ? 0f0 :
+    Float32(sum(f, world.agents) / length(world.agents))
+
+# --- core-fraction-style metrics --------------------------------------------
+
+"""
+    committed_frac(world) -> Float32 in [0,1]
+
+Fraction of agents with role ≥ `:user`. Numerator excludes `:removed`,
+`:defector`, `:infiltrator`, `:outsider`.
+"""
+committed_frac(world::World) = length(world.agents) == 0 ? 0f0 :
+    Float32(committed_count(world) / length(world.agents))
+
+# --- structural metrics on G_S | active -------------------------------------
+
+# Boolean mask: which agent ids are currently "active" in the polis-internal
+# sense (not removed, not outsider, not infiltrator, not defector). This is
+# stricter than `is_active` because infiltrators and defectors are technically
+# in the network but not on the polis's side.
+function _polis_mask(world::World)
+    n = nv(layer(world.multiplex, :S))
+    mask = falses(Int(n))
+    for a in world.agents
+        if a.role !== :removed && a.role !== :outsider &&
+           a.role !== :infiltrator && a.role !== :defector && a.id <= Int(n)
+            mask[a.id] = true
+        end
+    end
+    return mask
+end
+
+"""
+    giant_active_frac(world) -> Float32 in [0,1]
+
+Size of the largest weakly-connected component on `G_S` restricted to
+polis-active agents, divided by the total number of agents.
+"""
+function giant_active_frac(world::World)
+    g = layer(world.multiplex, :S)
+    n = Int(nv(g))
+    n == 0 && return 0f0
+    mask = _polis_mask(world)
+    sum(mask) == 0 && return 0f0
+    visited = falses(n)
+    best = 0; q = Int[]; T = eltype(g)
+    @inbounds for v in 1:n
+        (mask[v] && !visited[v]) || continue
+        empty!(q); push!(q, v); visited[v] = true
+        size = 0
+        while !isempty(q)
+            u = pop!(q); size += 1
+            for w in outneighbors(g, T(u))
+                iw = Int(w); iw <= n && mask[iw] && !visited[iw] &&
+                    (visited[iw] = true; push!(q, iw))
+            end
+            for w in inneighbors(g, T(u))
+                iw = Int(w); iw <= n && mask[iw] && !visited[iw] &&
+                    (visited[iw] = true; push!(q, iw))
+            end
+        end
+        size > best && (best = size)
+    end
+    return Float32(best / n)
+end
+
+"""
+    kcore_depth(world) -> Int
+
+Largest `k` for which a non-empty `k`-core exists on the *active-vertex*
+projection of `G_S`. Uses LightGraphs' `core_number` on the full G_S
+then zeros the entries of non-polis-active vertices; the resulting max
+core number is the depth.
+
+**Convention**: LightGraphs.core_number on a directed graph counts
+total degree (out + in). A k-clique therefore has core number 2(k−1),
+not k−1. This matches what we want for the polis since both directions
+of trust count toward "membership in the dense core".
+"""
+function kcore_depth(world::World)
+    g = layer(world.multiplex, :S)
+    nv(g) == 0 && return 0
+    mask = _polis_mask(world)
+    sum(mask) == 0 && return 0
+    cn = LightGraphs.core_number(g)
+    best = 0
+    @inbounds for i in eachindex(cn)
+        if i <= length(mask) && mask[i]
+            cn[i] > best && (best = cn[i])
+        end
+    end
+    return Int(best)
+end
+
+"""
+    modularity_active(world; partition=nothing) -> Float64
+
+Newman directed modularity on the active-vertex projection of `G_S`.
+If `partition === nothing`, returns `NaN` (no natural cell grouping).
+Topologies built via `build_topology` should pass
+`natural_partition(topology, n)` to get a meaningful number.
+"""
+function modularity_active(world::World; partition::Union{Nothing,Vector{Int}}=nothing)
+    partition === nothing && return NaN
+    g = layer(world.multiplex, :S)
+    n = Int(nv(g))
+    n == 0 && return 0.0
+    mask = _polis_mask(world)
+    sum(mask) == 0 && return 0.0
+    # Restrict to active vertices in-place by skipping edges with inactive endpoints.
+    m = 0
+    comms = unique(partition[mask])
+    L  = Dict(c => 0.0 for c in comms)
+    Do = Dict(c => 0.0 for c in comms)
+    Di = Dict(c => 0.0 for c in comms)
+    T = eltype(g)
+    @inbounds for v in 1:n
+        mask[v] || continue
+        cv = partition[v]
+        ods = 0; ids = 0
+        for u in outneighbors(g, T(v))
+            iu = Int(u); iu <= n && mask[iu] || continue
+            ods += 1
+            partition[iu] == cv && (L[cv] += 1.0)
+        end
+        for u in inneighbors(g, T(v))
+            iu = Int(u); iu <= n && mask[iu] || continue
+            ids += 1
+        end
+        Do[cv] += Float64(ods)
+        Di[cv] += Float64(ids)
+        m += ods   # each directed edge counted once at its tail
+    end
+    m == 0 && return 0.0
+    q = 0.0
+    @inbounds for c in comms
+        q += L[c] - Do[c] * Di[c] / m
+    end
+    return q / m
+end
+
+# --- legibility -------------------------------------------------------------
+
+"""
+    lambda(world; eps=1f-3) -> Float32
+
+§11 legibility ratio Λ(t) = mean(L_int) / max(mean(L_ext), ε), restricted
+to polis-active agents. Can exceed 1; see `lambda_sat`.
+"""
+function lambda(world::World; eps::Float32=1f-3)
+    active = filter(a -> a.role !== :removed && a.role !== :outsider &&
+                         a.role !== :infiltrator && a.role !== :defector,
+                    world.agents)
+    isempty(active) && return 0f0
+    l_int = sum(a -> a.L_int, active) / length(active)
+    l_ext = sum(a -> a.L_ext, active) / length(active)
+    return Float32(l_int / max(l_ext, eps))
+end
+
+"""
+    lambda_sat(world) -> Float32 in [0,1)
+
+Squashed legibility ratio Λ / (1 + Λ) — bounded so legibility cannot
+dominate `Φ`. (Spec requirement from the *Metrics normalization spec*
+section of RESEARCH_TASKS.md.)
+"""
+lambda_sat(world::World) = (Λ = lambda(world); Float32(Λ / (1f0 + Λ)))
+
+# --- infrastructure (§12) ---------------------------------------------------
+
+# Replica latency lookup — returns `true` if the agent is still in the
+# warm-up window for this function (and therefore should not count toward
+# Ψ_T yet). Currently stored only when latency > 0; absence means ready.
+@inline _is_warming(world::World, k::Symbol, id::Int) =
+    haskey(world.infra_latency, k) && haskey(world.infra_latency[k], id)
+
+# An agent is an "active replica" if it is a polis-active committed
+# agent (not removed, not defector, not infiltrator) AND has finished
+# its replica-latency warm-up.
+function _is_effective_replica(world::World, k::Symbol, id::Int)
+    a = world.agents[id]
+    is_committed(a) || return false
+    return !_is_warming(world, k, id)
+end
+
+"""
+    psi_T(world) -> Float32 in [0,1]
+
+§12 technical-resilience score, weighted sum over critical functions of
+the indicator `|R_k_active| ≥ m_k`. Skeleton uses uniform weights
+`ω_k = 1/|K|`; future versions tied to `params.phi_weights` could
+distinguish "communication" from "archives".
+"""
+function psi_T(world::World)
+    K = collect(keys(world.infra))
+    isempty(K) && return 0f0
+    score = 0.0
+    for k in K
+        active = count(id -> _is_effective_replica(world, k, id), world.infra[k])
+        score += (active >= world.infra_min[k]) ? 1.0 : 0.0
+    end
+    return Float32(score / length(K))
+end
+
+"""
+    infra_outages(world) -> Int
+
+Number of critical functions currently below their `m_k` threshold of
+effective replicas.
+"""
+function infra_outages(world::World)
+    n_out = 0
+    for k in keys(world.infra)
+        active = count(id -> _is_effective_replica(world, k, id), world.infra[k])
+        active < world.infra_min[k] && (n_out += 1)
+    end
+    return n_out
+end
+
+# --- governance ------------------------------------------------------------
+
+"""
+    gamma(world) -> Float32 in [0,1]
+
+§13 governance score placeholder. Skeleton: fraction of agents who hold
+the `:steward` role. Item 9 (principles) will broaden this with the full
+`F(participation, legitimacy, speed, capture_risk, ...)` form.
+"""
+gamma(world::World) =
+    isempty(world.agents) ? 0f0 :
+    Float32(count(is_steward, world.agents) / length(world.agents))
+
+# --- Φ composite -----------------------------------------------------------
+
+"""
+    default_phi_weights() -> NamedTuple
+
+Default Φ-component weights. Sum to 1.0 so `Φ ∈ [0,1]` even before any
+saturation. Override by passing
+`params = merge(default_params(), (phi_weights = (...),))`.
+"""
+default_phi_weights() = (
+    core        = 0.25f0,
+    giant       = 0.25f0,
+    kcore       = 0.10f0,
+    psi_T       = 0.20f0,
+    lambda_sat  = 0.20f0,
+)
+
+"""
+    phi(world; partition=nothing) -> Float32 in [0,1]
+
+§14 viability composite. Uses `world.params.phi_weights` if present,
+else `default_phi_weights()`. K-core depth is normalised by
+`params.kcore_scale` (default 10) so the normalised value lives in
+[0,1].
+"""
+function phi(world::World; partition::Union{Nothing,Vector{Int}}=nothing)
+    n = length(world.agents)
+    n == 0 && return 0f0
+    w = get(world.params, :phi_weights, default_phi_weights())
+    kcore_scale = Float32(get(world.params, :kcore_scale, 10))
+    core_f  = committed_frac(world)
+    giant_f = giant_active_frac(world)
+    kcore_f = Float32(kcore_depth(world) / kcore_scale)
+    psi     = psi_T(world)
+    lsat    = lambda_sat(world)
+    return clamp(
+        w.core      * core_f +
+        w.giant     * giant_f +
+        w.kcore     * min(kcore_f, 1f0) +
+        w.psi_T     * psi +
+        w.lambda_sat * lsat,
+        0f0, 1f0)
+end
+
+# --- hierarchy score H(t) — paper 2 ---------------------------------------
+#
+# H(t) ∈ [0, 1] is the polis's *hierarchy / domination / minority-control*
+# score, deliberately kept ORTHOGONAL to Φ so that the politically central
+# failure mode "resilient domination" (high Φ + high H) is detectable.
+#
+# Components (mean of available signals):
+#
+#   steward_concentration  = top-3 stewards' G_S outdegree / total committed G_S edges
+#                            ∈ [0, 1], high = a few stewards dominate the trust graph.
+#   infra_concentration    = max replicas per agent / max(total replicas, 1)
+#                            ∈ [0, 1], high = one agent holds all infrastructure keys.
+#   faction_dominance      = max faction size / max(n_committed, 1)
+#                            ∈ [0, 1], high = one faction controls the committed core.
+#   steward_fraction       = n_steward / max(n_committed, 1) capped at the "few-
+#                            stewards" tail: small steward population governing
+#                            many is hierarchy; large rotating set is not.
+#                            Maps n_steward/n_committed = 0.05 → H=1, ≥ 0.5 → H=0.
+#
+# Each component is reported separately for paper-2 transparency; the
+# scalar H(t) is the equally-weighted mean of the components actually
+# defined for the world's current state.
+
+"""
+    hierarchy_components(world) -> NamedTuple
+
+Per-step components of the hierarchy score, in `[0, 1]` (higher = more
+hierarchical). Returns each signal separately so the composite is
+transparent.
+"""
+function hierarchy_components(world::World)
+    g_S = layer(world.multiplex, :S)
+    committed_ids = [a.id for a in world.agents if is_committed(a)]
+    n_committed = length(committed_ids)
+    n_steward = count(is_steward, world.agents)
+
+    # 1. steward_concentration
+    sc = 0f0
+    if n_committed > 0 && n_steward > 0
+        steward_ids = [a.id for a in world.agents if a.role === :steward]
+        # Total committed-to-committed edges on G_S
+        total_committed_edges = 0
+        for u in committed_ids
+            for v in outneighbors(g_S, eltype(g_S)(u))
+                is_committed(world.agents[Int(v)]) && (total_committed_edges += 1)
+            end
+        end
+        if total_committed_edges > 0
+            steward_out = [outdegree(g_S, eltype(g_S)(s)) for s in steward_ids]
+            sort!(steward_out; rev = true)
+            top = sum(steward_out[1:min(3, length(steward_out))])
+            sc = clamp(Float32(top / total_committed_edges), 0f0, 1f0)
+        end
+    end
+
+    # 2. infra_concentration
+    ic = 0f0
+    total_replicas = sum(length(s) for (_, s) in world.infra)
+    if total_replicas > 0
+        per_agent = Dict{Int, Int}()
+        for (_, s) in world.infra
+            for id in s
+                per_agent[id] = get(per_agent, id, 0) + 1
+            end
+        end
+        max_per = isempty(per_agent) ? 0 : maximum(values(per_agent))
+        ic = clamp(Float32(max_per / total_replicas), 0f0, 1f0)
+    end
+
+    # 3. faction_dominance
+    fd = 0f0
+    if n_committed > 0
+        fcounts = Dict{Symbol, Int}()
+        for a in world.agents
+            is_committed(a) || continue
+            a.faction === :none && continue
+            fcounts[a.faction] = get(fcounts, a.faction, 0) + 1
+        end
+        if !isempty(fcounts)
+            fd = clamp(Float32(maximum(values(fcounts)) / n_committed), 0f0, 1f0)
+        end
+    end
+
+    # 4. steward_fraction — "few stewards governing many" maps to high H.
+    #    n_steward/n_committed of 0.05 or below → H=1; ≥ 0.5 → H=0.
+    sf = 0f0
+    if n_committed > 0
+        ratio = n_steward / n_committed
+        sf = clamp(Float32((0.5 - ratio) / 0.45), 0f0, 1f0)
+    end
+
+    return (steward_concentration = sc,
+            infra_concentration   = ic,
+            faction_dominance     = fd,
+            steward_fraction      = sf)
+end
+
+"""
+    hierarchy_score(world) -> Float32
+
+Scalar H(t) ∈ [0, 1]: equally-weighted mean of the components in
+`hierarchy_components(world)`. Higher = more hierarchical / captured.
+
+A "captured" polis is one where H exceeds a threshold (e.g., 0.5)
+for many consecutive steps; this single-step scalar is the input to
+that downstream detector.
+"""
+function hierarchy_score(world::World)
+    c = hierarchy_components(world)
+    return Float32(mean((c.steward_concentration, c.infra_concentration,
+                          c.faction_dominance, c.steward_fraction)))
+end
+
+# --- per-step snapshot ------------------------------------------------------
+
+"""
+    snapshot(world; t, attacked, defected, backfired, partition=nothing)
+
+Per-step metrics record (one row of `metrics.tsv`). Returns a NamedTuple
+with the full column set from RESEARCH_TASKS.md item 7 spec, plus the
+extras introduced in items 5–6 (`n_infiltrators`, `n_defectors`).
+
+`partition` is optional but required for a meaningful `modularity_S`
+value; pass `natural_partition(topology, n)` from `topologies.jl`.
+"""
+function snapshot(world::World; t::Int, attacked::Int=0,
+                  defected::Int=0, backfired::Int=0,
+                  partition::Union{Nothing,Vector{Int}}=nothing)
+    Λ   = lambda(world)
+    Λs  = lambda_sat(world)
+    return (
+        t              = t,
+        n_active       = active_count(world),
+        n_committed    = committed_count(world),
+        n_steward      = count(is_steward, world.agents),
+        n_infiltrators = count(is_infiltrator, world.agents),
+        n_defectors    = count(is_defector,    world.agents),
+        k_core_depth   = kcore_depth(world),
+        giant_comp_S   = giant_active_frac(world),
+        modularity_S   = Float32(modularity_active(world; partition=partition)),
+        mean_fear      = mean_field(world, a -> a.fear),
+        mean_backfire  = mean_field(world, a -> a.backfire),
+        mean_L_int     = mean_field(world, a -> a.L_int),
+        mean_L_ext     = mean_field(world, a -> a.L_ext),
+        Lambda         = Λ,
+        Lambda_sat     = Λs,
+        Psi_T          = psi_T(world),
+        infra_outages  = infra_outages(world),
+        Gamma          = gamma(world),
+        Phi            = phi(world; partition=partition),
+        H              = hierarchy_score(world),
+        n_attacked     = attacked,
+        n_defected     = defected,
+        n_backfired    = backfired,
+    )
+end

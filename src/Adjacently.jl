@@ -115,4 +115,8 @@ include("fingerprints/Fingerprints.jl")
 using .Fingerprints
 export Fingerprints
 
+include("mycelial_polis/MycelialPolis.jl")
+using .MycelialPolis
+export MycelialPolis
+
 end # module Adjacently

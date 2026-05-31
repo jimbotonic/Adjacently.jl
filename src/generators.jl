@@ -21,14 +21,15 @@ prediction. All generators produce `SimpleDiGraph{UInt32}`.
 """
 module Generators
 
-using LightGraphs: nv, ne, add_edge!, add_vertices!, vertices, outneighbors
+using LightGraphs: nv, ne, add_edge!, add_vertices!, vertices, outneighbors,
+                   watts_strogatz, edges, src, dst
 using Random: MersenneTwister, rand, randperm, shuffle!
 
 using ..CustomLightGraphs: SimpleDiGraph
 
 export random_erdos_renyi_digraph, random_barabasi_albert_digraph,
        random_sbm_digraph, random_modular_hub_digraph,
-       random_lfr_digraph,
+       random_lfr_digraph, random_watts_strogatz_digraph,
        random_web_digraph, generate_training_batch
 
 """
@@ -447,6 +448,35 @@ function random_web_digraph(n::Int; avg_degree::Int=8, seed::Int=42)
         end
     end
 
+    return g
+end
+
+"""
+    random_watts_strogatz_digraph(n, k=8, β=0.05; seed=42)
+
+Watts–Strogatz small-world *directed* graph. Wraps
+`LightGraphs.watts_strogatz(n, k, β; is_directed=true, seed=seed)` and
+re-exports the result as a `SimpleDiGraph{UInt32}` for consistency with
+the rest of the `Adjacently.Generators` API.
+
+`k` is the (mean) total degree on the underlying ring lattice (must be
+even); each vertex is connected to its `k/2` nearest neighbors on each
+side before rewiring. `β ∈ [0,1]` is the rewire probability — `β=0`
+gives the pure ring lattice (high clustering, long average path),
+`β=1` gives a near-random graph. Small β (≈ 0.01–0.1) gives the
+small-world regime: high clustering plus short paths.
+
+Used by `Adjacently.MycelialPolis.build_topology(:p2p_mesh, ...)` to
+realise the peer-to-peer mesh of roadmap §7.
+"""
+function random_watts_strogatz_digraph(n::Int, k::Int=8, β::Float64=0.05;
+                                       seed::Int=42)
+    iseven(k) || throw(ArgumentError("Watts–Strogatz expects an even k, got $k"))
+    src_g = watts_strogatz(n, k, β; is_directed=true, seed=seed)
+    g = SimpleDiGraph{UInt32}(UInt32(n))
+    for e in edges(src_g)
+        add_edge!(g, UInt32(src(e)), UInt32(dst(e)))
+    end
     return g
 end
 

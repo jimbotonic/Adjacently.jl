@@ -2,7 +2,7 @@
 
 julia_version = "1.12.4"
 manifest_format = "2.0"
-project_hash = "880b2fa630c2c9782a3f85d8ebca3b164f1482b3"
+project_hash = "25e6b3b80d2680a278278fc9230e3d88104bf116"
 
 [[deps.ADTypes]]
 git-tree-sha1 = "f7304359109c768cf32dc5fa2d371565bb63b68a"
@@ -62,7 +62,7 @@ weakdeps = ["SparseArrays", "StaticArrays"]
     AdaptStaticArraysExt = "StaticArrays"
 
 [[deps.Adjacently]]
-deps = ["BSON", "ChainRulesCore", "DataStructures", "Distances", "Flux", "GraphPlot", "HDF5", "HiGHS", "JLD", "JSON", "JuMP", "LightGraphs", "LinearAlgebra", "Logging", "Match", "Optimisers", "Plots", "Random", "SparseArrays", "Statistics", "StatsBase", "Test"]
+deps = ["BSON", "ChainRulesCore", "DataStructures", "Distances", "Flux", "GraphPlot", "HDF5", "HiGHS", "JLD", "JLD2", "JSON", "JuMP", "LightGraphs", "LinearAlgebra", "Logging", "Match", "NPZ", "Optimisers", "Plots", "Random", "SparseArrays", "Statistics", "StatsBase", "Test"]
 path = "."
 uuid = "411c8731-a39f-4a7d-8b26-fcc9fee4eb7b"
 version = "0.8.0"
@@ -704,6 +704,18 @@ deps = ["FileIO", "HDF5", "Printf"]
 git-tree-sha1 = "f6cf928214ae7c0e7550b2424a57f11875d7e49a"
 uuid = "4138dd39-2aa7-5051-a626-17a0bb65d9c8"
 version = "0.10.0"
+
+[[deps.JLD2]]
+deps = ["FileIO", "MacroTools", "Mmap", "OrderedCollections", "PrecompileTools", "ScopedValues", "TranscodingStreams"]
+git-tree-sha1 = "d97791feefda45729613fafeccc4fbef3f539151"
+uuid = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
+version = "0.5.15"
+
+    [deps.JLD2.extensions]
+    UnPackExt = "UnPack"
+
+    [deps.JLD2.weakdeps]
+    UnPack = "3a884ed6-31ef-47d7-9d2a-63182c4928ed"
 
 [[deps.JLFzf]]
 deps = ["REPL", "Random", "fzf_jll"]

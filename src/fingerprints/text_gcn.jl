@@ -93,13 +93,43 @@ the seed weighting in v_k:
 
 - `:freq`    — normalized frequency vector v_k[u] = count(u in doc) / |doc|
 - `:binary`  — v_k[u] = 1/|seed set| for words present (matches v1 DF semantics)
+- `:tfidf`   — TF-IDF weights normalized to sum to 1. Document frequency is
+  computed from the **training split only** to avoid test-set leakage. Rare
+  class-specific words get higher mass; generic words are down-weighted.
+  Recommended for multi-class datasets with class-distinctive vocabulary
+  (R52, 20NG, Ohsumed).
 """
 function textgcn_to_documents(docs::Vector{TextGcnDoc},
                               vocab::Dict{String,Int},
                               label2id::Dict{String,Int};
                               weight::Symbol = :freq)
-    weight ∈ (:freq, :binary) ||
-        throw(ArgumentError("weight must be :freq or :binary"))
+    weight ∈ (:freq, :binary, :tfidf) ||
+        throw(ArgumentError("weight must be :freq, :binary, or :tfidf"))
+
+    # Precompute IDF from the training split only (no test leakage).
+    idf = if weight === :tfidf
+        df = zeros(Int, length(vocab))
+        n_train_docs = 0
+        for d in docs
+            d.split === :train || continue
+            n_train_docs += 1
+            seen = Set{Int}()
+            for w in d.tokens
+                id = get(vocab, w, 0)
+                id == 0 && continue
+                if !(id in seen)
+                    push!(seen, id)
+                    df[id] += 1
+                end
+            end
+        end
+        # Standard smoothed IDF: log((N + 1) / (df + 1)) + 1
+        Float32[log(Float32(n_train_docs + 1) / (Float32(df[i]) + 1f0)) + 1f0
+                for i in 1:length(vocab)]
+    else
+        Float32[]
+    end
+
     train_docs = Document[]
     test_docs  = Document[]
     for d in docs
@@ -115,6 +145,12 @@ function textgcn_to_documents(docs::Vector{TextGcnDoc},
         seed_ids = collect(keys(seed_counts))
         seed_weights = if weight === :freq
             Float32[seed_counts[i] / total for i in seed_ids]
+        elseif weight === :tfidf
+            # TF-IDF, normalized to sum to 1 so seed vector remains a
+            # probability distribution (preserves v_k semantics).
+            raw = Float32[(seed_counts[i] / total) * idf[i] for i in seed_ids]
+            s = sum(raw)
+            s > 0f0 ? raw ./ s : Float32[1.0f0 / length(seed_ids) for _ in seed_ids]
         else  # :binary
             Float32[1.0f0 / length(seed_ids) for _ in seed_ids]
         end
@@ -126,6 +162,108 @@ function textgcn_to_documents(docs::Vector{TextGcnDoc},
         end
     end
     return train_docs, test_docs, length(label2id)
+end
+
+"""
+    read_blog_posts(dir; min_post_tokens=10, n_authors=500,
+                    min_posts_per_author=20, test_frac=0.2,
+                    chunk_words=0, label_by=:author,
+                    stem=false, seed=0) -> Vector{TextGcnDoc}
+
+Layout for per-post or per-chunk classification on the blog corpus.
+Returns one TextGcnDoc per "document" labelled by `blogger_id`
+(authorship attribution, the v1 §4.2 task) or by `gender` (binary
+gender classification on chunks). Pipeline:
+
+1. Walk every XML, extract each `<post>` as its own raw chunk; drop posts
+   with fewer than `min_post_tokens` tokens.
+2. Filter to authors with at least `min_posts_per_author` qualifying posts.
+3. Select the top `n_authors` by post count (most data per class first).
+4. **Document granularity** (controlled by `chunk_words`):
+   - `chunk_words == 0` (default) — one document per individual post.
+     Matches the v1 §4.2 setup but with per-post training.
+   - `chunk_words > 0` — concatenate each author's posts in order, then
+     split into successive ~`chunk_words`-token chunks. Each chunk is one
+     document. Closer to the Koppel et al. (2011) setup where each test
+     instance is a 500-word "snippet" rather than a single post. The last
+     chunk may be shorter; dropped if shorter than `chunk_words / 4`.
+5. For each selected author: shuffle documents with `MersenneTwister(seed)`,
+   split `test_frac` to `:test`, rest to `:train`.
+
+Returned vector is in (per-author, then per-doc) order. Caller typically
+passes it to `build_text_gcn_vocab` and `textgcn_to_documents`.
+"""
+function read_blog_posts(dir::AbstractString;
+                         min_post_tokens::Int=10,
+                         n_authors::Int=500,
+                         min_posts_per_author::Int=20,
+                         test_frac::Float64=0.2,
+                         chunk_words::Int=0,
+                         label_by::Symbol=:author,
+                         stem::Bool=false,
+                         seed::Int=0)
+    label_by ∈ (:author, :gender) ||
+        throw(ArgumentError("label_by must be :author or :gender, got $label_by"))
+    files = filter(f -> endswith(f, ".xml"), readdir(dir; join=true, sort=true))
+    # author_id → Vector{post_tokens}, plus gender lookup
+    by_author = Dict{String,Vector{Vector{String}}}()
+    author_gender = Dict{String,Symbol}()
+    for f in files
+        try
+            aid, gender, posts = _parse_blog_posts(f; stem=stem)
+            keep = [p for p in posts if length(p) >= min_post_tokens]
+            isempty(keep) && continue
+            append!(get!(by_author, aid, Vector{Vector{String}}()), keep)
+            author_gender[aid] = gender
+        catch err
+            @warn "Skipping $f: $err"
+        end
+    end
+
+    # Filter authors with enough posts, take top N by count.
+    eligible = [(aid, posts) for (aid, posts) in by_author
+                if length(posts) >= min_posts_per_author]
+    sort!(eligible; by = x -> (-length(x[2]), x[1]))
+    n_keep = min(n_authors, length(eligible))
+    selected = eligible[1:n_keep]
+
+    # Per-author train/test split with a shared RNG (re-runs stable given
+    # same seed; selection order above is already deterministic).
+    rng = MersenneTwister(seed)
+    out = TextGcnDoc[]
+    for (aid, posts) in selected
+        # Build the per-author document list, either one-doc-per-post (default)
+        # or coalesce posts into ~chunk_words-token chunks.
+        docs = if chunk_words <= 0
+            posts
+        else
+            all_toks = reduce(vcat, posts)
+            n = length(all_toks)
+            chunks = Vector{Vector{String}}()
+            i = 1
+            while i <= n
+                stop = min(n, i + chunk_words - 1)
+                push!(chunks, all_toks[i:stop])
+                i = stop + 1
+            end
+            # Drop the trailing chunk if it's much shorter than the target
+            # — keeps per-doc size roughly uniform.
+            if !isempty(chunks) && length(chunks[end]) < chunk_words ÷ 4 && length(chunks) > 1
+                pop!(chunks)
+            end
+            chunks
+        end
+        isempty(docs) && continue
+        perm = Random.shuffle(rng, collect(1:length(docs)))
+        n_test = max(1, round(Int, test_frac * length(docs)))
+        test_idx = Set(perm[1:n_test])
+        label = label_by === :author ? aid : String(author_gender[aid])
+        for (i, tokens) in enumerate(docs)
+            split_sym = i in test_idx ? :test : :train
+            push!(out, TextGcnDoc(tokens, label, split_sym))
+        end
+    end
+    return out
 end
 
 """

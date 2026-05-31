@@ -101,6 +101,10 @@ results/
 plots/
 figures/
 
+# Experiment output dirs (sweep_out, multiseed_out, text_gcn_out, …)
+# Numbers worth keeping live in research/fingerprints/PROGRESS.md and BENCHMARKS.md.
+*_out/
+
 # =========================
 
 # Package development

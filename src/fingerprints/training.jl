@@ -40,9 +40,12 @@ When `restore_best=true`, the model parameters at the epoch with the best
 of training. Requires `val_docs` to be passed to `train!`.
 
 When `checkpoint_path != ""`, the best state is also written to that file
-(BSON) on every improvement — so even a crash mid-training leaves the
-best-so-far model on disk. Load back with
-`BSON.@load path state; Flux.loadmodel!(model, state)`.
+on every improvement — so even a crash mid-training leaves the best-so-far
+model on disk. The format is selected by file extension: `.jld2` uses JLD2
+(required for classifier heads >2 GB; BSON's wire format has a 2 GB
+single-document limit), anything else uses BSON. Load back with
+`load_ndf_state(path)` (handles both formats), or directly with
+`JLD2.load(path)` / `BSON.load(path)` as appropriate.
 """
 Base.@kwdef struct TrainConfig
     lr::Float32 = 1f-3
@@ -68,19 +71,47 @@ Base.@kwdef struct TrainConfig
 end
 
 # Atomic-ish state writer. Writes to a temp file then renames so readers
-# never see a half-written BSON. Stored as a NamedTuple wrapping the state
+# never see a half-written file. Stored as a NamedTuple wrapping the state
 # plus metadata about which epoch / metric value it corresponds to.
 # Always serializes CPU-backed arrays so checkpoints are portable across
 # CPU↔GPU runs.
+#
+# Format is chosen by extension: `.jld2` → JLD2 (no 2 GB doc-size limit),
+# anything else → BSON (compact, but Int32 document-size header overflows
+# for >2 GB classifier heads — e.g. flatten readout with 10K classes × 100K
+# vocab).
 function _save_state(path::AbstractString, state, epoch::Int,
                      val_acc::Real, val_loss::Real)
     mkpath(dirname(abspath(path)))
     tmp = path * ".tmp"
-    BSON.bson(tmp, Dict(:state => Flux.cpu(state), :epoch => epoch,
-                        :val_acc => Float32(val_acc),
-                        :val_loss => Float32(val_loss)))
+    cpu_state = Flux.cpu(state)
+    if endswith(path, ".jld2")
+        JLD2.jldsave(tmp; state=cpu_state, epoch=epoch,
+                     val_acc=Float32(val_acc), val_loss=Float32(val_loss))
+    else
+        BSON.bson(tmp, Dict(:state => cpu_state, :epoch => epoch,
+                            :val_acc => Float32(val_acc),
+                            :val_loss => Float32(val_loss)))
+    end
     mv(tmp, path; force=true)
     return nothing
+end
+
+"""
+    load_ndf_state(path) -> Dict
+
+Load an NDF checkpoint written by `_save_state`. Auto-dispatches on extension
+(`.jld2` → JLD2, else BSON). Returns a `Dict{Symbol,Any}` with keys
+`:state`, `:epoch`, `:val_acc`, `:val_loss` regardless of underlying format,
+so callers can use `loaded[:state]` uniformly.
+"""
+function load_ndf_state(path::AbstractString)
+    if endswith(path, ".jld2")
+        raw = JLD2.load(path)  # String-keyed
+        return Dict{Symbol,Any}(Symbol(k) => v for (k, v) in raw)
+    else
+        return BSON.load(path)
+    end
 end
 
 # Detect classifier output size. Returns 0 when the model has no classifier.
@@ -126,7 +157,8 @@ function _evaluate(model::NDF,
                    X::AbstractMatrix{Float32},
                    batch_size::Int,
                    n_classes::Int;
-                   device::Function = identity)
+                   device::Function = identity,
+                   central_nodes::Union{Nothing,AbstractVector{<:Integer}}=nothing)
     n = size(X, 1)
     Flux.testmode!(model)
     total_loss = 0.0f0
@@ -139,7 +171,7 @@ function _evaluate(model::NDF,
         labels = Int[d.label for d in batch]
         y_cpu = Flux.onehotbatch(labels, 1:n_classes)
         Φ = device(Φ_cpu); mask = device(mask_cpu); y = device(y_cpu)
-        ŷ = model(Φ, Â; seed_mask=mask)
+        ŷ = model(Φ, Â; seed_mask=mask, central_nodes=central_nodes)
         total_loss += Float32(Flux.logitcrossentropy(ŷ, y)) * length(batch)
         # argmax on possibly-GPU array → move to CPU for comparison with CPU labels.
         ŷ_cpu = Array(ŷ)
@@ -170,16 +202,23 @@ the same domain graph (represented by its normalized adjacency `Â`).
        stopping.
 - `config`: `TrainConfig` with hyperparameters.
 
-Returns a `NamedTuple` `(train_loss, train_acc, val_loss, val_acc)` where each
-field is a `Vector{Float32}` of per-epoch values. `val_*` are empty when no
-`val_docs` are supplied.
+Returns a `NamedTuple` `(train_loss, train_acc, val_loss, val_acc, test_loss,
+test_acc)` where each field is a `Vector{Float32}` of per-evaluation values.
+`val_*` are empty when no `val_docs` are supplied. `test_*` are empty when no
+`test_docs` are supplied; otherwise they have the same length as `val_*`,
+with `NaN` at val evaluations where the checkpoint metric did NOT improve,
+and the actual test value at evaluations where it did. This is a pure
+diagnostic — `test_docs` is NEVER used for early stopping or checkpoint
+selection.
 """
 function train!(model::NDF,
                 Â::AbstractMatrix,
                 docs::AbstractVector{Document};
                 X::Union{AbstractMatrix,Nothing}=nothing,
                 val_docs::Union{AbstractVector{Document},Nothing}=nothing,
-                config::TrainConfig=TrainConfig())
+                test_docs::Union{AbstractVector{Document},Nothing}=nothing,
+                config::TrainConfig=TrainConfig(),
+                central_nodes::Union{Nothing,AbstractVector{<:Integer}}=nothing)
     n = size(Â, 1)
     # X_eff is kept CPU-side; _build_batch reads it to fill structural feature
     # columns before the result is moved to the model's device via `config.device`.
@@ -203,6 +242,8 @@ function train!(model::NDF,
         train_acc  = Float32[],
         val_loss   = Float32[],
         val_acc    = Float32[],
+        test_loss  = Float32[],
+        test_acc   = Float32[],
     )
     config.checkpoint_metric ∈ (:val_acc, :val_loss) ||
         throw(ArgumentError("checkpoint_metric must be :val_acc or :val_loss"))
@@ -228,7 +269,7 @@ function train!(model::NDF,
             Φ = dev(Φ_cpu); mask = dev(mask_cpu); y = dev(y_cpu)
 
             loss, grads = Flux.withgradient(model) do m
-                Flux.logitcrossentropy(m(Φ, Â; seed_mask=mask), y)
+                Flux.logitcrossentropy(m(Φ, Â; seed_mask=mask, central_nodes=central_nodes), y)
             end
             Flux.update!(opt_state, model, grads[1])
 
@@ -237,7 +278,7 @@ function train!(model::NDF,
             # Cheap train accuracy from the same forward (recomputed in
             # testmode would double the cost; we accept the dropout-induced
             # noise here). Move logits to CPU for argmax comparison.
-            ŷ_cpu = Array(model(Φ, Â; seed_mask=mask))
+            ŷ_cpu = Array(model(Φ, Â; seed_mask=mask, central_nodes=central_nodes))
             preds = vec(map(I -> I[1], argmax(ŷ_cpu; dims=1)))
             epoch_correct += count(preds .== labels)
         end
@@ -251,7 +292,8 @@ function train!(model::NDF,
         if do_val
             val_loss, val_acc = _evaluate(model, Â, val_docs, X_eff,
                                           config.batch_size, n_classes;
-                                          device=dev)
+                                          device=dev,
+                                          central_nodes=central_nodes)
             push!(history.val_loss, val_loss)
             push!(history.val_acc,  val_acc)
             config.verbose && @info "epoch=$epoch train=$(round(train_loss; digits=4))/$(round(train_acc; digits=3)) val=$(round(val_loss; digits=4))/$(round(val_acc; digits=3))"
@@ -270,8 +312,23 @@ function train!(model::NDF,
                 if !isempty(config.checkpoint_path)
                     _save_state(config.checkpoint_path, best_state === nothing ? Flux.state(model) : best_state, epoch, val_acc, val_loss)
                 end
+                # Diagnostic test eval at each best epoch — never feeds back
+                # into early stop or checkpoint selection.
+                if test_docs !== nothing
+                    test_loss, test_acc = _evaluate(model, Â, test_docs, X_eff,
+                                                    config.batch_size, n_classes;
+                                                    device=dev,
+                                                    central_nodes=central_nodes)
+                    push!(history.test_loss, test_loss)
+                    push!(history.test_acc,  test_acc)
+                    config.verbose && @info "  test (diagnostic) epoch=$epoch test_loss=$(round(test_loss; digits=4)) test_acc=$(round(test_acc; digits=4))"
+                end
                 patience = 0
             else
+                if test_docs !== nothing
+                    push!(history.test_loss, NaN32)
+                    push!(history.test_acc,  NaN32)
+                end
                 patience += 1
                 if config.early_stop_patience > 0 &&
                    patience >= config.early_stop_patience

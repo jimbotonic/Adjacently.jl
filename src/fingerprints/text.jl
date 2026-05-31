@@ -174,6 +174,34 @@ function _parse_blog_file(path::AbstractString; stem::Bool=false)
     return BlogDoc(blogger_id, gender, age, industry, sign, tokens)
 end
 
+# Parse a blog XML into individual posts (one tokenized string per <post>
+# block). Used by the authorship-attribution loader which treats each post
+# as a separate document with the blogger_id as label, in contrast to
+# `_parse_blog_file` which concatenates all posts of a blogger.
+# Returns (blogger_id, gender_symbol, posts) so callers can label by either.
+function _parse_blog_posts(path::AbstractString; stem::Bool=false)
+    fname = basename(path)
+    parts = split(replace(fname, r"\.xml$" => ""), ".")
+    length(parts) >= 5 ||
+        throw(ArgumentError("Unexpected blog filename: $fname"))
+    blogger_id = parts[1]
+    gender_str = lowercase(parts[2])
+    gender = gender_str == "male" ? :male :
+             gender_str == "female" ? :female :
+             throw(ArgumentError("Unrecognized gender '$gender_str' in $fname"))
+
+    raw = read(path, String)
+    raw = replace(raw, "﻿" => "", "\r\n" => "\n", "\r" => "\n")
+
+    posts = Vector{Vector{String}}()
+    for m in eachmatch(r"<post>(.*?)</post>"s, raw)
+        toks = simple_tokenize(m.captures[1]; stem=stem)
+        isempty(toks) && continue
+        push!(posts, toks)
+    end
+    return blogger_id, gender, posts
+end
+
 """
     read_blog_corpus(dir; max_docs=typemax(Int), min_tokens=8,
                           balance_genders=false, seed=0) -> Vector{BlogDoc}
@@ -293,25 +321,34 @@ function compute_ppmi(docs::AbstractVector,
 end
 
 """
-    build_domain_graph(K::SparseMatrixCSC, density::Real) -> SparseMatrixCSC
+    build_domain_graph(K::SparseMatrixCSC, density::Real; weighted::Bool=false)
+        -> SparseMatrixCSC
 
 Threshold a weighted association matrix `K` at the top-`density` fraction of
-edges (per the v1 DF construction). Returns a 0/1 sparse matrix of the same
-shape with approximately `density · |V| · (|V|−1)` entries set to 1. Memory
-is the bottleneck for large `K` — the implementation avoids `findnz`'s
-triple-copy and walks `K`'s internal CSC arrays directly, allocating only
-the final `(keep_rows, keep_cols)` pair plus one transient sort buffer.
-Ties at the threshold are kept (slight overshoot of the target).
+edges (per the v1 DF construction). With `weighted=false` (default, matches
+the legacy behaviour) returns a 0/1 sparse matrix. With `weighted=true`
+returns a sparse matrix preserving the original PPMI / collocation
+magnitudes — this is faithful to the v1 paper, which explicitly allows a
+weighted domain graph, and tends to help when the surviving edges have a
+wide range of strengths (e.g. PPMI on multi-class datasets where rare-but-
+strong co-occurrences dominate class structure).
+
+Memory is the bottleneck for large `K` — the implementation avoids
+`findnz`'s triple-copy and walks `K`'s internal CSC arrays directly,
+allocating only the final `(keep_rows, keep_cols)` pair plus one transient
+sort buffer. Ties at the threshold are kept (slight overshoot of the
+target).
 """
-function build_domain_graph(K::SparseMatrixCSC, density::Real)
+function build_domain_graph(K::SparseMatrixCSC, density::Real;
+                            weighted::Bool=false)
     n = size(K, 1)
     target = max(1, round(Int, density * n * (n - 1)))
     nzv = K.nzval
     n_entries = length(nzv)
     if n_entries <= target
-        # Reuse K's structure with all-ones values.
-        return SparseMatrixCSC(n, n, copy(K.colptr), copy(K.rowval),
-                               ones(Float32, n_entries))
+        # Reuse K's structure; choose values per `weighted` flag.
+        vals = weighted ? copy(nzv) : ones(Float32, n_entries)
+        return SparseMatrixCSC(n, n, copy(K.colptr), copy(K.rowval), vals)
     end
 
     # Threshold = the target-th largest nzval. Copy + partial-sort the values
@@ -327,17 +364,23 @@ function build_domain_graph(K::SparseMatrixCSC, density::Real)
     keep_count = count(>=(threshold), nzv)
     keep_rows = Vector{Int}(undef, keep_count)
     keep_cols = Vector{Int}(undef, keep_count)
+    keep_vals = weighted ? Vector{Float32}(undef, keep_count) : nothing
     pos = 1
     @inbounds for j in 1:n
         for idx in K.colptr[j]:(K.colptr[j + 1] - 1)
-            if nzv[idx] >= threshold
+            v = nzv[idx]
+            if v >= threshold
                 keep_rows[pos] = K.rowval[idx]
                 keep_cols[pos] = j
+                if weighted
+                    keep_vals[pos] = Float32(v)
+                end
                 pos += 1
             end
         end
     end
-    return sparse(keep_rows, keep_cols, ones(Float32, keep_count), n, n)
+    final_vals = weighted ? keep_vals : ones(Float32, keep_count)
+    return sparse(keep_rows, keep_cols, final_vals, n, n)
 end
 
 """
