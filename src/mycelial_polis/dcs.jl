@@ -46,6 +46,10 @@ Base.@kwdef mutable struct CellSensors
     # held by stewards in this cell. 1.0 = one steward in this cell
     # holds all replicas held by this cell's stewards; 0 = uniform.
     infra_concentration::Float32   = 0f0
+    # N-1: faction-dominance sensor — max share of committed agents in
+    # this cell belonging to a single faction (incl. :coalition). High
+    # values = narrative attack in progress / one faction dominates.
+    faction_dominance::Float32     = 0f0
     # Counters reset each step
     _new_outsiders_this_step::Int  = 0
     _advanced_this_step::Int       = 0
@@ -73,6 +77,7 @@ Base.@kwdef mutable struct CellPrinciples
     functional_autonomy::Float32           = 0f0
     redundant_stewardship::Float32         = 0f0
     adaptive_memory::Float32               = 0f0
+    faction_diversity_floor::Float32       = 0f0     # N-1
 end
 
 """
@@ -108,6 +113,15 @@ Base.@kwdef mutable struct DCSState
     # the pre-H-5 mapping. Decoupling lets DCS-3-style runs measure the
     # pre-H-5 baseline cleanly.
     h_sensing::Bool = false
+    # H-12: when true, the adaptive mapping uses a high-pass threshold
+    # (sensor must exceed baseline by `adaptive_threshold_offset` before
+    # firing the principle). This recovers the "contextual reflex"
+    # framing: sensors stay quiet in benign conditions and fire only on
+    # signal-above-baseline. The default (false) preserves the linear
+    # mapping used in DCS-1 through DCS-4.
+    strict_adaptive_thresholds::Bool = false
+    adaptive_threshold_offset::Float32 = 0.3f0
+    adaptive_threshold_slope::Float32  = 5f0
     # DCS-2: fraction of cells that activate the WRONG principle each
     # step. Misclassified cells set `controlled_permeability = 1` and
     # zero all other principles — this is the "tighten openness when
@@ -134,7 +148,10 @@ function build_dcs_state(world::World, partition::Vector{Int};
                           sensor_ema_decay::Real = 0.85f0,
                           misclassification_rate::Real = 0f0,
                           misclassification_adversarial::Bool = false,
-                          h_sensing::Bool = false)
+                          h_sensing::Bool = false,
+                          strict_adaptive_thresholds::Bool = false,
+                          adaptive_threshold_offset::Real = 0.3f0,
+                          adaptive_threshold_slope::Real  = 5f0)
     g_S = world.multiplex.layers[:S]
     cells = unique(partition)
     sensors    = Dict{Int, CellSensors}()
@@ -167,7 +184,10 @@ function build_dcs_state(world::World, partition::Vector{Int};
                      sensor_ema_decay = Float32(sensor_ema_decay),
                      misclassification_rate = Float32(misclassification_rate),
                      misclassification_adversarial = misclassification_adversarial,
-                     h_sensing = h_sensing)
+                     h_sensing = h_sensing,
+                     strict_adaptive_thresholds = strict_adaptive_thresholds,
+                     adaptive_threshold_offset = Float32(adaptive_threshold_offset),
+                     adaptive_threshold_slope  = Float32(adaptive_threshold_slope))
 end
 
 # --- Sensor update ---------------------------------------------------------
@@ -245,6 +265,22 @@ function _update_dcs_sensors!(world::World, dcs::DCSState, snap::NamedTuple)
                            Float32(max_steward_out / max(sens.initial_edges, 1))
         # resource_pressure: hook for E3 (treasury layer); 0 for now
         sig_resource     = 0f0
+        # N-1: faction_dominance — max share of committed in this cell
+        # belonging to a single faction (counts :coalition too). Fires
+        # on narrative attack in progress.
+        sig_faction_dom = 0f0
+        if n_committed > 0
+            faction_counts = Dict{Symbol, Int}()
+            for id in sens.members
+                a = world.agents[id]
+                is_committed(a) || continue
+                a.faction === :none && continue
+                faction_counts[a.faction] = get(faction_counts, a.faction, 0) + 1
+            end
+            if !isempty(faction_counts)
+                sig_faction_dom = Float32(maximum(values(faction_counts)) / n_committed)
+            end
+        end
         # infra_concentration: local Herfindahl-style — among stewards in
         # this cell, what fraction of replicas held by them is held by the
         # single most-loaded steward. Fires when one steward in this cell
@@ -277,6 +313,7 @@ function _update_dcs_sensors!(world::World, dcs::DCSState, snap::NamedTuple)
             sens.steward_dominance  = (1-α) * sens.steward_dominance + α * sig_steward_dom
             sens.resource_pressure  = (1-α) * sens.resource_pressure + α * sig_resource
             sens.infra_concentration = (1-α) * sens.infra_concentration + α * sig_infra_conc
+            sens.faction_dominance  = (1-α) * sens.faction_dominance + α * sig_faction_dom
         end
     end
 end
@@ -361,19 +398,33 @@ function _cell_activate!(world::World, dcs::DCSState)
             end
             continue
         end
+        # H-12: optional high-pass mapping (sensor must exceed
+        # `offset` baseline before firing). `_act(x, gain) =
+        # clamp((x − offset) * slope * gain, 0, 1)`.
+        strict = dcs.strict_adaptive_thresholds
+        off    = dcs.adaptive_threshold_offset
+        slope  = dcs.adaptive_threshold_slope
+        _act = strict ?
+            (x, gain) -> clamp((x - off) * slope * gain, 0f0, 1f0) :
+            (x, gain) -> clamp(x * gain, 0f0, 1f0)
         # Renewal bottleneck → NM (the universal default)
-        p.normative_minimalism = clamp(sens.recruitment_slow, 0f0, 1f0)
+        p.normative_minimalism = _act(sens.recruitment_slow, 1f0)
         # External pressure → TNA
-        p.transformative_non_absorption = clamp(sens.attack_intensity * 3f0, 0f0, 1f0)
+        p.transformative_non_absorption = _act(sens.attack_intensity, 3f0)
         # Internal conflict → forkability + reversible_governance
-        p.forkability = clamp(sens.faction_diversity * 1.5f0, 0f0, 1f0)
-        p.reversible_governance = clamp((sens.faction_diversity * 1.5f0 +
-                                          sens.steward_dominance * 2f0) / 2, 0f0, 1f0)
+        p.forkability = _act(sens.faction_diversity, 1.5f0)
+        p.reversible_governance = strict ?
+            _act((sens.faction_diversity + sens.steward_dominance) / 2, 1.75f0) :
+            clamp((sens.faction_diversity * 1.5f0 +
+                    sens.steward_dominance * 2f0) / 2, 0f0, 1f0)
         # Capture → non_domination
-        p.non_domination = clamp(sens.steward_dominance * 2f0, 0f0, 1f0)
+        p.non_domination = _act(sens.steward_dominance, 2f0)
         # Resources → functional_autonomy + redundant_stewardship (E3)
-        p.functional_autonomy = clamp(sens.resource_pressure, 0f0, 1f0)
-        p.redundant_stewardship = clamp(sens.resource_pressure * 0.7f0, 0f0, 1f0)
+        p.functional_autonomy = _act(sens.resource_pressure, 1f0)
+        p.redundant_stewardship = _act(sens.resource_pressure, 0.7f0)
+        # N-1: faction_dominance → faction_diversity_floor. Fires when
+        # a single faction approaches majority in this cell.
+        p.faction_diversity_floor = _act(sens.faction_dominance, 1.5f0)
         # H-5: hierarchy-sensing reflex. When `h_sensing`, the
         # `steward_dominance` (G_S edges) and `infra_concentration`
         # (replica hoarding) sensors fire the anti-capture reflex per
@@ -384,11 +435,11 @@ function _cell_activate!(world::World, dcs::DCSState)
         if dcs.h_sensing
             h_signal = max(sens.steward_dominance, sens.infra_concentration)
             p.redundant_stewardship = max(p.redundant_stewardship,
-                                          clamp(h_signal * 2f0, 0f0, 1f0))
+                                          _act(h_signal, 2f0))
             p.non_domination = max(p.non_domination,
-                                   clamp(h_signal * 1.5f0, 0f0, 1f0))
+                                   _act(h_signal, 1.5f0))
             p.reversible_governance = max(p.reversible_governance,
-                                          clamp(h_signal * 1.5f0, 0f0, 1f0))
+                                          _act(h_signal, 1.5f0))
         end
         # Infiltration proxy (cell trust decay) → bounded_legibility / CP
         p.bounded_legibility = clamp(sens.trust_decay, 0f0, 1f0)
@@ -448,5 +499,6 @@ function cell_principles_for(world::World, dcs::Union{Nothing, DCSState},
         functional_autonomy = cp.functional_autonomy,
         redundant_stewardship = cp.redundant_stewardship,
         adaptive_memory = cp.adaptive_memory,
+        faction_diversity_floor = cp.faction_diversity_floor,
     )
 end

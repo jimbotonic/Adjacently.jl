@@ -46,6 +46,21 @@ mutable struct World
     infra_latency::Dict{Symbol,Dict{Int,Int}}   # function → (agent_id → remaining warm-up) (item 7)
     dcs::Any                                    # ::Union{Nothing, DCSState}; left untyped
                                                 # so multiplex.jl doesn't need to import dcs.jl
+    # H-13 — scratch counters for scaling-coalition modes. Set when the
+    # coalition is seeded; read each step to compute pool growth deltas.
+    # Default 0 (no-op for fixed coalition or non-coalition runs).
+    _coalition_seed_committed::Int
+    _coalition_prev_committed::Int
+    # E3 — treasury layer. Per-cell treasury balances (Float32). Empty
+    # when E3 is off; populated by `_treasury_step!` once
+    # `params.treasury_enabled == true`.
+    treasury::Dict{Int,Float32}
+    # N-1 — counters for the faction_diversity_floor mechanism audit.
+    # `faction_change_attempts` counts every call to
+    # `_faction_change_rejected`; `faction_change_blocks` counts those
+    # that returned `true`. Both reset by `reset_faction_counters!`.
+    faction_change_attempts::Int
+    faction_change_blocks::Int
 
     # Inner constructor with backward-compatible defaults for both
     # narrative buffer and latency map — the 7-arg positional form is
@@ -55,7 +70,8 @@ mutable struct World
           infra_latency::Dict{Symbol,Dict{Int,Int}}=Dict{Symbol,Dict{Int,Int}}(),
           dcs::Any = nothing) =
         new(agents, multiplex, infra, infra_min, rng, params, t,
-            recent_backfire_count, infra_latency, dcs)
+            recent_backfire_count, infra_latency, dcs, 0, 0,
+            Dict{Int,Float32}(), 0, 0)
 end
 
 # Convenience constructors -----------------------------------------------------

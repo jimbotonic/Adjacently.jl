@@ -34,6 +34,14 @@ Base.@kwdef struct Principles
     adaptive_memory::Float32               = 0.5f0
     controlled_permeability::Float32       = 0.5f0
     transformative_non_absorption::Float32 = 0.5f0
+    # N-1 — defence against narrative coalition. When > 0, faction-change
+    # attempts (coalition narrative conversion + schism reassignment) are
+    # rejected with probability proportional to the *target faction's*
+    # share of committed agents in the target's cell. Logic: the bigger
+    # a faction already is, the harder it is for it to grow further —
+    # which forces narrative attackers to spread their conversions across
+    # cells instead of saturating one.
+    faction_diversity_floor::Float32       = 0f0
 end
 
 """
@@ -63,6 +71,7 @@ zero_principles() = Principles(
     adaptive_memory               = 0f0,
     controlled_permeability       = 0f0,
     transformative_non_absorption = 0f0,
+    faction_diversity_floor       = 0f0,
 )
 
 """

@@ -27,10 +27,15 @@ function step!(world::World, host::HostStrategy;
     # DCS aggregation: lift `s` to the per-cell max so a single cell that
     # senses capture triggers the rotation, matching the H-2 anti-capture
     # reflex semantics.
+    # H-7 audit: `disable_rotation_effect=true` gags the non-dom rotation
+    # AND the reversible-governance defector recovery, regardless of the
+    # underlying principle strengths. Used to test whether DCS infra
+    # defense depends on rotation/recovery vs. pure refill repair.
+    disable_rotation = Bool(get(p, :disable_rotation_effect, false))
     nd_strength = max(pr.non_domination,
                        global_principle_max(world.dcs, :non_domination))
     nd_period = max(3, round(Int, 30 / (1 + 9 * nd_strength)))
-    if nd_strength > 0 && t % nd_period == 0
+    if !disable_rotation && nd_strength > 0 && t % nd_period == 0
         stewards = [a for a in world.agents if a.role === :steward]
         if !isempty(stewards)
             victim = stewards[1 + (t % length(stewards))]
@@ -114,6 +119,14 @@ function step!(world::World, host::HostStrategy;
     # faction trust edges with probability `trust_decay_on_fight`).
     _disagreement_step!(world, p)
 
+    # H-3 — minority coalition capture attempt. No-op when
+    # `coalition_size_frac == 0`.
+    _coalition_step!(world)
+
+    # E3 — treasury layer + host treasury-drain attack. No-op when
+    # `treasury_enabled` is false.
+    _treasury_step!(world)
+
     # 1. exposures — count adopted neighbors on G_S and G_C.
     exposures_S, exposures_C = compute_exposures(world)
 
@@ -143,7 +156,8 @@ function step!(world::World, host::HostStrategy;
     # Reversible governance (§19.4) — defectors revert to :contributor with
     # probability `s` per step. Implementation: scan defectors created so
     # far and randomly restore. (Cheap: at most `n_defectors` agents.)
-    if pr.reversible_governance > 0
+    # H-7 audit: gated by `disable_rotation_effect`.
+    if !disable_rotation && pr.reversible_governance > 0
         for a in world.agents
             a.role === :defector || continue
             if rand(world.rng) < pr.reversible_governance
@@ -332,14 +346,18 @@ end
 const STAGE_SEQUENCE = (:outsider, :observer, :sympathizer, :user, :contributor, :steward)
 
 function _maybe_advance_role!(a::Agent, drive::Float32, thresholds::NamedTuple;
-                              principles::Principles=default_principles())
+                              principles::Principles=default_principles(),
+                              disable_nm_effect::Bool=false)
     rank = ROLE_RANK[a.role]
     # Negative-rank roles (:removed, :infiltrator, :defector) are not on the
     # advancement ladder. They get filtered upstream too, but the guard makes
     # the function safe to call on any agent.
     rank < 0 && return a
     # §19.7 Normative minimalism — thin constitution = lower stage thresholds.
-    thr_scale = 1f0 - 0.5f0 * principles.normative_minimalism
+    # H-10 audit: `disable_nm_effect=true` gags the threshold-lowering mechanic,
+    # so the polis runs with full thresholds regardless of NM principle strength.
+    nm_strength = disable_nm_effect ? 0f0 : principles.normative_minimalism
+    thr_scale = 1f0 - 0.5f0 * nm_strength
     # §19.2 Functional autonomy — commitment boost per stage reached.
     fa_boost  = 1f0 + principles.functional_autonomy
     while rank < ROLE_RANK[:steward]
@@ -378,7 +396,9 @@ function refill_infrastructure!(world::World)
     # DCS aggregation: if any cell senses infrastructure capture, lift the
     # redundancy bonus to that cell's principle strength. Mirrors the
     # global aggregation used for non_domination.
-    rs_strength = max(pr.redundant_stewardship,
+    # H-10 audit: `disable_redundant_effect=true` zeros the bonus.
+    rs_strength = Bool(get(p, :disable_redundant_effect, false)) ? 0f0 :
+                  max(pr.redundant_stewardship,
                       global_principle_max(world.dcs, :redundant_stewardship))
     redundancy_bonus = round(Int, 3 * rs_strength)
 
@@ -596,6 +616,7 @@ function _disagreement_step!(world::World, p::NamedTuple)
     for a in world.agents
         ROLE_RANK[a.role] >= ROLE_RANK[:user] || continue
         a.faction === forked_faction && continue
+        a.faction === :coalition && continue   # H-3: coalition is fixed
         a.disagreement >= thresh || continue
         old_faction = a.faction
         a.faction = _next_faction_label(world.rng, cap, old_faction)
@@ -656,5 +677,370 @@ function _disagreement_step!(world::World, p::NamedTuple)
     return world
 end
 
+# H-3 — minority coalition capture --------------------------------------------
+
+"""
+    _coalition_step!(world)
+
+Adversarial minority coalition (paper 2, §H-3). When
+`params.coalition_size_frac > 0` and `t == params.coalition_start`,
+seeds a coalition of `round(coalition_size_frac * N)` committed agents.
+At every subsequent step, the coalition pursues `params.coalition_target`:
+
+- `:governance` — each coalition member adds one outgoing G_S edge per
+  step (with probability `coalition_intensity`) to a random committed
+  non-coalition agent, concentrating G_S in-edges around the coalition.
+- `:infrastructure` — coalition members' commitment is bumped to 0.95
+  each step so that `refill_infrastructure!` (which sorts by commitment)
+  preferentially seats them in replica slots.
+- `:narrative` — each coalition member converts one random committed
+  in-neighbour to faction `:coalition` (probability `coalition_intensity`).
+
+The coalition members share faction `:coalition` (special label outside
+the `n_factions_cap` rotation), trust each other (G_S edges among them
+at seed time), and are immune from schism reassignment.
+
+A no-op when `coalition_size_frac == 0` (the default).
+"""
+function _coalition_step!(world::World)
+    p = world.params
+    cs = Float64(get(p, :coalition_size_frac, 0.0))
+    cs > 0 || return world
+    cstart = Int(get(p, :coalition_start, 20))
+    target = Symbol(get(p, :coalition_target, :governance))
+    intensity = Float64(get(p, :coalition_intensity, 0.3))
+    # H-13 — attacker growth mode. `:fixed` is the H-3 baseline. The other
+    # three let the coalition scale with the polis pool, testing whether
+    # NM-driven pool dilution still defends against a proportional attacker.
+    growth_mode = Symbol(get(p, :coalition_growth_mode, :fixed))
+    growth_rate = Float64(get(p, :coalition_growth_rate, 1.0))
+    t = world.t
+    g_S = world.multiplex.layers[:S]
+
+    # Seed coalition once at start time.
+    if t == cstart
+        committed = [a for a in world.agents if is_committed(a)]
+        if !isempty(committed)
+            n_coal = min(round(Int, cs * length(world.agents)), length(committed))
+            n_coal >= 1 || return world
+            picks_idx = randperm(world.rng, length(committed))[1:n_coal]
+            picks = committed[picks_idx]
+            for a in picks
+                a.faction = :coalition
+                a.commitment = max(a.commitment, 0.9f0)
+            end
+            # Wire mutual G_S trust edges among coalition members.
+            for u in picks, v in picks
+                u.id == v.id && continue
+                uid = eltype(g_S)(u.id); vid = eltype(g_S)(v.id)
+                if !LightGraphs.has_edge(g_S, uid, vid)
+                    add_edge!(g_S, uid, vid)
+                end
+            end
+            # Anchor counters for proportional / nm_paced growth modes.
+            world._coalition_seed_committed = length(committed)
+            world._coalition_prev_committed = length(committed)
+        end
+    end
+
+    t >= cstart || return world
+    coalition = [a for a in world.agents
+                 if a.faction === :coalition && is_committed(a)]
+    isempty(coalition) && return world
+
+    if target === :governance
+        # Each coalition member adds one G_S out-edge to a random
+        # committed non-coalition agent — concentrates power around it.
+        non_coal_ids = [b.id for b in world.agents
+                        if is_committed(b) && b.faction !== :coalition]
+        isempty(non_coal_ids) && return world
+        for a in coalition
+            rand(world.rng) < intensity || continue
+            tid = non_coal_ids[1 + rand(world.rng, 0:length(non_coal_ids)-1)]
+            aid = eltype(g_S)(a.id); tgt = eltype(g_S)(tid)
+            LightGraphs.has_edge(g_S, aid, tgt) && continue
+            add_edge!(g_S, aid, tgt)
+        end
+    elseif target === :infrastructure
+        # Boost commitment each step so refill_infrastructure! picks
+        # coalition members first when ranking by commitment.
+        for a in coalition
+            a.commitment = max(a.commitment, 0.95f0)
+        end
+    elseif target === :narrative
+        # Convert one random committed in-neighbour per coalition member
+        # to the coalition's faction.
+        for a in coalition
+            rand(world.rng) < intensity || continue
+            nbrs = collect(inneighbors(g_S, eltype(g_S)(a.id)))
+            isempty(nbrs) && continue
+            b_id = Int(nbrs[1 + rand(world.rng, 0:length(nbrs)-1)])
+            b = world.agents[b_id]
+            is_committed(b) || continue
+            b.faction === :coalition && continue
+            # N-1 — faction_diversity_floor gate. Resolve the principle
+            # strength per-cell (DCS-aware) and reject the conversion
+            # with probability `s × coalition_share_in_cell`.
+            if _faction_change_rejected(world, b, :coalition)
+                continue
+            end
+            b.faction = :coalition
+        end
+    end
+
+    # H-13 — scaling coalition growth modes. Compute how many new
+    # members should join this step based on `growth_mode`, then
+    # convert random non-coalition committed agents to the coalition.
+    n_committed_now = count(is_committed, world.agents)
+    n_coal_now = length(coalition)
+    n_new = 0
+    if growth_mode === :proportional
+        target_n = round(Int, cs * n_committed_now)
+        n_new = max(0, target_n - n_coal_now)
+    elseif growth_mode === :nm_paced
+        Δ = n_committed_now - world._coalition_prev_committed
+        n_new = Δ > 0 ? round(Int, growth_rate * Δ) : 0
+    elseif growth_mode === :host_subsidized
+        # Each non-coalition committed agent flips to :coalition with
+        # probability `growth_rate / N` × (committed_now / committed_seed).
+        # I.e. host backing scales with how much the polis has grown
+        # since seeding.
+        growth_factor = world._coalition_seed_committed == 0 ? 1.0 :
+                        n_committed_now / world._coalition_seed_committed
+        p_flip = clamp(growth_rate * growth_factor / length(world.agents), 0.0, 1.0)
+        for a in world.agents
+            is_committed(a) || continue
+            a.faction === :coalition && continue
+            if rand(world.rng) < p_flip
+                # N-1 — gate the host-subsidised flip too.
+                _faction_change_rejected(world, a, :coalition) && continue
+                a.faction = :coalition
+                a.commitment = max(a.commitment, 0.9f0)
+                if target === :infrastructure
+                    a.commitment = max(a.commitment, 0.95f0)
+                end
+            end
+        end
+    end
+    if n_new > 0
+        candidates = [a for a in world.agents
+                      if is_committed(a) && a.faction !== :coalition]
+        if !isempty(candidates)
+            k = min(n_new, length(candidates))
+            picks_idx = randperm(world.rng, length(candidates))[1:k]
+            for i in picks_idx
+                a = candidates[i]
+                a.faction = :coalition
+                a.commitment = max(a.commitment, 0.9f0)
+                if target === :infrastructure
+                    a.commitment = max(a.commitment, 0.95f0)
+                end
+            end
+        end
+    end
+    world._coalition_prev_committed = n_committed_now
+    return world
+end
+
+# E3 — treasury layer + host treasury-drain attack ----------------------------
+
+"""
+    _treasury_step!(world)
+
+Per-cell treasury maintained by member contributions; consumed by
+steward upkeep; vulnerable to host drain attacks. Activates the
+`functional_autonomy` and `redundant_stewardship` principles in a
+new threat regime: financial chokepoints.
+
+Per step (when `params.treasury_enabled = true`):
+  1. Each committed agent contributes `treasury_contrib_per_committed`
+     to its cell.
+  2. Each cell pays `treasury_steward_cost` per steward in the cell.
+  3. Host drain attack: with probability `treasury_drain_prob`, the
+     host removes `treasury_drain_rate × cell_balance` from
+     `treasury_attack_cells` randomly-chosen cells.
+  4. If `functional_autonomy < 1`, treasuries are partially pooled:
+     positive balances are averaged across cells at strength
+     `1 − fa`. Fully pooled (`fa = 0`) means draining one cell hits
+     all; fully autonomous (`fa = 1`) means each cell stands alone.
+  5. If any cell's balance drops below zero, the most-junior steward
+     in that cell reverts to `:contributor` (the cell can't sustain
+     them all) and the balance is reset to zero.
+
+`redundant_stewardship` modulates step 5: it lowers the per-steward
+upkeep cost (more replicas = each costs less to keep), making cells
+more drain-resilient.
+
+No-op when treasury is off; preserves all prior dynamics for runs
+that don't set `treasury_enabled`.
+"""
+function _treasury_step!(world::World)
+    p = world.params
+    Bool(get(p, :treasury_enabled, false)) || return world
+    contrib    = Float32(get(p, :treasury_contrib_per_committed, 0.10f0))
+    base_cost  = Float32(get(p, :treasury_steward_cost, 1.0f0))
+    drain_prob = Float64(get(p, :treasury_drain_prob, 0.10))
+    drain_rate = Float32(get(p, :treasury_drain_rate, 0.30f0))
+    n_attack   = Int(get(p, :treasury_attack_cells, 1))
+    # Per-cell view: rely on DCS partition when present, otherwise
+    # treat the whole polis as one cell.
+    cell_of = world.dcs === nothing ? fill(1, length(world.agents)) :
+              world.dcs.cell_of
+    cells = sort!(collect(unique(cell_of)))
+    isempty(cells) && return world
+
+    # Resolve principle strengths. functional_autonomy is read globally
+    # because pooling is a system-level property; redundant_stewardship
+    # uses the global-max aggregator (consistent with refill).
+    pr_global = get_principles(p)
+    fa = pr_global.functional_autonomy
+    rs = max(pr_global.redundant_stewardship,
+              global_principle_max(world.dcs, :redundant_stewardship))
+    # Higher RS lowers per-steward upkeep (replicas share the cost).
+    steward_cost = base_cost * (1f0 - 0.5f0 * rs)
+
+    # 1. Contributions.
+    for a in world.agents
+        is_committed(a) || continue
+        c = cell_of[a.id]
+        world.treasury[c] = get(world.treasury, c, 0f0) + contrib
+    end
+
+    # 2. Steward upkeep.
+    for a in world.agents
+        a.role === :steward || continue
+        c = cell_of[a.id]
+        world.treasury[c] = get(world.treasury, c, 0f0) - steward_cost
+    end
+
+    # 3. Host drain attack.
+    if rand(world.rng) < drain_prob && n_attack > 0
+        targets_idx = randperm(world.rng, length(cells))[1:min(n_attack, length(cells))]
+        for i in targets_idx
+            c = cells[i]
+            bal = get(world.treasury, c, 0f0)
+            world.treasury[c] = bal - drain_rate * max(bal, 0f0)
+        end
+    end
+
+    # 4. Pooling (functional_autonomy < 1).
+    if fa < 1f0
+        share_frac = 1f0 - fa     # share `share_frac` of each positive balance
+        pool = 0f0; n_pos = 0
+        for c in cells
+            bal = get(world.treasury, c, 0f0)
+            if bal > 0
+                pool += bal * share_frac
+                world.treasury[c] = bal * (1f0 - share_frac)
+                n_pos += 1
+            end
+        end
+        if n_pos > 0
+            redistributed = pool / length(cells)
+            for c in cells
+                world.treasury[c] = get(world.treasury, c, 0f0) + redistributed
+            end
+        end
+    end
+
+    # 5. Bankruptcy → stewards defect. Defection is sticky: a
+    # `:defector` agent leaves committed roles and cannot be re-promoted
+    # except via `reversible_governance`. This is what makes the
+    # treasury attack persistent across steps; demotion to `:contributor`
+    # was reverted in the same step by `apply_adoption!`'s re-promotion.
+    # Mechanism: when a cell's treasury is negative, defect enough
+    # stewards (lowest-commitment first) to balance the deficit.
+    for c in cells
+        bal = get(world.treasury, c, 0f0)
+        bal >= 0 && continue
+        cell_stewards = [a for a in world.agents
+                         if a.role === :steward && cell_of[a.id] == c]
+        isempty(cell_stewards) && (world.treasury[c] = 0f0; continue)
+        sort!(cell_stewards; by = a -> a.commitment)
+        deficit = -bal
+        n_to_defect = max(1, ceil(Int, deficit / max(steward_cost, 1f-3)))
+        for i in 1:min(n_to_defect, length(cell_stewards))
+            cell_stewards[i].role = :defector
+            cell_stewards[i].commitment = 0f0
+            # Drop them from any infrastructure they held.
+            for (_, replicas) in world.infra
+                delete!(replicas, cell_stewards[i].id)
+            end
+        end
+        world.treasury[c] = 0f0
+    end
+
+    return world
+end
+
+# N-1 — faction-diversity-floor defence ---------------------------------------
+
+"""
+    _faction_change_rejected(world, agent, new_faction) -> Bool
+
+Defensive gate for narrative-style faction changes. Returns `true`
+when the proposed change should be rejected. Logic:
+
+  reject_prob = s × (target_faction_share_in_cell)
+
+where `s` is the `faction_diversity_floor` principle strength
+resolved per-cell (DCS-aware), and `target_faction_share_in_cell` is
+the current fraction of committed agents in the *target's* cell who
+already hold the `new_faction`. When the faction is already large
+(approaching majority), conversions to it are rejected with high
+probability — forcing the attacker to spread across cells.
+
+Returns `false` (no rejection) when DCS is off and the global
+principle strength is also zero (preserves the pre-N-1 behaviour).
+"""
+function _faction_change_rejected(world::World, agent::Agent,
+                                    new_faction::Symbol)
+    world.faction_change_attempts += 1
+    # Resolve principle strength. When DCS is active we take the *max*
+    # of the static global principle and the per-cell adaptive value,
+    # so a pre-positioned global floor of fdf=1.0 is never overridden
+    # by a momentarily-quiet per-cell sensor (this is the
+    # "pre-positioned + reactive" architecture).
+    pr_global = get_principles(world.params)
+    s = pr_global.faction_diversity_floor
+    if world.dcs !== nothing
+        pr_cell = cell_principles_for(world, world.dcs, agent.id)
+        s = max(s, pr_cell.faction_diversity_floor)
+    end
+    s > 0 || return false
+    # Compute the target faction's share among committed in the target's
+    # cell.
+    n_in_cell, n_in_faction = 0, 0
+    if world.dcs !== nothing
+        c = world.dcs.cell_of[agent.id]
+        sens = world.dcs.sensors[c]
+        for id in sens.members
+            a = world.agents[id]
+            is_committed(a) || continue
+            n_in_cell += 1
+            a.faction === new_faction && (n_in_faction += 1)
+        end
+    else
+        # No DCS: use the global population as the "cell".
+        for a in world.agents
+            is_committed(a) || continue
+            n_in_cell += 1
+            a.faction === new_faction && (n_in_faction += 1)
+        end
+    end
+    share = n_in_cell == 0 ? 0f0 : Float32(n_in_faction / n_in_cell)
+    # Soft-cap at `soft_cap` fraction. Below the cap, rejection ramps
+    # linearly with share/soft_cap. At and above the cap, rejection is
+    # `s` (max). This fires meaningfully at low shares (e.g., share = 0.10
+    # gives 0.5·s rejection vs. 0.10·s from a pure linear rule), which is
+    # what stops a tipping-point cascade before the faction is dominant.
+    soft_cap = Float32(get(world.params, :faction_diversity_soft_cap, 0.20f0))
+    reject_prob = s * min(1f0, share / max(soft_cap, 1f-6))
+    rejected = rand(world.rng) < reject_prob
+    rejected && (world.faction_change_blocks += 1)
+    return rejected
+end
+
 # Expose for test/diagnostic scripts.
-export _disagreement_step!
+export _disagreement_step!, _coalition_step!, _faction_change_rejected,
+       _treasury_step!

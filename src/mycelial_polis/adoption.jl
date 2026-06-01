@@ -63,7 +63,8 @@ function threshold_adopt!(world::World, exposures_S::Vector{Float32},
         pr = dcs_active ? cell_principles_for(world, world.dcs, a.id) : pr_global
         drive = _drive(a, g_s, exposures_S, exposures_C, p, pr)
         a.awareness = clamp(0.7f0 * a.awareness + 0.3f0 * drive, 0f0, 1f0)
-        _maybe_advance_role!(a, drive, p.stage_thresholds; principles=pr)
+        _maybe_advance_role!(a, drive, p.stage_thresholds; principles=pr,
+                              disable_nm_effect = Bool(get(p, :disable_nm_effect, false)))
     end
     return world
 end
@@ -114,7 +115,8 @@ function complex_contagion_adopt!(world::World, exposures_S::Vector{Float32},
             trust += nb.commitment
         end
         (m_i >= k_cc && trust >= theta_cc) || continue
-        _maybe_advance_role!(a, drive, p.stage_thresholds; principles=pr)
+        _maybe_advance_role!(a, drive, p.stage_thresholds; principles=pr,
+                              disable_nm_effect = Bool(get(p, :disable_nm_effect, false)))
     end
     return world
 end
