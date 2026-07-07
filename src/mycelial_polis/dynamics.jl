@@ -347,12 +347,19 @@ const STAGE_SEQUENCE = (:outsider, :observer, :sympathizer, :user, :contributor,
 
 function _maybe_advance_role!(a::Agent, drive::Float32, thresholds::NamedTuple;
                               principles::Principles=default_principles(),
-                              disable_nm_effect::Bool=false)
+                              disable_nm_effect::Bool=false,
+                              block_committed_promotion::Bool=false)
     rank = ROLE_RANK[a.role]
     # Negative-rank roles (:removed, :infiltrator, :defector) are not on the
     # advancement ladder. They get filtered upstream too, but the guard makes
     # the function safe to call on any agent.
     rank < 0 && return a
+    # Saturation cap (paper 2 rewrite): when the polis is at its growth
+    # ceiling, refuse promotions that would cross into the committed pool
+    # (:user or higher). Agents already in the committed pool continue to
+    # advance normally; the cap only gates the boundary into commitment.
+    user_rank = ROLE_RANK[:user]
+    capped_at_boundary = block_committed_promotion && rank < user_rank
     # §19.7 Normative minimalism — thin constitution = lower stage thresholds.
     # H-10 audit: `disable_nm_effect=true` gags the threshold-lowering mechanic,
     # so the polis runs with full thresholds regardless of NM principle strength.
@@ -362,6 +369,11 @@ function _maybe_advance_role!(a::Agent, drive::Float32, thresholds::NamedTuple;
     fa_boost  = 1f0 + principles.functional_autonomy
     while rank < ROLE_RANK[:steward]
         next = STAGE_SEQUENCE[rank + 2]   # +2 because outsider=0, sympathizer=1, ...
+        # Carrying-capacity gate: if the polis is at its growth ceiling
+        # and we would cross the boundary into the committed pool
+        # (:user), refuse the promotion. Sub-committed agents can still
+        # advance among themselves but cannot enter commitment.
+        capped_at_boundary && ROLE_RANK[next] >= user_rank && break
         thr = getfield(thresholds, next) * thr_scale
         drive >= thr || break
         a.role = next
@@ -536,6 +548,19 @@ function _disagreement_step!(world::World, p::NamedTuple)
     base_k = floor(Int, rate)
     frac = rate - base_k
     k_events = base_k + (rand(world.rng) < frac ? 1 : 0)
+    # AM-2: wave-based conflict bursts. At wave events, add a fixed
+    # number of disagreement events on top of the baseline rate.
+    # No-op when `disagreement_wave_period == 0` (default).
+    let wp = Int(get(p, :disagreement_wave_period, 0)),
+        ws = Int(get(p, :disagreement_wave_start, 0)),
+        wb = Int(get(p, :disagreement_wave_burst, 0))
+        if wp > 0 && wb > 0
+            t_now = world.t
+            is_wave = (t_now == ws) ||
+                      (t_now > ws && (t_now - ws) % wp == 0)
+            is_wave && (k_events += wb)
+        end
+    end
     if k_events > 0
         committed_ids = [a.id for a in world.agents
                          if ROLE_RANK[a.role] >= ROLE_RANK[:user]]
@@ -714,32 +739,49 @@ function _coalition_step!(world::World)
     # NM-driven pool dilution still defends against a proportional attacker.
     growth_mode = Symbol(get(p, :coalition_growth_mode, :fixed))
     growth_rate = Float64(get(p, :coalition_growth_rate, 1.0))
+    # AM-1 — wave-based recurrent threats. If `coalition_wave_period > 0`,
+    # the coalition is re-seeded at every `wave_period` steps after
+    # `coalition_start`, restoring the coalition to `cs * N` fresh members.
+    # Between waves the existing dynamics carry the coalition forward.
+    wave_period = Int(get(p, :coalition_wave_period, 0))
     t = world.t
     g_S = world.multiplex.layers[:S]
 
-    # Seed coalition once at start time.
-    if t == cstart
-        committed = [a for a in world.agents if is_committed(a)]
-        if !isempty(committed)
-            n_coal = min(round(Int, cs * length(world.agents)), length(committed))
-            n_coal >= 1 || return world
-            picks_idx = randperm(world.rng, length(committed))[1:n_coal]
-            picks = committed[picks_idx]
-            for a in picks
-                a.faction = :coalition
-                a.commitment = max(a.commitment, 0.9f0)
-            end
-            # Wire mutual G_S trust edges among coalition members.
-            for u in picks, v in picks
-                u.id == v.id && continue
-                uid = eltype(g_S)(u.id); vid = eltype(g_S)(v.id)
-                if !LightGraphs.has_edge(g_S, uid, vid)
-                    add_edge!(g_S, uid, vid)
+    is_wave_step = (t == cstart) ||
+                   (wave_period > 0 && t > cstart && (t - cstart) % wave_period == 0)
+
+    # Seed (or re-seed at wave events) the coalition.
+    if is_wave_step
+        target_n = round(Int, cs * length(world.agents))
+        n_existing_coal = count(a -> a.faction === :coalition && is_committed(a),
+                                 world.agents)
+        n_add = max(0, target_n - n_existing_coal)
+        if n_add >= 1
+            non_coal = [a for a in world.agents
+                        if is_committed(a) && a.faction !== :coalition]
+            n_add = min(n_add, length(non_coal))
+            if n_add >= 1
+                picks_idx = randperm(world.rng, length(non_coal))[1:n_add]
+                picks = non_coal[picks_idx]
+                for a in picks
+                    a.faction = :coalition
+                    a.commitment = max(a.commitment, 0.9f0)
+                end
+                # Wire mutual G_S trust edges among the newly-seeded
+                # coalition members.
+                for u in picks, v in picks
+                    u.id == v.id && continue
+                    uid = eltype(g_S)(u.id); vid = eltype(g_S)(v.id)
+                    if !LightGraphs.has_edge(g_S, uid, vid)
+                        add_edge!(g_S, uid, vid)
+                    end
                 end
             end
-            # Anchor counters for proportional / nm_paced growth modes.
-            world._coalition_seed_committed = length(committed)
-            world._coalition_prev_committed = length(committed)
+        end
+        # Anchor counters at first seeding only.
+        if t == cstart
+            world._coalition_seed_committed = count(is_committed, world.agents)
+            world._coalition_prev_committed = world._coalition_seed_committed
         end
     end
 
@@ -913,11 +955,18 @@ function _treasury_step!(world::World)
         world.treasury[c] = get(world.treasury, c, 0f0) - steward_cost
     end
 
-    # 3. Host drain attack.
+    # 3. Host drain attack. Targets can be `:random` (default) or
+    # `:fixed` (always the same first-n cells in sorted order) ---
+    # the patterned-drain regime tested in AM-3.
+    drain_pattern = Symbol(get(p, :treasury_drain_pattern, :random))
     if rand(world.rng) < drain_prob && n_attack > 0
-        targets_idx = randperm(world.rng, length(cells))[1:min(n_attack, length(cells))]
-        for i in targets_idx
-            c = cells[i]
+        target_cells = if drain_pattern === :fixed
+            cells[1:min(n_attack, length(cells))]
+        else
+            idx = randperm(world.rng, length(cells))[1:min(n_attack, length(cells))]
+            cells[idx]
+        end
+        for c in target_cells
             bal = get(world.treasury, c, 0f0)
             world.treasury[c] = bal - drain_rate * max(bal, 0f0)
         end

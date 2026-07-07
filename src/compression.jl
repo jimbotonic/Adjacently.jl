@@ -29,6 +29,9 @@ GOLOMB_BASE, REF_ENCODING_TH, REF_V_MIN_DEGREE, FED_BLOCK_SIZE, MIN_INTERVAL_LEN
 using ..Index
 using ..CompressionUtils
 
+# Streaming context-adaptive range coder for the :context_range integer backend.
+include("range_coder.jl")
+
 
 
 # Export the functions we want to make available
@@ -83,6 +86,7 @@ export write_unary_coding,
        estimate_interval_runlength_encoding_cost,
        write_greedy_graph_data,
        read_greedy_graph_data,
+       parse_bg_ctxrange_index,
        write_cmdstream_graph_data,
        read_cmdstream_graph_data,
        CommandStream,
@@ -308,7 +312,100 @@ Write a value to the bitwriter using the specified compression code.
 @param value::T: the value to write
 @param compression::Symbol: the compression coding to use (:elias_gamma, :elias_delta, :golomb, :fibonacci, :zeta, :fed)
 """
+# Measurement tap: when set to a Vector, records every coded integer so we can
+# compare alternative integer backends (e.g. context-range) offline. nothing = off.
+# Concretely typed so the hot-path check in write_encoded_value is type-stable and
+# allocation-free (no boxed Any load per coded integer).
+const _VALUE_TAP = Ref{Union{Nothing,Vector{UInt64}}}(nothing)
+# Structural taps (lever-2 sizing): reference distances + copy-bitmap bits.
+const _REFDIST_TAP = Ref{Any}(nothing)
+const _COPYBMP_TAP = Ref{Any}(nothing)
+# Exact per-stream bit accounting (Dict{Symbol,Int} when active) + residual accumulator.
+const _STREAM_BITS = Ref{Any}(nothing)
+const _RESID_ACC = Ref{Any}(nothing)
+# Per-vertex residual metadata for typed-context experiments:
+# Vector of (degree, n_residual_values, ref_mode_code) in encode order. ref_mode:
+# 0=none, 1=reference, 2=multi_ref.
+const _RESID_META = Ref{Any}(nothing)
+# Per-vertex residual neighbor-id list (diagnostic tap for copy-aware rank-gap
+# experiments): when set to a Vector, _encode_vertex! pushes a copy of each
+# vertex's final residual (non-copied) neighbor id list in encode order.
+const _RESIDIDS_TAP = Ref{Any}(nothing)
+# Production :context_range backend: when set to a CtxRangeEncoder / CtxRangeDecoder,
+# write_encoded_value / read_encoded_value redirect the residual-region integer
+# stream to the range coder instead of the bitstream. Gated to the residual region
+# by _encode_vertex! / read_greedy_graph_data.
+# Concretely typed (CtxRangeEncoder/Decoder are defined in range_coder.jl, include'd
+# above at L33) so the per-call redirect check in write/read_encoded_value is
+# type-stable and allocation-free — the boxed Ref{Any} load on this hot path was
+# the root cause of the flaky GC segfault.
+const _RESID_SINK = Ref{Union{Nothing,CtxRangeEncoder}}(nothing)
+const _RESID_SOURCE = Ref{Union{Nothing,CtxRangeDecoder}}(nothing)
+
+# --- Copy-aware rank gaps (Task A) -------------------------------------------
+# In the :context_range residual path, residual neighbour ids are recoded as
+# ranks in the complement of the already-copied set C (target ids copied from
+# the reference), instead of absolute-coordinate gaps. This lets consecutive
+# residuals whose gap is "explained" by an intervening copied id become adjacent
+# ranks (interval-detectable), shaving residual bits. The transform is applied
+# to the sorted residual id list R -> Q immediately BEFORE it enters the residual
+# range coder, and inverted Q -> R immediately AFTER the residual range decoder;
+# the coder / hybrid tokens / stop / count / interval logic are untouched
+# (intervals are simply detected on Q). Tied to :context_range being active — no
+# header bit. The transform is universe-agnostic: it depends only on C (sorted,
+# unique, disjoint from R), so BG/CS (id universe 1:n) and CG (cluster-local
+# 1:s) share it.
+#
+# rank_C(r) = r - #{c in C : c < r}   (1-based position of r in complement of C)
+#
+# Guards (caller-guaranteed): C sorted-unique, R sorted-strictly-increasing,
+# R ∩ C = ∅. Then Q is sorted-strictly-increasing and 1-based.
+@inline function _rankgap_forward(R::AbstractVector{I}, C::AbstractVector{I}) where {I<:Integer}
+    Q = Vector{I}(undef, length(R))
+    ci = 1; nc = length(C); copied_before = 0
+    @inbounds for k in eachindex(R)
+        r = R[k]
+        while ci <= nc && C[ci] < r
+            copied_before += 1; ci += 1
+        end
+        Q[k] = r - I(copied_before)
+    end
+    return Q
+end
+
+@inline function _rankgap_inverse(Q::AbstractVector{I}, C::AbstractVector{I}) where {I<:Integer}
+    R = Vector{I}(undef, length(Q))
+    ci = 1; nc = length(C)
+    @inbounds for k in eachindex(Q)
+        r = Q[k] + I(ci - 1)
+        while ci <= nc && C[ci] <= r
+            ci += 1; r += one(I)
+        end
+        R[k] = r
+    end
+    return R
+end
+
+# Map a single coordinate x (e.g. the vertex id) into the same complement-rank
+# space as _rankgap_forward, so the residual coder's vertex-relative first-value
+# zigzag keeps its locality after the residuals are remapped. Encode and decode
+# must call this with the identical C to stay lossless.
+@inline function _rank_of(x::I, C::AbstractVector{I}) where {I<:Integer}
+    cnt = 0
+    @inbounds for c in C
+        c < x ? (cnt += 1) : break
+    end
+    return x - I(cnt)
+end
+
 function write_encoded_value(w::BitWriter, value::T, compression::Symbol) where {T<:Unsigned}
+    let t = _VALUE_TAP[]; t === nothing || push!(t::Vector{UInt64}, UInt64(value)); end
+    let s = _RESID_SINK[]
+        if s !== nothing
+            rc_encode_value!(s::CtxRangeEncoder, UInt64(value))
+            return
+        end
+    end
     if compression == :elias_gamma
         write_elias_gamma(w, value)
     elseif compression == :elias_delta
@@ -337,6 +434,11 @@ Read a value from the bitreader using the specified compression code.
 @return::T: the decoded value
 """
 function read_encoded_value(r::BitReader, compression::Symbol, ::Type{T}=UInt8) where {T<:Unsigned}
+    let s = _RESID_SOURCE[]
+        if s !== nothing
+            return T(rc_decode_value!(s::CtxRangeDecoder))
+        end
+    end
     if compression == :elias_gamma
         return read_elias_gamma(r, T)
     elseif compression == :elias_delta
@@ -3053,11 +3155,28 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         index_sample_k::Int=0) where {T<:Unsigned}
 
     vs = length(keys(neighbor_lists))
-    ie = integer_encoding
+    # :context_range routes residual-region integers to a streaming range coder;
+    # structural integers (refdist, copy blocks, counts) still use fibonacci in the
+    # bitstream. Residuals are collected across all vertices, finalized, returned.
+    use_ctx_range = integer_encoding == :context_range
+    ie = use_ctx_range ? :fibonacci : integer_encoding
+    resid_sink   = use_ctx_range ? CtxRangeEncoder() : nothing
+    refdist_sink = use_ctx_range ? CtxRangeEncoder() : nothing   # reference distances
+    copy_sink    = use_ctx_range ? BinRangeEncoder() : nothing   # copy bitmap bits
+    if use_ctx_range && coding_scheme == :index && index_sample_k <= 0
+        # Full (per-vertex) index needs a continuous range blob → not seekable.
+        error(":context_range index mode requires a sampled index (index_sample_k > 0)")
+    end
 
     # Index mode: full index uses count-prefixed (no stop_deltas); sampled uses children-mode data
     idx_mode = coding_scheme == :index
     sampled_idx = idx_mode && index_sample_k > 0
+    # Chunked range streams: sampled index + :context_range. Each k-vertex chunk
+    # finalizes the range coders into an independently-decodable byte blob so a
+    # reader can seek to the chunk containing v (granularity k) instead of decoding
+    # the whole graph. Per-chunk blob byte-offset tables are stored in the struct
+    # stream right after the sampled struct-offset table.
+    ctx_chunked = use_ctx_range && sampled_idx
     if idx_mode && !sampled_idx
         # Full index: override stop_deltas (redundant with offset table)
         stop_deltas = false
@@ -3119,7 +3238,12 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         _, actual_ref_mode, mil, ref_result, enc_type, use_stop, res_enc_type, res_mil = _greedy_vertex_search(current_neighbors, neighbor_lists, reference_window, ie; vertex_id=v, copy_blocks=copy_blocks, adaptive_copy=adaptive_copy, fixwidth_ref=fixwidth_ref, ref_dist_bits=ref_dist_bits, stop_deltas=stop_deltas, adaptive_deltas=adaptive_deltas, split_residual=split_residual, bv_blocks=bv_blocks, compact_copy=compact_copy, tight_intervals=tight_intervals, buf=gcb, lr_split=lr_split, multi_ref=multi_ref, adaptive_header=adaptive_header, ws=_ws, cost_model=cost_model)
 
         # Write vertex header
+        _hb0 = _STREAM_BITS[] === nothing ? 0 : _total_bits(wr)
         _write_vertex_header_vlc(wr, actual_ref_mode, enc_type, mil; adaptive=adaptive_header)
+        if _STREAM_BITS[] !== nothing
+            _sbh = _STREAM_BITS[]::Dict{Symbol,Int}
+            _sbh[:header] = get(_sbh, :header, 0) + (_total_bits(wr) - _hb0)
+        end
 
         # Collect action statistics if requested
         if stats !== nothing
@@ -3133,7 +3257,17 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
 
         # Helper: write one reference (distance + copy bitmap)
         function _write_one_ref!(wr_out, ref_dist, copy_bmp)
-            if fixwidth_ref
+            let t = _REFDIST_TAP[]; t === nothing || push!(t::Vector{UInt64}, UInt64(ref_dist)); end
+            let t = _COPYBMP_TAP[]
+                if t !== nothing
+                    for b in copy_bmp; push!(t::Vector{Bool}, b != 0); end
+                end
+            end
+            local _sbr = _STREAM_BITS[]
+            local _rp0 = _sbr === nothing ? 0 : _total_bits(wr_out)
+            if refdist_sink !== nothing
+                rc_encode_value!(refdist_sink, UInt64(ref_dist))          # -> refdist range coder
+            elseif fixwidth_ref
                 local d = Int(ref_dist) - 1
                 for b in (ref_dist_bits-1):-1:0
                     write_bit(wr_out, ((d >> b) & 1) == 1)
@@ -3141,12 +3275,20 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
             else
                 write_encoded_value(wr_out, T(ref_dist), ie)
             end
-            if adaptive_copy && copy_blocks
+            local _rp1 = _sbr === nothing ? 0 : _total_bits(wr_out)
+            if copy_sink !== nothing
+                for b in copy_bmp; brc_encode_bit!(copy_sink, b != 0); end  # -> copy binary coder
+            elseif adaptive_copy && copy_blocks
                 _write_adaptive_copy(wr_out, copy_bmp, ie; bv_blocks=bv_blocks, compact_copy=compact_copy)
             elseif copy_blocks
                 _write_copy_blocks(wr_out, copy_bmp, ie)
             else
                 write_bitmap_adaptive(wr_out, copy_bmp, ie)
+            end
+            if _sbr !== nothing
+                _sbrd = _sbr::Dict{Symbol,Int}
+                _sbrd[:refdist] = get(_sbrd, :refdist, 0) + (_rp1 - _rp0)
+                _sbrd[:copy] = get(_sbrd, :copy, 0) + (_total_bits(wr_out) - _rp1)
             end
         end
 
@@ -3172,12 +3314,36 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
             write_mil = split_residual ? res_mil : mil
         end
 
+        # Copy-aware rank gaps: when the residual range coder is active, recode the
+        # residual ids as ranks in the complement of the copied set
+        # C = current_neighbors \ residuals. Identity when C is empty (:none), so
+        # only reference / multi_ref vertices are affected. The vertex id is mapped
+        # into the same rank space so the coder's vertex-relative first value keeps
+        # its locality.
+        _resid_vid = v
+        if resid_sink !== nothing && actual_ref_mode != :none
+            _C = setdiff(current_neighbors, target_list)   # sorted, unique, disjoint
+            if !isempty(_C)
+                target_list = _rankgap_forward(target_list, _C)
+                _resid_vid = _rank_of(v, _C)
+            end
+        end
+
         # Encode target_list
+        _rs0 = _STREAM_BITS[] === nothing ? 0 : _total_bits(wr)
+        _rsn0 = (_RESID_META[] === nothing || _RESID_ACC[] === nothing) ? 0 : length(_RESID_ACC[]::Vector{UInt64})
+        if _STREAM_BITS[] !== nothing && _RESID_ACC[] !== nothing
+            _VALUE_TAP[] = _RESID_ACC[]   # capture only residual integers
+        end
+        if resid_sink !== nothing
+            rc_reset_region!(resid_sink)
+            _RESID_SINK[] = resid_sink    # redirect residual-region integers to range coder
+        end
         if write_enc == :interval
             if lr_split
-                _write_intervals_lr(wr, target_list, ie, write_mil; vertex_id=v, tight_intervals=tight_intervals)
+                _write_intervals_lr(wr, target_list, ie, write_mil; vertex_id=_resid_vid, tight_intervals=tight_intervals)
             else
-                write_intervals_and_residuals(wr, target_list, ie, write_mil; vertex_id=v, tight_intervals=tight_intervals)
+                write_intervals_and_residuals(wr, target_list, ie, write_mil; vertex_id=_resid_vid, tight_intervals=tight_intervals)
             end
         elseif write_enc == :delta
             # Determine delta format: adaptive (per-vertex) or global
@@ -3186,12 +3352,12 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
                 write_bit(wr, vertex_stop)  # 1-bit flag: true=stop, false=count
             end
             if vertex_stop
-                _write_stop_delta(wr, target_list, ie; vertex_id=v)
+                _write_stop_delta(wr, target_list, ie; vertex_id=_resid_vid)
             else
                 # Self-delimiting delta: count + values
                 write_encoded_value(wr, T(length(target_list) + 1), ie)
                 if !isempty(target_list)
-                    write_delta(wr, target_list, ie; vertex_id=v)
+                    write_delta(wr, target_list, ie; vertex_id=_resid_vid)
                 end
             end
         elseif write_enc == :rle
@@ -3199,23 +3365,56 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
             write_encoded_value(wr, T(length(target_list) + 1), ie)
             if !isempty(target_list)
                 deltas = delta_encode_vector(target_list)
-                write_hybrid_mix_encoded_list(wr, deltas, ie, true, write_mil, false; vertex_id=v)
+                write_hybrid_mix_encoded_list(wr, deltas, ie, true, write_mil, false; vertex_id=_resid_vid)
             end
+        end
+        if resid_sink !== nothing
+            _RESID_SINK[] = nothing       # end residual region
+        end
+        if _STREAM_BITS[] !== nothing
+            _VALUE_TAP[] = nothing
+            _sbres = _STREAM_BITS[]::Dict{Symbol,Int}
+            _sbres[:residual] = get(_sbres, :residual, 0) + (_total_bits(wr) - _rs0)
+        end
+        if _RESID_META[] !== nothing && _RESID_ACC[] !== nothing
+            local _rmc = length(_RESID_ACC[]::Vector{UInt64}) - _rsn0
+            local _rmm = (actual_ref_mode == :multi_ref) ? 2 : (actual_ref_mode == :reference ? 1 : 0)
+            push!(_RESID_META[]::Vector{NTuple{3,Int}}, (length(current_neighbors), _rmc, _rmm))
+        end
+        let t = _RESIDIDS_TAP[]
+            t === nothing || push!(t::Vector{Any}, copy(target_list))
         end
 
         add_to_ref_window!(v)
     end
 
+    # Per-chunk range blobs (ctx_chunked only): concatenated finalized chunks +
+    # cumulative byte-offset tables (length nchunks+1, first entry 0, last = blob len).
+    resid_blob = UInt8[]; refdist_blob = UInt8[]; copy_blob = UInt8[]
+    resid_coff = Int[0]; refdist_coff = Int[0]; copy_coff = Int[0]
     if idx_mode
         # Two-pass encoding: encode per-vertex data to buffer, then write offset table + data
         buf_bw = BitWriter()
         vertex_offsets = Vector{Int}(undef, vs + 1)
 
         for v_idx in 1:vs
+            # At each chunk boundary (aligned to the sampled-index sample points),
+            # finalize + reset the range coders so each chunk is self-contained.
+            if ctx_chunked && v_idx > 1 && (v_idx - 1) % index_sample_k == 0
+                append!(resid_blob,   rc_finish_and_reset!(resid_sink));   push!(resid_coff,   length(resid_blob))
+                append!(refdist_blob, rc_finish_and_reset!(refdist_sink)); push!(refdist_coff, length(refdist_blob))
+                append!(copy_blob,    brc_finish_and_reset!(copy_sink));   push!(copy_coff,    length(copy_blob))
+            end
             v = T(v_idx)
             vertex_offsets[v_idx] = _total_bits(buf_bw)
             current_neighbors = sort(get(neighbor_lists, v, T[]))
             _encode_vertex!(buf_bw, v, current_neighbors)
+        end
+        if ctx_chunked
+            # Finalize the last chunk.
+            append!(resid_blob,   rc_finish_and_reset!(resid_sink));   push!(resid_coff,   length(resid_blob))
+            append!(refdist_blob, rc_finish_and_reset!(refdist_sink)); push!(refdist_coff, length(refdist_blob))
+            append!(copy_blob,    brc_finish_and_reset!(copy_sink));   push!(copy_coff,    length(copy_blob))
         end
         flush_bitwriter(buf_bw; flush_last_bits=true)
         vertex_offsets[vs + 1] = bytes_written(buf_bw) * 8
@@ -3230,9 +3429,15 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
             # [ceil(n/k)+2 entries × entry_width bits]
             # Data is identical to full index mode.
             write_bit(w, true)  # sampled flag
-            # Store sample_k as (k/4 - 1) in 8 bits: supports k=4,8,...,1024
             @assert index_sample_k >= 4 && index_sample_k % 4 == 0 "index_sample_k must be a multiple of 4, >= 4"
-            write_value(w, UInt64(index_sample_k ÷ 4 - 1), 8)
+            if use_ctx_range
+                # :context_range (new path): store raw k in 32 bits so chunk sizes
+                # can exceed the 8-bit (k/4-1) field's 1024 ceiling.
+                write_value(w, UInt64(index_sample_k), 32)
+            else
+                # Legacy fibonacci sampled index: k as (k/4-1) in 8 bits (k ≤ 1024).
+                write_value(w, UInt64(index_sample_k ÷ 4 - 1), 8)
+            end
             write_value(w, UInt64(entry_width), 6)
 
             # Write sampled offsets: one entry per k-th vertex + end marker
@@ -3241,6 +3446,21 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
             end
             # End marker: total data size
             write_value(w, UInt64(vertex_offsets[vs + 1]), entry_width)
+
+            # :context_range — per-chunk byte-offset tables for the three range
+            # streams (resid, refdist, copy), each length nchunks+1 (cumulative,
+            # last = blob length). Lets a reader slice + spin up fresh decoders on
+            # the chunk containing v.
+            if ctx_chunked
+                max_boff = max(resid_coff[end], refdist_coff[end], copy_coff[end])
+                coff_width = max_boff > 0 ? max(Int(ceil(log2(max_boff + 1))), 1) : 1
+                write_value(w, UInt64(coff_width), 6)
+                for offs in (resid_coff, refdist_coff, copy_coff)
+                    for o in offs
+                        write_value(w, UInt64(o), coff_width)
+                    end
+                end
+            end
         else
             # Full offset table (original behavior):
             # [1 bit: sampled=0] [6 bits: entry_width] [(N+1) entries × entry_width bits]
@@ -3263,6 +3483,15 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
             _encode_vertex!(w, v, current_neighbors)
         end
     end
+    # :context_range — finalize the three range streams (all empty otherwise)
+    if ctx_chunked
+        # Already finalized per chunk; return the concatenated blobs.
+        return (resid_blob, refdist_blob, copy_blob)
+    end
+    if use_ctx_range
+        return (rc_finish!(resid_sink), rc_finish!(refdist_sink), brc_finish!(copy_sink))
+    end
+    return (UInt8[], UInt8[], UInt8[])
 end
 
 function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Type{T};
@@ -3273,10 +3502,30 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
         tight_intervals::Bool=false,
         lr_split::Bool=false,
         multi_ref::Bool=false,
-        adaptive_header::Bool=false) where {T<:Unsigned}
+        adaptive_header::Bool=false,
+        ctx_range::Bool=false,
+        resid_bytes::Vector{UInt8}=UInt8[],
+        refdist_bytes::Vector{UInt8}=UInt8[],
+        copy_bytes::Vector{UInt8}=UInt8[],
+        decode_range::Union{Nothing,UnitRange{Int}}=nothing,
+        seed_window::Vector{T}=T[],
+        ref_resolver::Union{Nothing,Function}=nothing) where {T<:Unsigned}
 
     neighbor_lists = Dict{T,Vector{T}}()
     ref_dist_bits = fixwidth_ref ? ceil(Int, log2(max(2, ref_window_size))) : 0
+    # :context_range — residual/refdist/copy streams are pulled from range decoders.
+    # For the chunked (sampled-index) path these are (re)initialised per chunk on a
+    # byte slice; here we set up the whole-blob decoders used by the non-index path.
+    resid_source   = ctx_range ? CtxRangeDecoder(resid_bytes) : nothing
+    refdist_source = ctx_range ? CtxRangeDecoder(refdist_bytes) : nothing
+    copy_source    = ctx_range ? BinRangeDecoder(copy_bytes) : nothing
+    # Read `n` copy bits from the binary range decoder into a Bool bitmap.
+    _read_copy_bits(n::Int) = Bool[brc_decode_bit!(copy_source::BinRangeDecoder) for _ in 1:n]
+    # Referenced-vertex adjacency lookup: local (already-decoded) first, then an
+    # optional external resolver (random-access: materialise a referenced vertex
+    # that lives in an earlier, not-yet-decoded chunk).
+    _ref_nbs(ref_v::T) = haskey(neighbor_lists, ref_v) ? neighbor_lists[ref_v] :
+        (ref_resolver !== nothing ? ref_resolver(ref_v)::Vector{T} : T[])
 
     # Read stream metadata
     is_index_mode = read_bit(r)
@@ -3287,16 +3536,38 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
     vertex_offsets = Int[]
     sampled_offsets = Int[]
     is_sampled_index = false
+    samp_k = 0
+    # Per-chunk range-blob byte offsets (ctx_range + sampled index).
+    resid_coff = Int[]; refdist_coff = Int[]; copy_coff = Int[]
+    data_start_bit = 0
     if is_index_mode
         is_sampled_index = read_bit(r)
         if is_sampled_index
-            # Two-level sampled offsets: data uses children-mode encoding
-            local _sk = (Int(read_value(r, 8, UInt64)) + 1) * 4  # decode: (stored+1)*4
+            # Two-level sampled offsets: data uses children-mode encoding.
+            # :context_range stores raw k in 32 bits; fibonacci uses (k/4-1) in 8 bits.
+            local _sk = ctx_range ? Int(read_value(r, 32, UInt64)) :
+                (Int(read_value(r, 8, UInt64)) + 1) * 4
+            samp_k = _sk
             entry_width = Int(read_value(r, 6, UInt64))
             n_sampled = length(1:_sk:Int(vs))
             for _ in 1:(n_sampled + 1)
                 push!(sampled_offsets, Int(read_value(r, entry_width, UInt64)))
             end
+            # :context_range — per-chunk byte-offset tables for the three range
+            # streams (each length nchunks+1). Enables seeking to the chunk of v.
+            if ctx_range
+                coff_width = Int(read_value(r, 6, UInt64))
+                for tbl in (0, 1, 2)
+                    for _ in 1:(n_sampled + 1)
+                        o = Int(read_value(r, coff_width, UInt64))
+                        tbl == 0 ? push!(resid_coff, o) :
+                        tbl == 1 ? push!(refdist_coff, o) : push!(copy_coff, o)
+                    end
+                end
+            end
+            # After the offset tables, the struct reader sits at the first vertex's
+            # data — record the absolute bit position so we can seek per chunk.
+            data_start_bit = r.bit_count
             # Sampled mode: data is children-mode, keep stop_deltas as passed
         else
             # Full offset table: data uses count-prefixed encoding
@@ -3318,39 +3589,77 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
         end
     end
 
+    # Chunked :context_range (sampled index): the three range streams are stored as
+    # a concatenation of independently-finalized chunks (aligned to sample points,
+    # every samp_k vertices). Spin up fresh decoders on chunk c's byte slice with
+    # fresh adaptive models — matching the encoder's per-chunk reset.
+    ctx_chunked = ctx_range && is_sampled_index && !isempty(resid_coff)
+    function _setup_chunk!(c::Int)
+        resid_source   = CtxRangeDecoder(resid_bytes[resid_coff[c] + 1 : resid_coff[c + 1]])
+        refdist_source = CtxRangeDecoder(refdist_bytes[refdist_coff[c] + 1 : refdist_coff[c + 1]])
+        copy_source    = BinRangeDecoder(copy_bytes[copy_coff[c] + 1 : copy_coff[c + 1]])
+        return nothing
+    end
+
+    # Random-access seek mode: decode only `decode_range`, seeding the reference
+    # window with the caller-supplied predecessor ids and jumping the struct reader
+    # + range decoders to the chunk containing the range start.
+    if decode_range !== nothing
+        for u in seed_window
+            push!(reference_window, u)
+        end
+        c0 = ((first(decode_range) - 1) ÷ samp_k) + 1
+        bitpos = data_start_bit + sampled_offsets[c0]
+        r.index = bitpos + 1
+        r.bit_count = bitpos
+        _setup_chunk!(c0)
+    end
+
     # Helper to read encoded list based on type (using captured ie, tight_intervals, etc.)
+    # For :context_range this is the residual region: gate the range decoder so
+    # read_encoded_value pulls from it (mirror of the encoder's sink region).
     function _read_encoded_list_body(r_in::BitReader, v::T, enc_type::Symbol, mil::Int)
-        if enc_type == :interval
-            if lr_split
-                return _read_intervals_lr(r_in, ie, mil, T; vertex_id=v, tight_intervals=tight_intervals)
-            else
-                return read_intervals_and_residuals(r_in, ie, mil, T; vertex_id=v, tight_intervals=tight_intervals)
-            end
-        elseif enc_type == :delta
-            # Determine delta format: adaptive (per-vertex) or global
-            vertex_stop = adaptive_deltas ? read_bit(r_in) : stop_deltas
-            if vertex_stop
-                return _read_stop_delta(r_in, ie, T; vertex_id=v)
-            else
+        if resid_source !== nothing
+            rc_reset_region!(resid_source::CtxRangeDecoder)
+            _RESID_SOURCE[] = resid_source
+        end
+        try
+            if enc_type == :interval
+                if lr_split
+                    return _read_intervals_lr(r_in, ie, mil, T; vertex_id=v, tight_intervals=tight_intervals)
+                else
+                    return read_intervals_and_residuals(r_in, ie, mil, T; vertex_id=v, tight_intervals=tight_intervals)
+                end
+            elseif enc_type == :delta
+                # Determine delta format: adaptive (per-vertex) or global
+                vertex_stop = adaptive_deltas ? read_bit(r_in) : stop_deltas
+                if vertex_stop
+                    return _read_stop_delta(r_in, ie, T; vertex_id=v)
+                else
+                    count = read_encoded_value(r_in, ie, T) - T(1)
+                    if count > 0
+                        return read_delta(r_in, ie, T; max_elements=Int(count), vertex_id=v)
+                    end
+                    return T[]
+                end
+            elseif enc_type == :rle
                 count = read_encoded_value(r_in, ie, T) - T(1)
                 if count > 0
-                    return read_delta(r_in, ie, T; max_elements=Int(count), vertex_id=v)
+                    return read_hybrid_mix_encoded_list(r_in, :index, ie, T; max_elements=Int(count), vertex_id=v)
                 end
                 return T[]
             end
-        elseif enc_type == :rle
-            count = read_encoded_value(r_in, ie, T) - T(1)
-            if count > 0
-                return read_hybrid_mix_encoded_list(r_in, :index, ie, T; max_elements=Int(count), vertex_id=v)
-            end
             return T[]
+        finally
+            resid_source === nothing || (_RESID_SOURCE[] = nothing)
         end
-        return T[]
     end
 
     # Helper: read one reference distance + copy bitmap, return copied neighbors
     function _read_one_ref(r_in::BitReader)
-        if fixwidth_ref
+        if refdist_source !== nothing
+            distance = T(rc_decode_value!(refdist_source::CtxRangeDecoder))
+        elseif fixwidth_ref
             local d = 0
             for _ in 1:ref_dist_bits
                 d = (d << 1) | Int(read_bit(r_in))
@@ -3363,9 +3672,12 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
         ref_nbs = T[]
         if 1 <= ref_idx <= length(reference_window)
             ref_v = reference_window[ref_idx]
-            ref_nbs = get(neighbor_lists, ref_v, T[])
+            ref_nbs = _ref_nbs(ref_v)
         end
-        if adaptive_copy && copy_blocks
+        if copy_source !== nothing
+            copy_bitmap = _read_copy_bits(length(ref_nbs))
+            copied = reconstruct_from_reference(ref_nbs, copy_bitmap, T[])
+        elseif adaptive_copy && copy_blocks
             ref_len = length(ref_nbs)
             copy_bitmap = _read_adaptive_copy(r_in, ref_len, ie, T; bv_blocks=bv_blocks, compact_copy=compact_copy)
             copied = reconstruct_from_reference(ref_nbs, copy_bitmap, T[])
@@ -3394,11 +3706,23 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
             # Multi-reference: read two ref+copy pairs, then residuals
             copied1 = _read_one_ref(r_in)
             copied2 = _read_one_ref(r_in)
-            residuals = _read_encoded_list_body(r_in, v, enc_type, mil)
+            # Copy-aware rank gaps: C = copied1 ∪ copied2; decode Q in rank space
+            # (rank-mapped vertex id) then invert Q -> R.
+            _mr_vid = v; _mr_C = T[]
+            if resid_source !== nothing
+                _mr_C = sort!(unique!(vcat(copied1, copied2)))
+                isempty(_mr_C) || (_mr_vid = _rank_of(v, _mr_C))
+            end
+            residuals = _read_encoded_list_body(r_in, _mr_vid, enc_type, mil)
+            if resid_source !== nothing && !isempty(_mr_C)
+                residuals = _rankgap_inverse(residuals, _mr_C)
+            end
             # Union all three sets
             current_neighbors = sort!(unique!(vcat(copied1, copied2, residuals)))
         elseif ref_mode == :reference
-            if fixwidth_ref
+            if refdist_source !== nothing
+                distance = T(rc_decode_value!(refdist_source::CtxRangeDecoder))
+            elseif fixwidth_ref
                 local d = 0
                 for _ in 1:ref_dist_bits
                     d = (d << 1) | Int(read_bit(r_in))
@@ -3407,12 +3731,38 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
             else
                 distance = read_encoded_value(r_in, ie, T)
             end
-            if adaptive_copy && copy_blocks
+            if copy_source !== nothing
                 ref_idx = length(reference_window) - Int(distance) + 1
                 ref_nbs = T[]
                 if 1 <= ref_idx <= length(reference_window)
                     ref_v = reference_window[ref_idx]
-                    ref_nbs = get(neighbor_lists, ref_v, T[])
+                    ref_nbs = _ref_nbs(ref_v)
+                end
+                copy_bitmap = _read_copy_bits(length(ref_nbs))
+                res_et, res_m = enc_type, mil
+                if split_residual
+                    if read_bit(r_in)
+                        res_et, res_m = _read_enc_opt_tag(r_in)
+                    end
+                end
+                # Copy-aware rank gaps: C = copied ids; decode Q in rank space then
+                # invert Q -> R.
+                _rg_vid = v; _rg_C = T[]
+                if resid_source !== nothing
+                    _rg_C = reconstruct_from_reference(ref_nbs, copy_bitmap, T[])
+                    isempty(_rg_C) || (_rg_vid = _rank_of(v, _rg_C))
+                end
+                residuals = _read_encoded_list_body(r_in, _rg_vid, res_et, res_m)
+                if resid_source !== nothing && !isempty(_rg_C)
+                    residuals = _rankgap_inverse(residuals, _rg_C)
+                end
+                current_neighbors = reconstruct_from_reference(ref_nbs, copy_bitmap, residuals)
+            elseif adaptive_copy && copy_blocks
+                ref_idx = length(reference_window) - Int(distance) + 1
+                ref_nbs = T[]
+                if 1 <= ref_idx <= length(reference_window)
+                    ref_v = reference_window[ref_idx]
+                    ref_nbs = _ref_nbs(ref_v)
                 end
                 ref_len = length(ref_nbs)
                 copy_bitmap = _read_adaptive_copy(r_in, ref_len, ie, T; bv_blocks=bv_blocks, compact_copy=compact_copy)
@@ -3436,7 +3786,7 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
                 ref_idx = length(reference_window) - Int(distance) + 1
                 if 1 <= ref_idx <= length(reference_window)
                     ref_v = reference_window[ref_idx]
-                    ref_nbs = get(neighbor_lists, ref_v, T[])
+                    ref_nbs = _ref_nbs(ref_v)
                     current_neighbors = reconstruct_from_copy_positions(ref_nbs, copy_positions, residuals)
                 else
                     current_neighbors = residuals
@@ -3453,7 +3803,7 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
                 ref_idx = length(reference_window) - Int(distance) + 1
                 if 1 <= ref_idx <= length(reference_window)
                     ref_v = reference_window[ref_idx]
-                    ref_nbs = get(neighbor_lists, ref_v, T[])
+                    ref_nbs = _ref_nbs(ref_v)
                     current_neighbors = reconstruct_from_reference(ref_nbs, copy_bitmap, residuals)
                 else
                     current_neighbors = residuals
@@ -3466,9 +3816,18 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
         return current_neighbors
     end
 
-    # Unified Data loop
-    for v_idx in 1:Int(vs)
+    # Unified Data loop. In seek mode only `decode_range` is visited; otherwise the
+    # whole graph is decoded sequentially.
+    loop_range = decode_range === nothing ? (1:Int(vs)) : decode_range
+    for v_idx in loop_range
         v = T(v_idx)
+
+        # Chunked :context_range full decode: swap to fresh per-chunk decoders at
+        # each sample boundary. (In seek mode the chunk is already set up and the
+        # range never crosses a boundary.)
+        if ctx_chunked && decode_range === nothing && (v_idx - 1) % samp_k == 0
+            _setup_chunk!(((v_idx - 1) ÷ samp_k) + 1)
+        end
 
         if is_index_mode && !isempty(vertex_offsets)
             # Full index mode: empty vertex = offset[v] == offset[v+1]
@@ -3489,6 +3848,37 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
     return neighbor_lists
 end
 
+
+# Parse the header + offset tables of a sampled-index :context_range BG struct
+# stream, returning everything a random-access reader needs to seek to a chunk.
+# Decodes NO vertex data. `vs` = number of vertices.
+function parse_bg_ctxrange_index(struct_bytes::Vector{UInt8}, vs::Int)
+    r = BitReader(IOBuffer(struct_bytes))
+    is_index = read_bit(r)
+    enc_tag = _read_encoding_tag(r)
+    ie = get(TAG_ENCODINGS, enc_tag, :fibonacci)
+    is_index || error("parse_bg_ctxrange_index: not an index-mode stream")
+    is_sampled = read_bit(r)
+    is_sampled || error("parse_bg_ctxrange_index: random access requires a sampled index")
+    samp_k = Int(read_value(r, 32, UInt64))   # :context_range stores raw k in 32 bits
+    entry_width = Int(read_value(r, 6, UInt64))
+    n_sampled = length(1:samp_k:vs)
+    sampled_offsets = Int[]
+    for _ in 1:(n_sampled + 1)
+        push!(sampled_offsets, Int(read_value(r, entry_width, UInt64)))
+    end
+    coff_width = Int(read_value(r, 6, UInt64))
+    resid_coff = Int[]; refdist_coff = Int[]; copy_coff = Int[]
+    for tbl in (resid_coff, refdist_coff, copy_coff)
+        for _ in 1:(n_sampled + 1)
+            push!(tbl, Int(read_value(r, coff_width, UInt64)))
+        end
+    end
+    data_start_bit = r.bit_count
+    return (samp_k=samp_k, sampled_offsets=sampled_offsets, resid_coff=resid_coff,
+        refdist_coff=refdist_coff, copy_coff=copy_coff, data_start_bit=data_start_bit,
+        ie=ie, n_sampled=n_sampled)
+end
 
 function _estimate_adaptive_bitmap_cost(bitmap::Vector{Bool}, ie::Symbol)::Int
     # Same logic as write_bitmap_adaptive: min of raw vs block encoding + 1-bit flag
@@ -4610,9 +5000,16 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         index_sample_k::Int=0) where {T<:Unsigned}
 
     vs = length(keys(neighbor_lists))
-    ie = integer_encoding
+    use_ctx_range = integer_encoding == :context_range
+    ie = use_ctx_range ? :fibonacci : integer_encoding
+    resid_sink   = use_ctx_range ? CtxRangeEncoder() : nothing
+    refdist_sink = use_ctx_range ? CtxRangeEncoder() : nothing
+    copy_sink    = use_ctx_range ? BinRangeEncoder() : nothing
     idx_mode = coding_scheme == :index
     sampled_idx = idx_mode && index_sample_k > 0
+    if use_ctx_range && idx_mode
+        error(":context_range does not yet support index (random-access) mode")
+    end
 
     fixwidth_ref = lr_split  # fixed-width ref distances when lr_split active (same as BG)
     ref_dist_bits = fixwidth_ref ? max(Int(ceil(log2(ref_window_size + 1))), 1) : 0
@@ -4658,39 +5055,63 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         target_list = current_neighbors
         if ref_mode != :none && ref_result !== nothing
             ref_distance, copy_bitmap, residuals = ref_result
-            if fixwidth_ref
+            if refdist_sink !== nothing
+                rc_encode_value!(refdist_sink, UInt64(ref_distance))
+            elseif fixwidth_ref
                 write_value(wr, UInt64(ref_distance), ref_dist_bits)
             else
                 write_encoded_value(wr, T(ref_distance), ie)
             end
-            _write_adaptive_copy(wr, copy_bitmap, ie; compact_copy=compact_copy)
+            if copy_sink !== nothing
+                for b in copy_bitmap; brc_encode_bit!(copy_sink, b != 0); end
+            else
+                _write_adaptive_copy(wr, copy_bitmap, ie; compact_copy=compact_copy)
+            end
             target_list = residuals
         end
 
-        # Encode target_list
+        # Copy-aware rank gaps: recode residual ids as ranks in the complement of
+        # the copied set C = current_neighbors \ residuals (identity when :none).
+        # Vertex id is mapped into rank space to preserve first-value locality.
+        _resid_vid = v
+        if resid_sink !== nothing && ref_mode != :none
+            _C = setdiff(current_neighbors, target_list)   # sorted, unique, disjoint
+            if !isempty(_C)
+                target_list = _rankgap_forward(target_list, _C)
+                _resid_vid = _rank_of(v, _C)
+            end
+        end
+
+        # Encode target_list (residual region — gate the range coder)
+        if resid_sink !== nothing
+            rc_reset_region!(resid_sink); _RESID_SINK[] = resid_sink
+        end
         if enc_type == :interval
             if lr_split
-                _write_intervals_lr(wr, target_list, ie, mil; vertex_id=v, tight_intervals=tight_intervals)
+                _write_intervals_lr(wr, target_list, ie, mil; vertex_id=_resid_vid, tight_intervals=tight_intervals)
             else
-                write_intervals_and_residuals(wr, target_list, ie, mil; vertex_id=v, tight_intervals=tight_intervals)
+                write_intervals_and_residuals(wr, target_list, ie, mil; vertex_id=_resid_vid, tight_intervals=tight_intervals)
             end
         elseif enc_type == :delta
             if idx_mode && !sampled_idx
                 # Full index mode: count-prefixed delta (no stop terminators)
                 write_encoded_value(wr, T(length(target_list) + 1), ie)
                 if !isempty(target_list)
-                    write_delta(wr, target_list, ie; vertex_id=v)
+                    write_delta(wr, target_list, ie; vertex_id=_resid_vid)
                 end
             else
                 # Children mode (or sampled index): always uses stop_deltas for :delta
-                _write_stop_delta(wr, target_list, ie; vertex_id=v)
+                _write_stop_delta(wr, target_list, ie; vertex_id=_resid_vid)
             end
         elseif enc_type == :rle
             write_encoded_value(wr, T(length(target_list) + 1), ie)
             if !isempty(target_list)
                 deltas = delta_encode_vector(target_list)
-                write_hybrid_mix_encoded_list(wr, deltas, ie, true, mil, false; vertex_id=v)
+                write_hybrid_mix_encoded_list(wr, deltas, ie, true, mil, false; vertex_id=_resid_vid)
             end
+        end
+        if resid_sink !== nothing
+            _RESID_SINK[] = nothing
         end
 
         add_to_ref_window!(v)
@@ -4744,14 +5165,27 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
             _encode_cs_vertex!(w, v, current_neighbors)
         end
     end
+    # :context_range — finalize the three range streams (all empty otherwise)
+    if use_ctx_range
+        return (rc_finish!(resid_sink), rc_finish!(refdist_sink), brc_finish!(copy_sink))
+    end
+    return (UInt8[], UInt8[], UInt8[])
 end
 
 function read_cmdstream_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Type{T};
         integer_encoding::Symbol=:fibonacci, compact_copy::Bool=true,
         tight_intervals::Bool=true, ref_window_size::Int=64,
-        lr_split::Bool=false) where {T<:Unsigned}
+        lr_split::Bool=false,
+        ctx_range::Bool=false,
+        resid_bytes::Vector{UInt8}=UInt8[],
+        refdist_bytes::Vector{UInt8}=UInt8[],
+        copy_bytes::Vector{UInt8}=UInt8[]) where {T<:Unsigned}
 
     neighbor_lists = Dict{T,Vector{T}}()
+    resid_source   = ctx_range ? CtxRangeDecoder(resid_bytes) : nothing
+    refdist_source = ctx_range ? CtxRangeDecoder(refdist_bytes) : nothing
+    copy_source    = ctx_range ? BinRangeDecoder(copy_bytes) : nothing
+    _read_copy_bits(n::Int) = Bool[brc_decode_bit!(copy_source::BinRangeDecoder) for _ in 1:n]
 
     # Read stream metadata
     is_index_mode = read_bit(r)
@@ -4793,33 +5227,41 @@ function read_cmdstream_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, :
     fixwidth_ref = lr_split
     ref_dist_bits = fixwidth_ref ? max(Int(ceil(log2(ref_window_size + 1))), 1) : 0
 
-    # Helper to read encoded list body
+    # Helper to read encoded list body (residual region — gate the range decoder)
     function _read_cs_body(r_in::BitReader, v::T, enc_type::Symbol, mil::Int)
-        if enc_type == :interval
-            if lr_split
-                return _read_intervals_lr(r_in, ie, mil, T; vertex_id=v, tight_intervals=tight_intervals)
-            end
-            return read_intervals_and_residuals(r_in, ie, mil, T; vertex_id=v, tight_intervals=tight_intervals)
-        elseif enc_type == :delta
-            if is_index_mode && !is_sampled_index
-                # Full index mode: count-prefixed delta (no stop terminators)
+        if resid_source !== nothing
+            rc_reset_region!(resid_source::CtxRangeDecoder)
+            _RESID_SOURCE[] = resid_source
+        end
+        try
+            if enc_type == :interval
+                if lr_split
+                    return _read_intervals_lr(r_in, ie, mil, T; vertex_id=v, tight_intervals=tight_intervals)
+                end
+                return read_intervals_and_residuals(r_in, ie, mil, T; vertex_id=v, tight_intervals=tight_intervals)
+            elseif enc_type == :delta
+                if is_index_mode && !is_sampled_index
+                    # Full index mode: count-prefixed delta (no stop terminators)
+                    count = read_encoded_value(r_in, ie, T) - T(1)
+                    if count > 0
+                        return read_delta(r_in, ie, T; max_elements=Int(count), vertex_id=v)
+                    end
+                    return T[]
+                else
+                    # Children mode (or sampled index): always uses stop_deltas
+                    return _read_stop_delta(r_in, ie, T; vertex_id=v)
+                end
+            elseif enc_type == :rle
                 count = read_encoded_value(r_in, ie, T) - T(1)
                 if count > 0
-                    return read_delta(r_in, ie, T; max_elements=Int(count), vertex_id=v)
+                    return read_hybrid_mix_encoded_list(r_in, :index, ie, T; max_elements=Int(count), vertex_id=v)
                 end
                 return T[]
-            else
-                # Children mode (or sampled index): always uses stop_deltas
-                return _read_stop_delta(r_in, ie, T; vertex_id=v)
-            end
-        elseif enc_type == :rle
-            count = read_encoded_value(r_in, ie, T) - T(1)
-            if count > 0
-                return read_hybrid_mix_encoded_list(r_in, :index, ie, T; max_elements=Int(count), vertex_id=v)
             end
             return T[]
+        finally
+            resid_source === nothing || (_RESID_SOURCE[] = nothing)
         end
-        return T[]
     end
 
     for v_idx in 1:Int(vs)
@@ -4848,7 +5290,8 @@ function read_cmdstream_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, :
         is_ref = ref_mode != :none
 
         if is_ref
-            distance = fixwidth_ref ? T(read_value(r, ref_dist_bits, UInt64)) : read_encoded_value(r, ie, T)
+            distance = refdist_source !== nothing ? T(rc_decode_value!(refdist_source::CtxRangeDecoder)) :
+                       (fixwidth_ref ? T(read_value(r, ref_dist_bits, UInt64)) : read_encoded_value(r, ie, T))
             ref_idx = length(reference_window) - Int(distance) + 1
             ref_nbs = T[]
             if 1 <= ref_idx <= length(reference_window)
@@ -4856,8 +5299,19 @@ function read_cmdstream_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, :
                 ref_nbs = get(neighbor_lists, ref_v, T[])
             end
             ref_len = length(ref_nbs)
-            copy_bitmap = _read_adaptive_copy(r, ref_len, ie, T; compact_copy=compact_copy)
-            residuals = _read_cs_body(r, v, enc_type, mil)
+            copy_bitmap = copy_source !== nothing ? _read_copy_bits(ref_len) :
+                          _read_adaptive_copy(r, ref_len, ie, T; compact_copy=compact_copy)
+            # Copy-aware rank gaps: C = copied ids; decode Q in rank space then
+            # invert Q -> R.
+            _cs_vid = v; _cs_C = T[]
+            if resid_source !== nothing
+                _cs_C = reconstruct_from_reference(ref_nbs, copy_bitmap, T[])
+                isempty(_cs_C) || (_cs_vid = _rank_of(v, _cs_C))
+            end
+            residuals = _read_cs_body(r, _cs_vid, enc_type, mil)
+            if resid_source !== nothing && !isempty(_cs_C)
+                residuals = _rankgap_inverse(residuals, _cs_C)
+            end
             current_neighbors = reconstruct_from_reference(ref_nbs, copy_bitmap, residuals)
         else
             current_neighbors = _read_cs_body(r, v, enc_type, mil)

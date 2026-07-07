@@ -20,11 +20,12 @@ using ..CustomTypes: UInt24, UInt40
 using ..CustomLightGraphs: SimpleDiGraph, SimpleGraph, SimpleEdge
 using ..Graph: get_in_degrees, get_out_degrees, get_in_out_degrees, get_reverse_graph, subgraph
 using ..Clustering: leiden_partition
+using ..Distribution: get_graph_entropy
 using ..PageRank: PR
 
 export relabel_graph, relabel_vertices, relabel_vertices_score, relabel_vertices_lexicographic, relabel_vertices_rcm, relabel_vertices_webgraph_lex,
        relabel_vertices_llp, relabel_vertices_minhash, relabel_vertices_bisection,
-       relabel_graph_llp, relabel_graph_leiden_llp,
+       relabel_graph_llp, relabel_graph_leiden_llp, merge_small_clusters,
        relabel_graph_leiden_greedy, relabel_graph_rgb, relabel_graph_leiden_rgb,
        save_llp_ordering, load_llp_ordering,
        ordering_quality_metrics, print_ordering_metrics, compare_ordering_metrics
@@ -918,32 +919,41 @@ function relabel_graph_llp(g::AbstractGraph{T}; llp_mode::Symbol=:sym, passes::I
 end
 
 """
-    relabel_graph_leiden_llp(g::AbstractGraph{T}; llp_mode::Symbol=:sym, llp_passes::Int=5, sort_clusters::Symbol=:size_desc) where {T<:Unsigned}
+    merge_small_clusters(g, part, min_size) -> Vector{Int}
 
-Apply Leiden+LLP reordering: partition graph into fine Leiden communities, apply
-per-cluster LLP on each induced subgraph, then concatenate cluster orderings into
-a single global vertex ordering. Encodes as K=1 (no inter-cluster cost).
-
-Pipeline:
-1. Leiden community detection → fine clusters (typically thousands of small clusters)
-2. Sort clusters by size descending (for better sequential locality)
-3. For each cluster: extract induced subgraph, run LLP, sort vertices by LLP rank
-4. Concatenate all clusters' sorted vertices into global ordering
-5. Relabel graph by this ordering
-
-This ordering improves compression by ~0.3 BPE over plain LLP on SNAP datasets.
-
-@param g: the graph
-@param llp_mode: LLP neighbor mode for within-cluster LLP (:sym or :out or :in)
-@param llp_passes: number of LLP passes per cluster
-@param sort_clusters: how to order clusters (:size_desc = largest first)
-@returns (relabeled_graph, vertex_mapping::Dict{T,T})
+Merge every cluster smaller than `min_size` into the neighbouring cluster it
+shares the most edges with (one pass, smallest-first). `leiden_partition` here is
+a lightweight Louvain approximation that over-fragments into many tiny clusters;
+grouping the small ones improves within-cluster locality and hence compression
+across all reference-based encoders. Returns a new label vector; `min_size <= 1`
+is a no-op.
 """
-function relabel_graph_leiden_llp(g::AbstractGraph{T}; llp_mode::Symbol=:sym, llp_passes::Int=5, sort_clusters::Symbol=:size_desc) where {T<:Unsigned}
-    n = nv(g)
+function merge_small_clusters(g::AbstractGraph{T}, part::Vector{Int}, min_size::Int) where {T<:Unsigned}
+    min_size <= 1 && return part
+    n = Int(nv(g))
+    lab = copy(part)
+    verts = Dict{Int,Vector{Int}}()
+    for v in 1:n; push!(get!(verts, lab[v], Int[]), v); end
+    smalls = sort([l for (l, vs) in verts if length(vs) < min_size]; by = l -> length(verts[l]))
+    for l in smalls
+        haskey(verts, l) || continue
+        vs = verts[l]
+        length(vs) < min_size || continue
+        cnt = Dict{Int,Int}()
+        for v in vs
+            for u in outneighbors(g, T(v)); cl = lab[Int(u)]; cl == l || (cnt[cl] = get(cnt, cl, 0) + 1); end
+            for u in inneighbors(g, T(v));  cl = lab[Int(u)]; cl == l || (cnt[cl] = get(cnt, cl, 0) + 1); end
+        end
+        isempty(cnt) && continue
+        tgt = argmax(cnt)
+        for v in vs; lab[v] = tgt; end
+        append!(verts[tgt], vs); delete!(verts, l)
+    end
+    return lab
+end
 
-    # Step 1: Leiden partition → fine clusters
-    part = leiden_partition(g)
+# Build the concatenated per-cluster-LLP vertex order for a partition.
+function _leiden_llp_order(g::AbstractGraph{T}, part; llp_mode, llp_passes, sort_clusters) where {T<:Unsigned}
     label_to_idx = Dict{Int,Int}()
     fine_clusters = Vector{Vector{T}}()
     for v in vertices(g)
@@ -954,19 +964,11 @@ function relabel_graph_leiden_llp(g::AbstractGraph{T}; llp_mode::Symbol=:sym, ll
         end
         push!(fine_clusters[label_to_idx[l]], T(v))
     end
-
-    # Step 2: Sort clusters
     if sort_clusters == :size_desc
         sort!(fine_clusters, by=length, rev=true)
     end
-
-    n_clusters = length(fine_clusters)
-    top_sizes = sort([length(C) for C in fine_clusters], rev=true)[1:min(5, n_clusters)]
-    @info "Leiden+LLP: $n_clusters fine clusters, largest: $top_sizes"
-
-    # Step 3: Per-cluster LLP ordering
     new_order = T[]
-    sizehint!(new_order, n)
+    sizehint!(new_order, nv(g))
     for C in fine_clusters
         if length(C) <= 2
             append!(new_order, sort(C))
@@ -977,6 +979,56 @@ function relabel_graph_leiden_llp(g::AbstractGraph{T}; llp_mode::Symbol=:sym, ll
             append!(new_order, C)
         end
     end
+    return new_order, length(fine_clusters)
+end
+
+# Pick the small-cluster-merge threshold that minimises the cheap delta-encoding
+# entropy proxy (no encoder run). The proxy's minimum coincides with the true
+# BPE minimum (validated on Web-Google/Amazon), and the optimum is
+# dataset-dependent, so a single fixed threshold will not do.
+function _auto_merge_threshold(g::AbstractGraph{T}, part; llp_mode, llp_passes, sort_clusters,
+                               grid=[0, 10, 20, 50, 100, 200, 400, 800]) where {T<:Unsigned}
+    best_ms, best_de = 0, Inf
+    for ms in grid
+        p = ms <= 1 ? part : merge_small_clusters(g, part, ms)
+        order, _ = _leiden_llp_order(g, p; llp_mode, llp_passes, sort_clusters)
+        vmap = Dict{T,T}(old => T(i) for (i, old) in enumerate(order))
+        de = get_graph_entropy(relabel_graph(g, vmap), :bits_per_edge, :delta)
+        de < best_de && (best_de = de; best_ms = ms)
+    end
+    return best_ms
+end
+
+"""
+    relabel_graph_leiden_llp(g; llp_mode=:sym, llp_passes=5, sort_clusters=:size_desc,
+                             merge_clusters=nothing)
+
+`merge_clusters` controls the small-cluster merge (see [`merge_small_clusters`]):
+`nothing` (default) keeps the legacy behaviour with no merge; an `Int` uses that
+fixed min-size threshold; `:auto` sweeps a threshold grid and picks the one that
+minimises the delta-entropy proxy (dataset-adaptive, but orders the graph once
+per grid point — expensive on very large graphs, so prefer a fixed `Int` there).
+"""
+function relabel_graph_leiden_llp(g::AbstractGraph{T}; llp_mode::Symbol=:sym, llp_passes::Int=5,
+                                  sort_clusters::Symbol=:size_desc,
+                                  merge_clusters::Union{Nothing,Integer,Symbol}=nothing) where {T<:Unsigned}
+    # Step 1: Leiden partition → fine clusters (label vector)
+    part = leiden_partition(g)
+
+    # Step 2 (optional): merge small clusters
+    if merge_clusters === :auto
+        ms = _auto_merge_threshold(g, part; llp_mode, llp_passes, sort_clusters)
+        @info "Leiden+LLP: auto-selected merge min_size=$ms"
+        part = merge_small_clusters(g, part, ms)
+    elseif merge_clusters isa Integer && merge_clusters > 1
+        part = merge_small_clusters(g, part, Int(merge_clusters))
+    end
+
+    # Step 3: per-cluster LLP ordering
+    new_order, n_clusters = _leiden_llp_order(g, part; llp_mode, llp_passes, sort_clusters)
+    szc = Dict{Int,Int}(); for l in part; szc[l] = get(szc, l, 0) + 1; end
+    top_sizes = sort(collect(values(szc)), rev=true)[1:min(5, n_clusters)]
+    @info "Leiden+LLP: $n_clusters clusters, largest: $top_sizes"
 
     # Step 4: Build vertex mapping and relabel
     vertex_map = Dict{T,T}()

@@ -27,7 +27,7 @@ using ..Compression: huffman_encoding, get_huffman_codes!, decode_huffman_values
 	delta_encode_vector, write_elias_coding, read_elias_coding,
 	write_golomb, read_golomb, write_fibonacci, read_fibonacci,
 	write_zeta, read_zeta, write_compressed_graph_data, read_compressed_graph_data,
-	write_greedy_graph_data, read_greedy_graph_data,
+	write_greedy_graph_data, read_greedy_graph_data, parse_bg_ctxrange_index,
 	write_cmdstream_graph_data, read_cmdstream_graph_data,
 	COST_MODEL_FULL, COST_MODEL_FAST, DEFAULT_COST_MODEL
 
@@ -60,6 +60,7 @@ const INT_ENCODING_GOLOMB = 0x3
 const INT_ENCODING_FED = 0x4
 const INT_ENCODING_ZETA = 0x5
 const INT_ENCODING_FIBONACCI = 0x6
+const INT_ENCODING_CONTEXT_RANGE = 0x7
 #
 # ── Self-describing byte 2 layout ───────────────────────────────────────────
 # Algorithm IDs (0x00–0x0F): no additional params needed
@@ -124,6 +125,8 @@ function create_header_flags(graph_type::Symbol, coding_scheme::Symbol, integer_
         INT_ENCODING_ZETA
     elseif integer_encoding == :fibonacci
         INT_ENCODING_FIBONACCI
+    elseif integer_encoding == :context_range
+        INT_ENCODING_CONTEXT_RANGE
     else
         error("Unsupported integer encoding: $integer_encoding")
     end
@@ -161,6 +164,8 @@ function decode_header_flags(byte1::UInt8, byte2::UInt8)
         :zeta
     elseif integer_encoding_bits == INT_ENCODING_FIBONACCI
         :fibonacci
+    elseif integer_encoding_bits == INT_ENCODING_CONTEXT_RANGE
+        :context_range
     else
         error("Unknown integer encoding: $integer_encoding_bits")
     end
@@ -888,10 +893,6 @@ function write_bg_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString;
 		(gs & 0xff), ((gs >> 8) & 0xff), ((gs >> 16) & 0xff), ((gs >> 24) & 0xff), ((gs >> 32) & 0xff)
 	]
 
-	bw = BitWriter()
-
-	write_bytes(bw, header_bytes)
-
 	# Build sorted neighbor lists from graph
 	nls = Dict{V,Vector{V}}()
 	for v in vs
@@ -899,6 +900,36 @@ function write_bg_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString;
 	end
 
 	@info("writing BG compressed graph data")
+	if integer_encoding == :context_range
+		# Two-pass: structural bitstream + three range-coded side streams.
+		# Layout: [12 header][8-byte LE lengths ×3: struct, refdist, copy]
+		#         [struct bytes][refdist blob][copy blob][resid blob]
+		sbw = BitWriter()
+		resid_bytes, refdist_bytes, copy_bytes = write_greedy_graph_data(sbw, nls, coding_scheme, ref_window_size;
+			integer_encoding=:context_range, copy_blocks=copy_blocks,
+			adaptive_copy=copy_blocks, stop_deltas=stop_deltas,
+			compact_copy=true,
+			tight_intervals=true, fixwidth_ref=lr_split,
+			exact_costing=exact_costing, lr_split=lr_split,
+			multi_ref=multi_ref, adaptive_header=adaptive_header,
+			cost_model=cost_model, index_sample_k=index_sample_k)
+		flush_bitwriter(sbw; flush_last_bits=true)
+		struct_bytes = collect(get_bytes(sbw))
+		open(filename * ".mgz", "w") do f
+			write(f, UInt8.(header_bytes))
+			for L in (UInt64(length(struct_bytes)), UInt64(length(refdist_bytes)), UInt64(length(copy_bytes)))
+				for i in 0:7; write(f, UInt8((L >> (8*i)) & 0xff)); end
+			end
+			write(f, struct_bytes)
+			write(f, refdist_bytes)
+			write(f, copy_bytes)
+			write(f, resid_bytes)
+		end
+		return
+	end
+
+	bw = BitWriter()
+	write_bytes(bw, header_bytes)
 	write_greedy_graph_data(bw, nls, coding_scheme, ref_window_size;
 		integer_encoding=integer_encoding, copy_blocks=copy_blocks,
 		adaptive_copy=copy_blocks, stop_deltas=stop_deltas,
@@ -952,10 +983,6 @@ function write_cs_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString;
 		(gs & 0xff), ((gs >> 8) & 0xff), ((gs >> 16) & 0xff), ((gs >> 24) & 0xff), ((gs >> 32) & 0xff)
 	]
 
-	bw = BitWriter()
-
-	write_bytes(bw, header_bytes)
-
 	# Build sorted neighbor lists from graph
 	nls = Dict{V,Vector{V}}()
 	for v in vs
@@ -963,6 +990,28 @@ function write_cs_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString;
 	end
 
 	@info("writing CS compressed graph data")
+	if integer_encoding == :context_range
+		# Two-pass: structural bitstream + three range-coded side streams.
+		# Layout: [12 header][8-byte lens ×3][struct][refdist][copy][resid]
+		sbw = BitWriter()
+		resid_bytes, refdist_bytes, copy_bytes = write_cmdstream_graph_data(sbw, nls, coding_scheme, ref_window_size;
+			integer_encoding=:context_range, compact_copy=compact_copy,
+			tight_intervals=tight_intervals, lr_split=lr_split,
+			cost_model=cost_model, index_sample_k=index_sample_k)
+		flush_bitwriter(sbw; flush_last_bits=true)
+		struct_bytes = collect(get_bytes(sbw))
+		open(filename * ".mgz", "w") do f
+			write(f, UInt8.(header_bytes))
+			for L in (UInt64(length(struct_bytes)), UInt64(length(refdist_bytes)), UInt64(length(copy_bytes)))
+				for i in 0:7; write(f, UInt8((L >> (8*i)) & 0xff)); end
+			end
+			write(f, struct_bytes); write(f, refdist_bytes); write(f, copy_bytes); write(f, resid_bytes)
+		end
+		return
+	end
+
+	bw = BitWriter()
+	write_bytes(bw, header_bytes)
 	write_cmdstream_graph_data(bw, nls, coding_scheme, ref_window_size;
 		integer_encoding=integer_encoding, compact_copy=compact_copy,
 		tight_intervals=tight_intervals, lr_split=lr_split,
@@ -994,6 +1043,7 @@ function write_cg_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString,
 		clusters::Vector{Vector{T}};
 		coding_scheme::Symbol=:children,
 		params::CGParams=CGParams(),
+		integer_encoding::Symbol=params.varint,
 		progress::Union{Nothing,Function}=nothing) where {T<:Unsigned}
 	vs = vertices(g)
 	gs = convert(UInt64, length(vs))
@@ -1001,8 +1051,10 @@ function write_cg_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString,
 	if gs > MGS_MAX_SIZE
 		error("Input graph cannot have more than 2^40-1 vertices")
 	end
+	ctx_range = integer_encoding == :context_range
 	option_flags = encode_cg_params(params)
-	flag_byte1, flag_byte2 = create_header_flags(:directed, coding_scheme, params.varint, option_flags)
+	hdr_ie = ctx_range ? :context_range : params.varint
+	flag_byte1, flag_byte2 = create_header_flags(:directed, coding_scheme, hdr_ie, option_flags)
 
 	header_bytes = UInt8[
 		0x4d, 0x47, 0x53,
@@ -1010,6 +1062,26 @@ function write_cg_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString,
 		flag_byte1, flag_byte2,
 		(gs & 0xff), ((gs >> 8) & 0xff), ((gs >> 16) & 0xff), ((gs >> 24) & 0xff), ((gs >> 32) & 0xff)
 	]
+
+	if ctx_range
+		# Two-pass: structural bitstream + three range-coded side streams (children mode).
+		# Layout: [12 header][8-byte lens ×3: struct, refdist, copy][struct][refdist][copy][resid]
+		coding_scheme == :index && error(":context_range CG does not support index mode")
+		sbw = BitWriter()
+		stats = CGStats()
+		@info("writing CG compressed graph data (context_range)")
+		resid_bytes, refdist_bytes, copy_bytes = encode_level(sbw, g, clusters; params=params, stats=stats, progress=progress, ctx_range=true)
+		flush_bitwriter(sbw; flush_last_bits=true)
+		struct_bytes = collect(get_bytes(sbw))
+		open(filename * ".mgz", "w") do f
+			write(f, UInt8.(header_bytes))
+			for L in (UInt64(length(struct_bytes)), UInt64(length(refdist_bytes)), UInt64(length(copy_bytes)))
+				for i in 0:7; write(f, UInt8((L >> (8*i)) & 0xff)); end
+			end
+			write(f, struct_bytes); write(f, refdist_bytes); write(f, copy_bytes); write(f, resid_bytes)
+		end
+		return
+	end
 
 	bw = BitWriter()
 
@@ -1160,8 +1232,10 @@ function load_compressed_mgs3_graph(filename::AbstractString)
 			compact_copy=p.compact_copy, tight_intervals=p.tight_intervals,
 			ref_window_size=p.ref_window_size, lr_split=p.lr_split)
 	elseif PARAM_CG_BASE <= byte2 <= PARAM_CG_MAX
-		p = decode_cg_params(byte2; varint=compression)
-		load_cg_mgs3_graph(f, graph_type, gs; params=p, coding_scheme=encoding)
+		# :context_range files store fibonacci-coded structural integers; the range
+		# coder handles residuals separately (signalled by compression==:context_range).
+		p = decode_cg_params(byte2; varint=(compression == :context_range ? :fibonacci : compression))
+		load_cg_mgs3_graph(f, graph_type, gs; params=p, coding_scheme=encoding, integer_encoding=compression)
 	else
 		error("Unknown byte2: 0x$(string(byte2, base=16, pad=2))")
 	end
@@ -1318,7 +1392,21 @@ function load_greedy_mgs3_graph(io::IO, graph_type::Symbol, coding_scheme::Symbo
 	@info("adding vertices")
 	add_vertices!(g, gs)
 
-	reader = BitReader(io)
+	# :context_range — split the layout:
+	# [8-byte lens ×3: struct, refdist, copy][struct][refdist][copy][resid]
+	ctx_range = integer_encoding == :context_range
+	resid_bytes = UInt8[]; refdist_bytes = UInt8[]; copy_bytes = UInt8[]
+	if ctx_range
+		rd8() = (b = read(io, 8); L = UInt64(0); for i in 1:8; L |= UInt64(b[i]) << (8*(i-1)); end; L)
+		slen = rd8(); rdlen = rd8(); cplen = rd8()
+		struct_bytes = read(io, Int(slen))
+		refdist_bytes = read(io, Int(rdlen))
+		copy_bytes = read(io, Int(cplen))
+		resid_bytes = read(io)                      # remaining bytes = residual blob
+		reader = BitReader(IOBuffer(struct_bytes))
+	else
+		reader = BitReader(io)
+	end
 
 	@info("reading greedy-compressed graph data")
 	neighbor_lists = read_greedy_graph_data(reader, V(gs), coding_scheme, V;
@@ -1329,7 +1417,9 @@ function load_greedy_mgs3_graph(io::IO, graph_type::Symbol, coding_scheme::Symbo
 		split_residual=split_residual, compact_copy=compact_copy,
 		tight_intervals=tight_intervals,
 		lr_split=lr_split, multi_ref=multi_ref,
-		adaptive_header=adaptive_header)
+		adaptive_header=adaptive_header,
+		ctx_range=ctx_range, resid_bytes=resid_bytes,
+		refdist_bytes=refdist_bytes, copy_bytes=copy_bytes)
 
 	@info("building graph from neighbor lists")
 	for (source_vertex, neighbors) in neighbor_lists
@@ -1363,13 +1453,28 @@ function load_cs_mgs3_graph(io::IO, graph_type::Symbol, coding_scheme::Symbol, g
 	@info("generating graph (CS mode)")
 	add_vertices!(g, gs)
 
-	reader = BitReader(io)
+	# :context_range — split [8-byte lens ×3][struct][refdist][copy][resid]
+	ctx_range = integer_encoding == :context_range
+	resid_bytes = UInt8[]; refdist_bytes = UInt8[]; copy_bytes = UInt8[]
+	if ctx_range
+		rd8() = (b = read(io, 8); L = UInt64(0); for i in 1:8; L |= UInt64(b[i]) << (8*(i-1)); end; L)
+		slen = rd8(); rdlen = rd8(); cplen = rd8()
+		struct_bytes = read(io, Int(slen))
+		refdist_bytes = read(io, Int(rdlen))
+		copy_bytes = read(io, Int(cplen))
+		resid_bytes = read(io)
+		reader = BitReader(IOBuffer(struct_bytes))
+	else
+		reader = BitReader(io)
+	end
 
 	@info("reading CS-compressed graph data")
 	neighbor_lists = read_cmdstream_graph_data(reader, V(gs), coding_scheme, V;
 		integer_encoding=integer_encoding, compact_copy=compact_copy,
 		tight_intervals=tight_intervals, ref_window_size=ref_window_size,
-		lr_split=lr_split)
+		lr_split=lr_split,
+		ctx_range=ctx_range, resid_bytes=resid_bytes,
+		refdist_bytes=refdist_bytes, copy_bytes=copy_bytes)
 
 	@info("building graph from neighbor lists")
 	for (source_vertex, neighbors) in neighbor_lists
@@ -1392,7 +1497,8 @@ end
 Load graph from CG compressed MGS v3 format.
 """
 function load_cg_mgs3_graph(io::IO, graph_type::Symbol, gs::UInt64;
-		params::CGParams=CGParams(), coding_scheme::Symbol=:children)
+		params::CGParams=CGParams(), coding_scheme::Symbol=:children,
+		integer_encoding::Symbol=:fibonacci)
 	n_bits_v = convert(UInt8, ceil(log(2, gs)))
 	V = infer_uint_custom_type(n_bits_v)
 
@@ -1400,7 +1506,20 @@ function load_cg_mgs3_graph(io::IO, graph_type::Symbol, gs::UInt64;
 
 	@info("generating graph (CG mode)")
 
-	reader = BitReader(io)
+	# :context_range — split [8-byte lens ×3][struct][refdist][copy][resid]
+	ctx_range = integer_encoding == :context_range
+	resid_bytes = UInt8[]; refdist_bytes = UInt8[]; copy_bytes = UInt8[]
+	if ctx_range
+		rd8() = (b = read(io, 8); L = UInt64(0); for i in 1:8; L |= UInt64(b[i]) << (8*(i-1)); end; L)
+		slen = rd8(); rdlen = rd8(); cplen = rd8()
+		struct_bytes = read(io, Int(slen))
+		refdist_bytes = read(io, Int(rdlen))
+		copy_bytes = read(io, Int(cplen))
+		resid_bytes = read(io)
+		reader = BitReader(IOBuffer(struct_bytes))
+	else
+		reader = BitReader(io)
+	end
 
 	if coding_scheme == :index
 		# Read cluster offset table: 6-bit entry_width + 32-bit K + (2K+1) entries
@@ -1413,7 +1532,8 @@ function load_cg_mgs3_graph(io::IO, graph_type::Symbol, gs::UInt64;
 	end
 
 	@info("reading CG-compressed graph data")
-	neighbor_lists = decode_level(reader, params; T=V, directed=directed, coding_scheme=coding_scheme)
+	neighbor_lists = decode_level(reader, params; T=V, directed=directed, coding_scheme=coding_scheme,
+		ctx_range=ctx_range, resid_bytes=resid_bytes, refdist_bytes=refdist_bytes, copy_bytes=copy_bytes)
 
 	# Build graph from decoded neighbor lists
 	g = directed ? SimpleDiGraph{V}() : SimpleGraph{V}()
@@ -1436,15 +1556,21 @@ end
 Load an MGS v3.2 compressed graph with sampled index and return an object
 supporting O(k) random access to any vertex's neighbor list.
 
-Returns a named tuple `(n, m, neighbors, algorithm)` where:
+Returns a named tuple `(n, m, neighbors, algorithm, ...)` where:
 - `n`: number of vertices
-- `m`: number of edges
+- `m`: number of edges (-1 in the true-seek path, where it is not computed)
 - `neighbors(v)`: function that returns sorted neighbor list of vertex v (1-indexed)
 - `algorithm`: symbol (:bg, :cs, or :cg)
 
-The `neighbors` function decompresses the entire graph on first call and caches it,
-providing O(1) access to any vertex thereafter. For true streaming random access,
-a block-level decoder would seek to the sampled offset and decode at most k vertices.
+Two backends:
+- **BG + :context_range + sampled index** → *true* O(k) random access: `neighbors(v)`
+  seeks to the chunk containing v (granularity = sample_k), spins up fresh range
+  decoders on that chunk's byte slice, decodes the chunk, and recursively
+  materialises any referenced vertex living in an earlier chunk. Chunks are
+  memoised. The tuple also carries `stats` (`chunks_decoded`, `total_chunks`,
+  `samp_k`) and `reset_fn()` (clears the memo for cold-seek measurement).
+- **All other formats** → the graph is fully decoded once and cached, giving O(1)
+  access to any vertex thereafter (no per-vertex seek).
 
 # Example
 ```julia
@@ -1453,7 +1579,95 @@ println("Graph: \$(idx.n) vertices, \$(idx.m) edges")
 nbrs = idx.neighbors(42)  # get neighbors of vertex 42
 ```
 """
+# ── True random-access reader: BG + :context_range + sampled index ────────────
+# Returns (n, m, neighbors, algorithm, stats) where `neighbors(v)` seeks to the
+# chunk containing v (granularity = sample_k), decodes that chunk, and recursively
+# materialises any referenced vertex living in an earlier chunk. Chunks are
+# memoised, so repeated access is O(1) after the first touch. `stats.chunks_decoded`
+# reports how many chunks were decoded (for verifying true seek vs full decode).
+function _load_bg_ctxrange_random_access(filename::AbstractString, graph_type::Symbol,
+		gs::UInt64, params)
+	# Re-read the file body (header already validated by caller).
+	local struct_bytes, refdist_bytes, copy_bytes, resid_bytes
+	open(filename, "r") do io
+		read(io, 12)  # skip header
+		rd8() = (b = read(io, 8); L = UInt64(0); for i in 1:8; L |= UInt64(b[i]) << (8*(i-1)); end; L)
+		slen = rd8(); rdlen = rd8(); cplen = rd8()
+		struct_bytes  = read(io, Int(slen))
+		refdist_bytes = read(io, Int(rdlen))
+		copy_bytes    = read(io, Int(cplen))
+		resid_bytes   = read(io)
+	end
+
+	n_bits_v = convert(UInt8, ceil(log(2, gs)))
+	T = infer_uint_custom_type(n_bits_v)
+	vs = Int(gs)
+	meta = parse_bg_ctxrange_index(struct_bytes, vs)
+	samp_k = meta.samp_k
+	rws = params.ref_window_size
+
+	memo = Dict{Int,Dict{T,Vector{T}}}()
+	chunks_decoded = Ref(0)
+	chunk_of(u::Int) = ((u - 1) ÷ samp_k) + 1
+
+	# Forward declaration for mutual recursion (chunk → resolver → chunk).
+	local get_neighbors_v
+	function materialize_chunk(c::Int)
+		haskey(memo, c) && return memo[c]
+		cs = (c - 1) * samp_k + 1
+		ce = min(c * samp_k, vs)
+		seed_window = T[T(u) for u in max(1, cs - rws):(cs - 1)]
+		reader = BitReader(IOBuffer(struct_bytes))
+		nls = read_greedy_graph_data(reader, T(gs), :index, T;
+			integer_encoding=:context_range,
+			copy_blocks=params.copy_blocks, adaptive_copy=params.adaptive_copy,
+			ref_window_size=params.ref_window_size, fixwidth_ref=params.fixwidth_ref,
+			stop_deltas=params.stop_deltas, compact_copy=params.compact_copy,
+			tight_intervals=params.tight_intervals, lr_split=params.lr_split,
+			adaptive_header=params.adaptive_header,
+			ctx_range=true, resid_bytes=resid_bytes, refdist_bytes=refdist_bytes,
+			copy_bytes=copy_bytes,
+			decode_range=cs:ce, seed_window=seed_window, ref_resolver=get_neighbors_v)
+		memo[c] = nls
+		chunks_decoded[] += 1
+		return nls
+	end
+	get_neighbors_v = function(u)
+		return materialize_chunk(chunk_of(Int(u)))[T(u)]
+	end
+
+	function _neighbors(v::Integer)
+		1 <= v <= vs || error("Vertex $v out of range [1, $vs]")
+		return sort(get_neighbors_v(T(v)))
+	end
+
+	return (n=vs, m=-1, neighbors=_neighbors, algorithm=:bg,
+		stats=(chunks_decoded=chunks_decoded, total_chunks=meta.n_sampled, samp_k=samp_k),
+		reset_fn=() -> (empty!(memo); chunks_decoded[] = 0))
+end
+
 function load_indexed_mgs3_graph(filename::AbstractString)
+	# Fast path: BG + :context_range + sampled index supports true O(k) random
+	# access via chunked range streams — no upfront full decode.
+	open(filename, "r") do f
+		header = read(f, 12)
+		if header[1:3] == [0x4d, 0x47, 0x53]
+			flag_byte1 = header[6]; flag_byte2 = header[7]
+			graph_type, encoding, compression, byte2 = decode_header_flags(flag_byte1, flag_byte2)
+			gs_bytes = header[8:12]
+			gs = UInt64(gs_bytes[1]) | (UInt64(gs_bytes[2]) << 8) | (UInt64(gs_bytes[3]) << 16) |
+				(UInt64(gs_bytes[4]) << 24) | (UInt64(gs_bytes[5]) << 32)
+			is_bg = byte2 == ALG_BG || (PARAM_BG_BASE <= byte2 <= PARAM_BG_MAX)
+			if is_bg && encoding == :index && compression == :context_range
+				p = byte2 == ALG_BG ? _bg_default_params() : decode_bg_params(byte2)
+				return _load_bg_ctxrange_random_access(filename, graph_type, gs, p)
+			end
+		end
+		return nothing
+	end |> ra -> ra === nothing ? _load_indexed_mgs3_graph_fulldecode(filename) : ra
+end
+
+function _load_indexed_mgs3_graph_fulldecode(filename::AbstractString)
 	# Load full graph (uses sequential decode internally)
 	g = load_compressed_mgs3_graph(filename)
 	n = Int(nv(g))
@@ -1482,9 +1696,9 @@ function load_indexed_mgs3_graph(filename::AbstractString)
 		end
 	end
 
-	function _neighbors(v::Int)
+	function _neighbors(v::Integer)
 		1 <= v <= n || error("Vertex $v out of range [1, $n]")
-		return adj[v]
+		return adj[Int(v)]
 	end
 
 	return (n=n, m=m, neighbors=_neighbors, algorithm=alg)

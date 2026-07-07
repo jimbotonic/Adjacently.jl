@@ -469,7 +469,17 @@ Per-vertex ref delta encoding. For each vertex in order:
 """
 function _write_fixwidth_ref_deltas(w::BitWriter, use_ref_vec::Vector{Bool},
                                     ref_delta_vec::Vector{UInt32}, window::Int;
-                                    vlc::Bool=false)
+                                    vlc::Bool=false, refdist_sink=nothing)
+    if refdist_sink !== nothing
+        # :context_range — use-ref flag stays in the bitstream, delta → range coder.
+        for idx in 1:length(use_ref_vec)
+            write_bit(w, use_ref_vec[idx])
+            if use_ref_vec[idx]
+                Compression.rc_encode_value!(refdist_sink, UInt64(ref_delta_vec[idx]))
+            end
+        end
+        return
+    end
     if vlc
         for idx in 1:length(use_ref_vec)
             write_bit(w, use_ref_vec[idx])
@@ -498,9 +508,19 @@ end
 
 Read per-vertex ref delta encoding written by `_write_fixwidth_ref_deltas`.
 """
-function _read_fixwidth_ref_deltas(r::BitReader, s::Int, window::Int; vlc::Bool=false)
+function _read_fixwidth_ref_deltas(r::BitReader, s::Int, window::Int; vlc::Bool=false, refdist_source=nothing)
     use_ref_vec = Vector{Bool}(undef, s)
     ref_delta_vec = zeros(UInt32, s)
+    if refdist_source !== nothing
+        for idx in 1:s
+            has_ref = read_bit(r)
+            use_ref_vec[idx] = has_ref
+            if has_ref
+                ref_delta_vec[idx] = UInt32(Compression.rc_decode_value!(refdist_source))
+            end
+        end
+        return use_ref_vec, ref_delta_vec
+    end
     if vlc
         for idx in 1:s
             has_ref = read_bit(r)
@@ -1318,7 +1338,68 @@ Inputs:
 - P::Vector{Vector{T}}: list of clusters with global vertex ids
 - params::CGParams: encoding parameters
 """
-function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; params::CGParams=CGParams(), stats::Union{Nothing,CGStats}=nothing, progress::Union{Nothing,Function}=nothing, cluster_offsets::Union{Nothing,Vector{Int}}=nothing) where {T<:Unsigned}
+# CG-2 helper: raw copy bitmap (length ref_len) → binary range coder.
+function _write_ctx_copy!(copy_sink, ref_positions, ref_len::Int)
+    bm = fill(false, ref_len)
+    for p in ref_positions
+        pi = Int(p)
+        if 1 <= pi <= ref_len; bm[pi] = true; end
+    end
+    for b in bm
+        Compression.brc_encode_bit!(copy_sink, b)
+    end
+    return nothing
+end
+
+# CG-2: encode all of a cluster's copy bitmaps into the binary coder. Kept as a
+# standalone function so the BinRangeEncoder never appears inside encode_level's
+# body — an inline reference there miscompiles that (very large) function.
+function _write_cluster_copy!(copy_sink, use_ref_vec::Vector{Bool}, ref_positions_list,
+                              ref_len_list, s::Int)
+    for idx_local in 1:s
+        if use_ref_vec[idx_local]
+            _write_ctx_copy!(copy_sink, ref_positions_list[idx_local], Int(ref_len_list[idx_local]))
+        end
+    end
+    return nothing
+end
+
+function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; params::CGParams=CGParams(), stats::Union{Nothing,CGStats}=nothing, progress::Union{Nothing,Function}=nothing, cluster_offsets::Union{Nothing,Vector{Int}}=nothing, ctx_range::Bool=false) where {T<:Unsigned}
+    # :context_range — residual (additions/raw) integers route to a streaming range
+    # coder; structural integers stay fibonacci in the bitstream. Requires the clean
+    # per-vertex path (directed + no bitset/mgs/block alternatives).
+    if ctx_range && (!is_directed(g) || params.intra_mgs || params.intra_block_try || cluster_offsets !== nothing ||
+                     (params.intra_ref_enabled && !params.intra_ref_fixwidth))
+        error(":context_range CG requires a directed graph, children mode, intra_mgs/intra_block_try disabled, and (if refs enabled) intra_ref_fixwidth")
+    end
+    Compression._RESID_SINK[] = nothing   # clear any leaked global state from a prior call
+    # Function barrier (fixes a Julia-1.12 flaky segfault): constructing the
+    # range-coder sinks here and threading them into a *separate* worker — as
+    # untyped params so each call specializes on the concrete sink type — keeps the
+    # enormous encode_level body from carrying Union{Nothing,CtxRangeEncoder}/
+    # BinRangeEncoder locals across its whole extent. That union-bloat pushed the
+    # 1.12 optimizer past a threshold and miscompiled even the fibonacci
+    # (ctx_range=false) path into a nondeterministic crash. With the barrier the
+    # fib call specializes _encode_level_body! on Nothing sinks (all ctx branches
+    # constant-folded out → clean-HEAD codegen); the ctx call specializes on the
+    # coder types.
+    if ctx_range
+        resid_sink   = Compression.CtxRangeEncoder()   # residuals (additions/raw)
+        refdist_sink = Compression.CtxRangeEncoder()   # ref deltas (CG-3)
+        copy_sink    = Compression.BinRangeEncoder()   # copy bitmap (CG-2)
+        _encode_level_body!(w, g, P, params, stats, progress, cluster_offsets, resid_sink, refdist_sink, copy_sink)
+        # finalize + return (residual, refdist, copy) range streams
+        return (Compression.rc_finish!(resid_sink), Compression.rc_finish!(refdist_sink), Compression.brc_finish!(copy_sink))
+    else
+        _encode_level_body!(w, g, P, params, stats, progress, cluster_offsets, nothing, nothing, nothing)
+        return nothing
+    end
+end
+
+# @noinline preserves the function barrier — inlining the worker back into the thin
+# wrapper would reintroduce the union-typed sink locals into a single huge method and
+# risk resurfacing the Julia-1.12 codegen miscompilation (see encode_level comment).
+@noinline function _encode_level_body!(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}, params::CGParams, stats::Union{Nothing,CGStats}, progress::Union{Nothing,Function}, cluster_offsets::Union{Nothing,Vector{Int}}, resid_sink, refdist_sink, copy_sink) where {T<:Unsigned}
     n = nv(g)
     directed = is_directed(g)
 
@@ -1668,7 +1749,7 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                 local hb0 = _total_bits(w)
                 if params.intra_ref_fixwidth
                     # Fixed-width (or VLC): 1-bit flag + delta encoding per ref vertex
-                    _write_fixwidth_ref_deltas(w, use_ref_vec, ref_delta_vec, params.intra_ref_window; vlc=params.intra_ref_vlc)
+                    _write_fixwidth_ref_deltas(w, use_ref_vec, ref_delta_vec, params.intra_ref_window; vlc=params.intra_ref_vlc, refdist_sink=refdist_sink)
                 else
                     # Legacy: byte-padded bitmap + varint delta list
                     Compression.write_bitpacked_bitmap(w, use_ref_vec)
@@ -1747,8 +1828,27 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                     ref_positions = ref_positions_list[idx_local]
                     additions = additions_list[idx_local]
                     ref_len = ref_len_list[idx_local]
+                    # Copy-aware rank gaps: when the residual range coder is active,
+                    # recode residual (addition) ids as ranks in the complement of the
+                    # copied set C = all_nl \ additions (cluster-local universe 1:s).
+                    # The zigzag vertex id is mapped into the same rank space.
+                    if resid_sink !== nothing
+                        _C = setdiff(all_nl[idx_local], additions)
+                        if !isempty(_C)
+                            additions = Compression._rankgap_forward(additions, _C)
+                            if _zz_vid !== nothing
+                                _zz_vid = Compression._rank_of(_zz_vid, _C)
+                            end
+                        end
+                    end
                     local bpos0 = _total_bits(pw)
-                    if params.intra_copy_adaptive && params.intra_copy_blocks
+                    if copy_sink !== nothing
+                        # CG-2: raw copy bitmap (length ref_len) → binary range coder,
+                        # REPLACING the bitstream copy (decoder reads ref_len bits, no
+                        # mode flag/length). Safe in the hot loop now because the function
+                        # barrier specializes this worker on the concrete copy_sink type.
+                        _write_ctx_copy!(copy_sink, ref_positions, Int(ref_len))
+                    elseif params.intra_copy_adaptive && params.intra_copy_blocks
                         # 3-way adaptive: use stored decision from search phase
                         local _cm = copy_mode_vec[idx_local]
                         if _cm == 0x00
@@ -1800,6 +1900,10 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                     local bpos1 = _total_bits(pw)
                     # additions: MGS intervals, custom intervals, or plain delta
                     local ah0 = _total_bits(pw)
+                    if resid_sink !== nothing
+                        Compression.rc_reset_region!(resid_sink)
+                        Compression._RESID_SINK[] = resid_sink
+                    end
                     if (params.intra_intervals || params.intra_greedy_mil) && params.intra_lr_split
                         _write_ir_lr(pw, additions, :fibonacci, mil_vec[idx_local], _zz_vid; tight_deltas=params.intra_tight_deltas)
                     elseif params.intra_intervals || params.intra_greedy_mil
@@ -1851,6 +1955,9 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                             end
                         end
                     end
+                    if resid_sink !== nothing
+                        Compression._RESID_SINK[] = nothing
+                    end
                     local b3 = _total_bits(pw)
                     if stats !== nothing
                         # positions bitmap is copy payload; additions include intervals/singles payload
@@ -1863,6 +1970,10 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                     # raw
                     nl = all_nl[idx_local]
                     local rb0 = _total_bits(pw)
+                    if resid_sink !== nothing
+                        Compression.rc_reset_region!(resid_sink)
+                        Compression._RESID_SINK[] = resid_sink
+                    end
                     if (params.intra_intervals || params.intra_greedy_mil) && params.intra_lr_split
                         _write_ir_lr(pw, nl, :fibonacci, mil_vec[idx_local], _zz_vid; tight_deltas=params.intra_tight_deltas)
                     elseif params.intra_intervals || params.intra_greedy_mil
@@ -1884,6 +1995,9 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                         if !isempty(nl)
                             write_delta(pw, nl, :fibonacci; vertex_id=_zz_vid)
                         end
+                    end
+                    if resid_sink !== nothing
+                        Compression._RESID_SINK[] = nothing
                     end
                     if stats !== nothing
                         stats.bits_intra_raw += _total_bits(pw) - rb0
@@ -2047,6 +2161,7 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
         end
     end
 
+    # Sinks are finalized by the encode_level wrapper (function barrier).
     return nothing
 end
 
@@ -2077,7 +2192,11 @@ end
 Decode one CG coarsening level from the bitstream.
 Returns a `Dict{T, Vector{T}}` mapping global vertex ID → sorted outneighbors.
 """
-function decode_level(r::BitReader, params::CGParams; T::Type{<:Unsigned}=UInt32, directed::Bool=true, coding_scheme::Symbol=:children)
+function decode_level(r::BitReader, params::CGParams; T::Type{<:Unsigned}=UInt32, directed::Bool=true, coding_scheme::Symbol=:children, ctx_range::Bool=false, resid_bytes::Vector{UInt8}=UInt8[], refdist_bytes::Vector{UInt8}=UInt8[], copy_bytes::Vector{UInt8}=UInt8[])
+    Compression._RESID_SOURCE[] = nothing   # clear any leaked global state from a prior call
+    resid_source   = ctx_range ? Compression.CtxRangeDecoder(resid_bytes) : nothing
+    refdist_source = ctx_range ? Compression.CtxRangeDecoder(refdist_bytes) : nothing
+    copy_source    = ctx_range ? Compression.BinRangeDecoder(copy_bytes) : nothing
     # ----------------------------------------------------------------
     # Section 1: Read cluster membership
     # ----------------------------------------------------------------
@@ -2172,7 +2291,7 @@ function decode_level(r::BitReader, params::CGParams; T::Type{<:Unsigned}=UInt32
             if params.intra_ref_enabled
                 if params.intra_ref_fixwidth
                     # Fixed-width (or VLC): 1-bit flag + delta encoding per ref vertex
-                    use_ref_vec, ref_delta_vec = _read_fixwidth_ref_deltas(r, s, params.intra_ref_window; vlc=params.intra_ref_vlc)
+                    use_ref_vec, ref_delta_vec = _read_fixwidth_ref_deltas(r, s, params.intra_ref_window; vlc=params.intra_ref_vlc, refdist_source=refdist_source)
                     has_any_ref = any(use_ref_vec)
                 else
                     # Legacy: byte-padded bitmap + varint delta list
@@ -2250,7 +2369,13 @@ function decode_level(r::BitReader, params::CGParams; T::Type{<:Unsigned}=UInt32
                     ref_len = length(ref_list)
 
                     # Read copied positions from reference
-                    if params.intra_copy_adaptive && params.intra_copy_blocks
+                    if copy_source !== nothing
+                        # CG-2: read ref_len raw bits from the binary range decoder
+                        copied_vals = Int[]
+                        for p in 1:ref_len
+                            if Compression.brc_decode_bit!(copy_source); push!(copied_vals, ref_list[p]); end
+                        end
+                    elseif params.intra_copy_adaptive && params.intra_copy_blocks
                         # Nested mode bits: outer=1 → bitmap; outer=0,inner=0 → copy-blocks;
                         #                   outer=0,inner=1 → complement (skipped positions)
                         copied_vals = Int[]
@@ -2293,7 +2418,19 @@ function decode_level(r::BitReader, params::CGParams; T::Type{<:Unsigned}=UInt32
                         copied_vals = Int[]
                     end
 
-                    # Read additions
+                    # Copy-aware rank gaps: C = copied ids (cluster-local). Map the
+                    # zigzag vertex id into rank space for the read, invert Q -> R after.
+                    _rg_active = resid_source !== nothing && !isempty(copied_vals)
+                    _rg_C = _rg_active ? sort(copied_vals) : Int[]
+                    if _rg_active && _zz_vid !== nothing
+                        _zz_vid = T(Compression._rank_of(Int(_zz_vid), _rg_C))
+                    end
+
+                    # Read additions (residual region — gate the range decoder)
+                    if resid_source !== nothing
+                        Compression.rc_reset_region!(resid_source)
+                        Compression._RESID_SOURCE[] = resid_source
+                    end
                     local additions::Vector{Int}
                     if (params.intra_intervals || params.intra_greedy_mil) && params.intra_lr_split
                         additions = Int.(_read_ir_lr(r, :fibonacci, mil_vec[idx_local], T, _zz_vid; tight_deltas=params.intra_tight_deltas))
@@ -2333,11 +2470,22 @@ function decode_level(r::BitReader, params::CGParams; T::Type{<:Unsigned}=UInt32
                             additions = Int[]
                         end
                     end
+                    if resid_source !== nothing
+                        Compression._RESID_SOURCE[] = nothing
+                    end
 
+                    # Copy-aware rank gaps: invert Q -> R using C = copied ids.
+                    if _rg_active
+                        additions = Compression._rankgap_inverse(additions, _rg_C)
+                    end
                     # Combine copied + additions
                     nl_local = sort(vcat(copied_vals, additions))
                 else
-                    # Raw mode
+                    # Raw mode (residual region — gate the range decoder)
+                    if resid_source !== nothing
+                        Compression.rc_reset_region!(resid_source)
+                        Compression._RESID_SOURCE[] = resid_source
+                    end
                     if (params.intra_intervals || params.intra_greedy_mil) && params.intra_lr_split
                         nl_local = Int.(_read_ir_lr(r, :fibonacci, mil_vec[idx_local], T, _zz_vid; tight_deltas=params.intra_tight_deltas))
                     elseif params.intra_intervals || params.intra_greedy_mil
@@ -2358,6 +2506,9 @@ function decode_level(r::BitReader, params::CGParams; T::Type{<:Unsigned}=UInt32
                         else
                             nl_local = Int[]
                         end
+                    end
+                    if resid_source !== nothing
+                        Compression._RESID_SOURCE[] = nothing
                     end
                 end
 

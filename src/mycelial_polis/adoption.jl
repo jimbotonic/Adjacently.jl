@@ -57,6 +57,17 @@ function threshold_adopt!(world::World, exposures_S::Vector{Float32},
     pr_global = get_principles(p)
     g_s = layer(world.multiplex, :S)
     dcs_active = world.dcs !== nothing
+    # Saturation cap: if `growth_ceiling_frac < 1.0` and the committed
+    # pool has already hit the ceiling, gate further promotions into
+    # the committed bracket (computed once per step from start-of-step
+    # state; the one-step lag is benign).
+    gc = Float64(get(p, :growth_ceiling_frac, 1.0))
+    cap_reached = false
+    if gc < 1.0
+        n_committed_start = count(is_committed, world.agents)
+        cap_reached = n_committed_start >= round(Int, gc * length(world.agents))
+    end
+    disable_nm = Bool(get(p, :disable_nm_effect, false))
     @inbounds for a in world.agents
         a.role === :removed && continue
         # Per-cell principle resolution when DCS is active.
@@ -64,7 +75,8 @@ function threshold_adopt!(world::World, exposures_S::Vector{Float32},
         drive = _drive(a, g_s, exposures_S, exposures_C, p, pr)
         a.awareness = clamp(0.7f0 * a.awareness + 0.3f0 * drive, 0f0, 1f0)
         _maybe_advance_role!(a, drive, p.stage_thresholds; principles=pr,
-                              disable_nm_effect = Bool(get(p, :disable_nm_effect, false)))
+                              disable_nm_effect = disable_nm,
+                              block_committed_promotion = cap_reached)
     end
     return world
 end
@@ -100,6 +112,13 @@ function complex_contagion_adopt!(world::World, exposures_S::Vector{Float32},
     theta_cc = p.theta_cc
     user_rank = ROLE_RANK[:user]
     dcs_active = world.dcs !== nothing
+    gc = Float64(get(p, :growth_ceiling_frac, 1.0))
+    cap_reached = false
+    if gc < 1.0
+        n_committed_start = count(is_committed, world.agents)
+        cap_reached = n_committed_start >= round(Int, gc * length(world.agents))
+    end
+    disable_nm = Bool(get(p, :disable_nm_effect, false))
     @inbounds for a in world.agents
         a.role === :removed && continue
         pr = dcs_active ? cell_principles_for(world, world.dcs, a.id) : pr_global
@@ -116,7 +135,8 @@ function complex_contagion_adopt!(world::World, exposures_S::Vector{Float32},
         end
         (m_i >= k_cc && trust >= theta_cc) || continue
         _maybe_advance_role!(a, drive, p.stage_thresholds; principles=pr,
-                              disable_nm_effect = Bool(get(p, :disable_nm_effect, false)))
+                              disable_nm_effect = disable_nm,
+                              block_committed_promotion = cap_reached)
     end
     return world
 end

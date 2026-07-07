@@ -83,6 +83,10 @@ include("clustering.jl")
 using .Clustering
 export Clustering
 
+include("distribution.jl")
+using .Distribution
+export Distribution
+
 include("relabeling.jl")
 using .Relabeling
 export Relabeling
@@ -94,10 +98,6 @@ export Cycles
 include("mgs.jl")
 using .MGS
 export MGS
-
-include("distribution.jl")
-using .Distribution
-export Distribution
 
 include("metrics.jl")
 using .Metrics

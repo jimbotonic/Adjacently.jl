@@ -94,6 +94,11 @@ Base.@kwdef mutable struct DCSState
     cell_of::Vector{Int}
     sensors::Dict{Int, CellSensors}
     principles::Dict{Int, CellPrinciples}
+    # Adaptive memory (per-cell, per-principle): the highest principle
+    # strength recently achieved, decaying slowly. Reactivation reuses
+    # this memory so that recurrent threats meet a pre-warmed defence.
+    # Empty until `_cell_activate!` populates it on first fire.
+    memory::Dict{Int, Dict{Symbol, Float32}} = Dict{Int, Dict{Symbol, Float32}}()
     communication_reliability::Float32 = 1f0
     activation_mode::Symbol = :adaptive
     # `:adaptive`  — sensors → activation logic per cell
@@ -444,8 +449,52 @@ function _cell_activate!(world::World, dcs::DCSState)
         # Infiltration proxy (cell trust decay) → bounded_legibility / CP
         p.bounded_legibility = clamp(sens.trust_decay, 0f0, 1f0)
         p.controlled_permeability = clamp(0.5f0 - sens.trust_decay, 0f0, 1f0)
-        # Adaptive memory: stub for now (needs cycle-detection logic)
-        p.adaptive_memory = 0f0
+
+        # Adaptive memory (AM): hysteresis layer that retains recently-
+        # achieved principle strengths and re-applies them as a floor
+        # under recurrent threats.
+        #
+        # Mechanism: each cell maintains a memory buffer of principle
+        # values; the buffer decays exponentially at rate
+        # (1 − am_decay) per step. When the current sensor-driven
+        # activation exceeds a memory threshold, the memory is
+        # refreshed. Subsequent reads override low live activation
+        # with memory × am_strength, so the next attack wave hits a
+        # pre-warmed defence rather than a fresh cold start.
+        #
+        # AM is only active for the four principles where hysteresis
+        # plausibly matters under recurrent threats:
+        # faction_diversity_floor (recurrent narrative waves),
+        # reversible_governance (recurrent treasury / conflict shocks),
+        # redundant_stewardship (recurrent infrastructure attempts),
+        # non_domination (recurrent governance pressure).
+        # NM and TNA are intentionally excluded: pool inflation and
+        # backfire are continuous channels that do not benefit from
+        # discrete memory.
+        am_global = max(get_principles(world.params).adaptive_memory, p.adaptive_memory)
+        if am_global > 0
+            am_decay = Float32(get(world.params, :adaptive_memory_decay, 0.92f0))
+            am_strength = clamp(am_global, 0f0, 1f0)
+            buf = get!(dcs.memory, c, Dict{Symbol, Float32}())
+            for f in (:faction_diversity_floor, :reversible_governance,
+                      :redundant_stewardship, :non_domination)
+                # Decay the stored memory.
+                cur_mem = get(buf, f, 0f0) * am_decay
+                # Refresh from current activation if it exceeds memory.
+                live = getfield(p, f)
+                if live > cur_mem
+                    cur_mem = live
+                end
+                buf[f] = cur_mem
+                # Apply memory floor: live activation is lifted by
+                # memory × strength (capped at memory itself).
+                setfield!(p, f, max(live, cur_mem * am_strength))
+            end
+        end
+        # The adaptive_memory principle itself stays at its static
+        # value (it's a meta-principle, not a self-regulated one).
+        p.adaptive_memory = am_global
+
         # Hybrid mode: enforce NM and TNA floor of 0.5 even when sensors
         # are silent. Adaptive activation may push them higher.
         if hybrid
