@@ -58,13 +58,16 @@ function get_dataset_path(filename)
     return normpath(joinpath(PROJECT_ROOT, "datasets", filename))
 end
 
-const AMZ_DATASET_IN = get_dataset_path("Amazon_0601/Amazon0601.txt")
+# Datasets ship as compressed .mgz fixtures (same graphs; load_dataset detects the
+# extension and uses the compressed loader). Keeps the repo lean without changing
+# any test's expected vertex/edge counts.
+const AMZ_DATASET_IN = get_dataset_path("Amazon_0601/Amazon0601.mgz")
 const AMZ_DATASET_OUT = "Amazon_0601_core"
 
-const GG_DATASET_IN = get_dataset_path("Web_Google/web-Google.txt")
+const GG_DATASET_IN = get_dataset_path("Web_Google/web-Google.mgz")
 const GG_DATASET_OUT = "Web_Google_core"
 
-const ARX_DATASET_IN = get_dataset_path("Arxiv_HEP-PH/Cit-HepPh.txt")
+const ARX_DATASET_IN = get_dataset_path("Arxiv_HEP-PH/Cit-HepPh.mgz")
 const ARX_DATASET_OUT = "Arxiv_HEP-PH_core"
 
 const EAT_DATASET_IN = get_dataset_path("EAT/EATnew.net")
@@ -78,7 +81,10 @@ const TEST_DIR = joinpath(PROJECT_ROOT, "test_data")
 Load graph from CSV adjacency list or Pajek file
 """
 function load_dataset(input_path::String; separator::Char=',', is_pajek::Bool=false)
-	if !is_pajek
+	if endswith(input_path, ".mgz")
+		# Compressed MGS fixture — same graph as the original raw edge list.
+		g = load_compressed_mgs3_graph(input_path)
+	elseif !is_pajek
 		g = load_adjacency_list_from_csv(input_path, separator)
 	else
 	    g = load_graph_from_pajek(input_path)

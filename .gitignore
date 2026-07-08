@@ -195,3 +195,15 @@ CLAUDE.md
 docs/deprecated/
 docs/artifacts.md
 research/
+
+scripts/
+notebooks/
+models/
+scratchpad/
+
+# ...except the committed test fixtures (compressed graphs the test suite needs)
+!datasets/Amazon_0601/Amazon0601.mgz
+!datasets/Web_Google/web-Google.mgz
+!datasets/Arxiv_HEP-PH/Cit-HepPh.mgz
+!datasets/webgraph/cnr-2000/cnr-2000.mgz
+!datasets/EAT/EATnew.net

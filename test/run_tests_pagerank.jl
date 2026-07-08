@@ -29,6 +29,7 @@ using Logging
 using LightGraphs: nv, ne, outneighbors
 using SparseArrays: SparseMatrixCSC, sparse
 using LinearAlgebra: norm
+using Adjacently.MGS: load_compressed_mgs3_graph
 using Adjacently
 using Adjacently.IO: load_adjacency_list_from_csv
 using Adjacently.PageRank: PR
@@ -40,7 +41,7 @@ println("=" ^ 80)
 
 # Load graph
 println("\n[1/5] Loading CNR-2000 dataset...")
-graph = load_adjacency_list_from_csv("datasets/webgraph/cnr-2000/cnr-2000.csv", ',', true)
+graph = load_compressed_mgs3_graph("datasets/webgraph/cnr-2000/cnr-2000.mgz")
 vertices_count = nv(graph)
 edges_count = ne(graph)
 println("  Graph: $vertices_count vertices, $edges_count edges")

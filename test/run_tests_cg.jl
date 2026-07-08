@@ -20,6 +20,7 @@ using Pkg
 using Logging
 Pkg.activate(normpath(joinpath(@__DIR__, "..")))
 
+using Adjacently.MGS: load_compressed_mgs3_graph
 using Adjacently
 using Adjacently.CG
 using Adjacently.IO: BitWriter, flush_bitwriter, load_adjacency_list_from_csv
@@ -95,13 +96,13 @@ end
     prev_logger = current_logger()
     global_logger(ConsoleLogger(stderr, Logging.Info))
     try
-    cnr_csv_path = "datasets/webgraph/cnr-2000/cnr-2000.csv"
+    cnr_csv_path = "datasets/webgraph/cnr-2000/cnr-2000.mgz"
     if !isfile(cnr_csv_path)
         @warn "CNR-2000 CSV not found at $cnr_csv_path; skipping CG full-graph test"
         @test_skip "CNR-2000 dataset unavailable"
     else
         # Load full directed graph
-        t0 = time(); g = load_adjacency_list_from_csv(cnr_csv_path, ',', true); t1 = time()
+        t0 = time(); g = load_compressed_mgs3_graph(cnr_csv_path); t1 = time()
         n = nv(g)
         @info "Loaded CNR-2000: n=$(n) in $(round(t1-t0,digits=3))s"
 
