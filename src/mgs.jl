@@ -1646,6 +1646,66 @@ function _load_bg_ctxrange_random_access(filename::AbstractString, graph_type::S
 		reset_fn=() -> (empty!(memo); chunks_decoded[] = 0))
 end
 
+# ── True random-access reader: CS + :context_range + sampled index ────────────
+# Structurally identical to the BG reader (the CS struct-header layout matches, so
+# parse_bg_ctxrange_index is reused); the only difference is the per-chunk decode
+# calls read_cmdstream_graph_data with CS params.
+function _load_cs_ctxrange_random_access(filename::AbstractString, graph_type::Symbol,
+		gs::UInt64, params)
+	local struct_bytes, refdist_bytes, copy_bytes, resid_bytes
+	open(filename, "r") do io
+		read(io, 12)  # skip header
+		rd8() = (b = read(io, 8); L = UInt64(0); for i in 1:8; L |= UInt64(b[i]) << (8*(i-1)); end; L)
+		slen = rd8(); rdlen = rd8(); cplen = rd8()
+		struct_bytes  = read(io, Int(slen))
+		refdist_bytes = read(io, Int(rdlen))
+		copy_bytes    = read(io, Int(cplen))
+		resid_bytes   = read(io)
+	end
+
+	n_bits_v = convert(UInt8, ceil(log(2, gs)))
+	T = infer_uint_custom_type(n_bits_v)
+	vs = Int(gs)
+	meta = parse_bg_ctxrange_index(struct_bytes, vs)
+	samp_k = meta.samp_k
+	rws = params.ref_window_size
+
+	memo = Dict{Int,Dict{T,Vector{T}}}()
+	chunks_decoded = Ref(0)
+	chunk_of(u::Int) = ((u - 1) ÷ samp_k) + 1
+
+	local get_neighbors_v
+	function materialize_chunk(c::Int)
+		haskey(memo, c) && return memo[c]
+		cs = (c - 1) * samp_k + 1
+		ce = min(c * samp_k, vs)
+		seed_window = T[T(u) for u in max(1, cs - rws):(cs - 1)]
+		reader = BitReader(IOBuffer(struct_bytes))
+		nls = read_cmdstream_graph_data(reader, T(gs), :index, T;
+			integer_encoding=:context_range,
+			compact_copy=params.compact_copy, tight_intervals=params.tight_intervals,
+			ref_window_size=params.ref_window_size, lr_split=params.lr_split,
+			ctx_range=true, resid_bytes=resid_bytes, refdist_bytes=refdist_bytes,
+			copy_bytes=copy_bytes,
+			decode_range=cs:ce, seed_window=seed_window, ref_resolver=get_neighbors_v)
+		memo[c] = nls
+		chunks_decoded[] += 1
+		return nls
+	end
+	get_neighbors_v = function(u)
+		return materialize_chunk(chunk_of(Int(u)))[T(u)]
+	end
+
+	function _neighbors(v::Integer)
+		1 <= v <= vs || error("Vertex $v out of range [1, $vs]")
+		return sort(get_neighbors_v(T(v)))
+	end
+
+	return (n=vs, m=-1, neighbors=_neighbors, algorithm=:cs,
+		stats=(chunks_decoded=chunks_decoded, total_chunks=meta.n_sampled, samp_k=samp_k),
+		reset_fn=() -> (empty!(memo); chunks_decoded[] = 0))
+end
+
 function load_indexed_mgs3_graph(filename::AbstractString)
 	# Fast path: BG + :context_range + sampled index supports true O(k) random
 	# access via chunked range streams — no upfront full decode.
@@ -1661,6 +1721,11 @@ function load_indexed_mgs3_graph(filename::AbstractString)
 			if is_bg && encoding == :index && compression == :context_range
 				p = byte2 == ALG_BG ? _bg_default_params() : decode_bg_params(byte2)
 				return _load_bg_ctxrange_random_access(filename, graph_type, gs, p)
+			end
+			is_cs = byte2 == ALG_CS || (PARAM_CS_BASE <= byte2 <= PARAM_CS_MAX)
+			if is_cs && encoding == :index && compression == :context_range
+				p = byte2 == ALG_CS ? _cs_default_params() : decode_cs_params(byte2)
+				return _load_cs_ctxrange_random_access(filename, graph_type, gs, p)
 			end
 		end
 		return nothing

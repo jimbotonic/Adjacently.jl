@@ -5007,9 +5007,14 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
     copy_sink    = use_ctx_range ? BinRangeEncoder() : nothing
     idx_mode = coding_scheme == :index
     sampled_idx = idx_mode && index_sample_k > 0
-    if use_ctx_range && idx_mode
-        error(":context_range does not yet support index (random-access) mode")
+    if use_ctx_range && idx_mode && !sampled_idx
+        # Full (per-vertex) index needs a continuous range blob → not seekable.
+        error(":context_range index mode requires a sampled index (index_sample_k > 0)")
     end
+    # Chunked range streams: sampled index + :context_range. Each k-vertex chunk
+    # finalizes the range coders into an independently-decodable byte blob so a
+    # reader can seek to the chunk containing v. Mirror of the BG path.
+    ctx_chunked = use_ctx_range && sampled_idx
 
     fixwidth_ref = lr_split  # fixed-width ref distances when lr_split active (same as BG)
     ref_dist_bits = fixwidth_ref ? max(Int(ceil(log2(ref_window_size + 1))), 1) : 0
@@ -5117,16 +5122,33 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         add_to_ref_window!(v)
     end
 
+    # Per-chunk range blobs (ctx_chunked only): concatenated finalized chunks +
+    # cumulative byte-offset tables (length nchunks+1, first entry 0, last = blob len).
+    resid_blob = UInt8[]; refdist_blob = UInt8[]; copy_blob = UInt8[]
+    resid_coff = Int[0]; refdist_coff = Int[0]; copy_coff = Int[0]
     if idx_mode
         # Two-pass encoding: encode per-vertex data to buffer, then write offset table + data
         buf_bw = BitWriter()
         vertex_offsets = Vector{Int}(undef, vs + 1)
 
         for v_idx in 1:vs
+            # At each chunk boundary (aligned to the sample points), finalize + reset
+            # the range coders so each chunk is independently decodable.
+            if ctx_chunked && v_idx > 1 && (v_idx - 1) % index_sample_k == 0
+                append!(resid_blob,   rc_finish_and_reset!(resid_sink));   push!(resid_coff,   length(resid_blob))
+                append!(refdist_blob, rc_finish_and_reset!(refdist_sink)); push!(refdist_coff, length(refdist_blob))
+                append!(copy_blob,    brc_finish_and_reset!(copy_sink));   push!(copy_coff,    length(copy_blob))
+            end
             v = T(v_idx)
             vertex_offsets[v_idx] = _total_bits(buf_bw)
             current_neighbors = sort(get(neighbor_lists, v, T[]))
             _encode_cs_vertex!(buf_bw, v, current_neighbors)
+        end
+        if ctx_chunked
+            # Finalize the last chunk.
+            append!(resid_blob,   rc_finish_and_reset!(resid_sink));   push!(resid_coff,   length(resid_blob))
+            append!(refdist_blob, rc_finish_and_reset!(refdist_sink)); push!(refdist_coff, length(refdist_blob))
+            append!(copy_blob,    brc_finish_and_reset!(copy_sink));   push!(copy_coff,    length(copy_blob))
         end
         flush_bitwriter(buf_bw; flush_last_bits=true)
         vertex_offsets[vs + 1] = bytes_written(buf_bw) * 8
@@ -5139,12 +5161,32 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
             # Two-level sampled offsets
             write_bit(w, true)  # sampled flag
             @assert index_sample_k >= 4 && index_sample_k % 4 == 0 "index_sample_k must be a multiple of 4, >= 4"
-            write_value(w, UInt64(index_sample_k ÷ 4 - 1), 8)
+            if use_ctx_range
+                # :context_range: store raw k in 32 bits (chunk sizes can exceed the
+                # 8-bit (k/4-1) field's 1024 ceiling). Matches BG + parse_bg_ctxrange_index.
+                write_value(w, UInt64(index_sample_k), 32)
+            else
+                write_value(w, UInt64(index_sample_k ÷ 4 - 1), 8)
+            end
             write_value(w, UInt64(entry_width), 6)
             for v_idx in 1:index_sample_k:vs
                 write_value(w, UInt64(vertex_offsets[v_idx]), entry_width)
             end
             write_value(w, UInt64(vertex_offsets[vs + 1]), entry_width)
+
+            # :context_range — per-chunk byte-offset tables for the three range
+            # streams (each length nchunks+1). Same layout BG writes / the shared
+            # parse_bg_ctxrange_index reads.
+            if ctx_chunked
+                max_boff = max(resid_coff[end], refdist_coff[end], copy_coff[end])
+                coff_width = max_boff > 0 ? max(Int(ceil(log2(max_boff + 1))), 1) : 1
+                write_value(w, UInt64(coff_width), 6)
+                for offs in (resid_coff, refdist_coff, copy_coff)
+                    for o in offs
+                        write_value(w, UInt64(o), coff_width)
+                    end
+                end
+            end
         else
             # Full offset table
             write_bit(w, false)
@@ -5165,8 +5207,11 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
             _encode_cs_vertex!(w, v, current_neighbors)
         end
     end
-    # :context_range — finalize the three range streams (all empty otherwise)
-    if use_ctx_range
+    # :context_range — finalize the three range streams.
+    if ctx_chunked
+        # Already finalized per chunk; return the concatenated blobs.
+        return (resid_blob, refdist_blob, copy_blob)
+    elseif use_ctx_range
         return (rc_finish!(resid_sink), rc_finish!(refdist_sink), brc_finish!(copy_sink))
     end
     return (UInt8[], UInt8[], UInt8[])
@@ -5179,13 +5224,22 @@ function read_cmdstream_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, :
         ctx_range::Bool=false,
         resid_bytes::Vector{UInt8}=UInt8[],
         refdist_bytes::Vector{UInt8}=UInt8[],
-        copy_bytes::Vector{UInt8}=UInt8[]) where {T<:Unsigned}
+        copy_bytes::Vector{UInt8}=UInt8[],
+        decode_range::Union{Nothing,UnitRange{Int}}=nothing,
+        seed_window::Vector{T}=T[],
+        ref_resolver::Union{Nothing,Function}=nothing) where {T<:Unsigned}
 
     neighbor_lists = Dict{T,Vector{T}}()
+    # Reassignable per-chunk decoders (swapped by _setup_chunk! in the chunked path).
     resid_source   = ctx_range ? CtxRangeDecoder(resid_bytes) : nothing
     refdist_source = ctx_range ? CtxRangeDecoder(refdist_bytes) : nothing
     copy_source    = ctx_range ? BinRangeDecoder(copy_bytes) : nothing
     _read_copy_bits(n::Int) = Bool[brc_decode_bit!(copy_source::BinRangeDecoder) for _ in 1:n]
+    # Referenced-vertex adjacency lookup: local (already-decoded) first, then an
+    # optional external resolver (random-access: materialise a referenced vertex in
+    # an earlier, not-yet-decoded chunk).
+    _ref_nbs(ref_v::T) = haskey(neighbor_lists, ref_v) ? neighbor_lists[ref_v] :
+        (ref_resolver !== nothing ? ref_resolver(ref_v)::Vector{T} : T[])
 
     # Read stream metadata
     is_index_mode = read_bit(r)
@@ -5194,19 +5248,38 @@ function read_cmdstream_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, :
 
     # Read offset table (index mode)
     vertex_offsets = Int[]
+    sampled_offsets = Int[]
     is_sampled_index = false
+    samp_k = 0
+    resid_coff = Int[]; refdist_coff = Int[]; copy_coff = Int[]
+    data_start_bit = 0
     if is_index_mode
         is_sampled_index = read_bit(r)
         if is_sampled_index
-            # Two-level sampled offsets: read and skip for sequential decode
-            local _sk = (Int(read_value(r, 8, UInt64)) + 1) * 4  # decode: (stored+1)*4
+            # Two-level sampled offsets. :context_range stores raw k in 32 bits;
+            # fibonacci uses (k/4-1) in 8 bits.
+            local _sk = ctx_range ? Int(read_value(r, 32, UInt64)) :
+                (Int(read_value(r, 8, UInt64)) + 1) * 4
+            samp_k = _sk
             entry_width = Int(read_value(r, 6, UInt64))
             n_sampled = length(1:_sk:Int(vs))
-            sampled = Int[]
             for _ in 1:(n_sampled + 1)
-                push!(sampled, Int(read_value(r, entry_width, UInt64)))
+                push!(sampled_offsets, Int(read_value(r, entry_width, UInt64)))
             end
-            # Data is children-mode encoded, vertex_offsets stays empty
+            # :context_range — per-chunk byte-offset tables (each length nchunks+1).
+            if ctx_range
+                coff_width = Int(read_value(r, 6, UInt64))
+                for tbl in (0, 1, 2)
+                    for _ in 1:(n_sampled + 1)
+                        o = Int(read_value(r, coff_width, UInt64))
+                        tbl == 0 ? push!(resid_coff, o) :
+                        tbl == 1 ? push!(refdist_coff, o) : push!(copy_coff, o)
+                    end
+                end
+            end
+            # Struct reader now sits at the first vertex's data — record the absolute
+            # bit position so we can seek per chunk.
+            data_start_bit = r.bit_count
         else
             # Full offset table
             entry_width = Int(read_value(r, 6, UInt64))
@@ -5226,6 +5299,30 @@ function read_cmdstream_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, :
 
     fixwidth_ref = lr_split
     ref_dist_bits = fixwidth_ref ? max(Int(ceil(log2(ref_window_size + 1))), 1) : 0
+
+    # Chunked :context_range (sampled index): the three range streams are stored as
+    # a concatenation of independently-finalized chunks (aligned to sample points).
+    # Spin up fresh decoders on chunk c's byte slice with fresh adaptive models.
+    ctx_chunked = ctx_range && is_sampled_index && !isempty(resid_coff)
+    function _setup_chunk!(c::Int)
+        resid_source   = CtxRangeDecoder(resid_bytes[resid_coff[c] + 1 : resid_coff[c + 1]])
+        refdist_source = CtxRangeDecoder(refdist_bytes[refdist_coff[c] + 1 : refdist_coff[c + 1]])
+        copy_source    = BinRangeDecoder(copy_bytes[copy_coff[c] + 1 : copy_coff[c + 1]])
+        return nothing
+    end
+
+    # Random-access seek mode: decode only `decode_range`, seeding the reference
+    # window and jumping the struct reader + range decoders to the range's chunk.
+    if decode_range !== nothing
+        for u in seed_window
+            push!(reference_window, u)
+        end
+        c0 = ((first(decode_range) - 1) ÷ samp_k) + 1
+        bitpos = data_start_bit + sampled_offsets[c0]
+        r.index = bitpos + 1
+        r.bit_count = bitpos
+        _setup_chunk!(c0)
+    end
 
     # Helper to read encoded list body (residual region — gate the range decoder)
     function _read_cs_body(r_in::BitReader, v::T, enc_type::Symbol, mil::Int)
@@ -5264,8 +5361,48 @@ function read_cmdstream_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, :
         end
     end
 
-    for v_idx in 1:Int(vs)
+    # Decode one vertex's neighbor list (header already positioned at r_in).
+    function _decode_cs_vertex!(r_in::BitReader, v::T)
+        is_empty, ref_mode, enc_type, mil = _read_cs_header(r_in)
+        is_empty && return T[]
+
+        if ref_mode != :none
+            distance = refdist_source !== nothing ? T(rc_decode_value!(refdist_source::CtxRangeDecoder)) :
+                       (fixwidth_ref ? T(read_value(r_in, ref_dist_bits, UInt64)) : read_encoded_value(r_in, ie, T))
+            ref_idx = length(reference_window) - Int(distance) + 1
+            ref_nbs = T[]
+            if 1 <= ref_idx <= length(reference_window)
+                ref_nbs = _ref_nbs(reference_window[ref_idx])
+            end
+            ref_len = length(ref_nbs)
+            copy_bitmap = copy_source !== nothing ? _read_copy_bits(ref_len) :
+                          _read_adaptive_copy(r_in, ref_len, ie, T; compact_copy=compact_copy)
+            # Copy-aware rank gaps: C = copied ids; decode Q in rank space then invert.
+            _cs_vid = v; _cs_C = T[]
+            if resid_source !== nothing
+                _cs_C = reconstruct_from_reference(ref_nbs, copy_bitmap, T[])
+                isempty(_cs_C) || (_cs_vid = _rank_of(v, _cs_C))
+            end
+            residuals = _read_cs_body(r_in, _cs_vid, enc_type, mil)
+            if resid_source !== nothing && !isempty(_cs_C)
+                residuals = _rankgap_inverse(residuals, _cs_C)
+            end
+            return reconstruct_from_reference(ref_nbs, copy_bitmap, residuals)
+        else
+            return _read_cs_body(r_in, v, enc_type, mil)
+        end
+    end
+
+    # Unified data loop. In seek mode only `decode_range` is visited.
+    loop_range = decode_range === nothing ? (1:Int(vs)) : decode_range
+    for v_idx in loop_range
         v = T(v_idx)
+
+        # Chunked full decode: swap to fresh per-chunk decoders at each sample
+        # boundary. (In seek mode the chunk is already set up.)
+        if ctx_chunked && decode_range === nothing && (v_idx - 1) % samp_k == 0
+            _setup_chunk!(((v_idx - 1) ÷ samp_k) + 1)
+        end
 
         if is_index_mode && !is_sampled_index
             # Full index mode: empty vertex = offset[v] == offset[v+1]
@@ -5275,49 +5412,8 @@ function read_cmdstream_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, :
                 continue
             end
         end
-        # Sampled index mode: CS header handles empty vertices via the empty prefix code
 
-        # Read CS header
-        is_empty, ref_mode, enc_type, mil = _read_cs_header(r)
-
-        if is_empty
-            neighbor_lists[v] = T[]
-            add_to_ref_window!(v)
-            continue
-        end
-
-        current_neighbors = T[]
-        is_ref = ref_mode != :none
-
-        if is_ref
-            distance = refdist_source !== nothing ? T(rc_decode_value!(refdist_source::CtxRangeDecoder)) :
-                       (fixwidth_ref ? T(read_value(r, ref_dist_bits, UInt64)) : read_encoded_value(r, ie, T))
-            ref_idx = length(reference_window) - Int(distance) + 1
-            ref_nbs = T[]
-            if 1 <= ref_idx <= length(reference_window)
-                ref_v = reference_window[ref_idx]
-                ref_nbs = get(neighbor_lists, ref_v, T[])
-            end
-            ref_len = length(ref_nbs)
-            copy_bitmap = copy_source !== nothing ? _read_copy_bits(ref_len) :
-                          _read_adaptive_copy(r, ref_len, ie, T; compact_copy=compact_copy)
-            # Copy-aware rank gaps: C = copied ids; decode Q in rank space then
-            # invert Q -> R.
-            _cs_vid = v; _cs_C = T[]
-            if resid_source !== nothing
-                _cs_C = reconstruct_from_reference(ref_nbs, copy_bitmap, T[])
-                isempty(_cs_C) || (_cs_vid = _rank_of(v, _cs_C))
-            end
-            residuals = _read_cs_body(r, _cs_vid, enc_type, mil)
-            if resid_source !== nothing && !isempty(_cs_C)
-                residuals = _rankgap_inverse(residuals, _cs_C)
-            end
-            current_neighbors = reconstruct_from_reference(ref_nbs, copy_bitmap, residuals)
-        else
-            current_neighbors = _read_cs_body(r, v, enc_type, mil)
-        end
-
-        neighbor_lists[v] = current_neighbors
+        neighbor_lists[v] = _decode_cs_vertex!(r, v)
         add_to_ref_window!(v)
     end
 
