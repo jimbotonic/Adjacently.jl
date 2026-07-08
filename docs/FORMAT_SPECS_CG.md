@@ -2,6 +2,13 @@
 
 ## Overview
 
+> **Context-Range backend:** CG supports `integer_encoding=:context_range` (header
+> `0x7`) in **children mode** — the residual/copy/refdist integers route through the
+> shared 3-stream range coders with copy-aware rank gaps. Index-mode (random-access)
+> context-range is **not** implemented for CG; requesting it falls back to Fibonacci.
+> The shared context-range format is in
+> [FORMAT_SPECS_CONTEXT_RANGE.md](FORMAT_SPECS_CONTEXT_RANGE.md).
+
 CG (Clustered Graph Encoding) compresses directed graphs by combining two-level community-based vertex ordering with per-cluster reference-based edge encoding. The key insight is that applying Leiden community detection followed by per-cluster LLP reordering creates tight sequential locality — consecutive vertices in encoding order share 80–90% of neighbors — which makes reference compression dramatically effective.
 
 Key properties:

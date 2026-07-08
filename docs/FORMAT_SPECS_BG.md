@@ -2,6 +2,12 @@
 
 ## Overview
 
+> **Context-Range backend:** in addition to the prefix/varint integer codes below,
+> BG supports `integer_encoding=:context_range` (header `0x7`) — a context-adaptive
+> range coder with a 3-stream layout, copy-aware rank gaps, and chunked random
+> access. This document specifies the classic (prefix-code) format; the shared
+> context-range format is in [FORMAT_SPECS_CONTEXT_RANGE.md](FORMAT_SPECS_CONTEXT_RANGE.md).
+
 MGS v3 extends v2 with two changes:
 
 1. **Zeta-3 integer encoding** (z3), matching WebGraph's encoding choice.

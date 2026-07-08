@@ -7,7 +7,7 @@ Header has 12 bytes:
   * Byte 1 (2 bits + 2 bits + 4 bits):
 	- graph type (2 bits): 0b00: directed graph | 0b01: undirected graph
 	- coding scheme (2 bits): 0b00: children | 0b01: index
-	- integer encoding (4 bits): 0x1: Elias gamma | 0x2: Elias delta | 0x3: Golomb | 0x4: FED | 0x5: Zeta | 0x6: Fibonacci
+	- integer encoding (4 bits): 0x1: Elias gamma | 0x2: Elias delta | 0x3: Golomb | 0x4: FED | 0x5: Zeta | 0x6: Fibonacci | 0x7: Context-Range (adaptive range coder; see [FORMAT_SPECS_CONTEXT_RANGE.md](FORMAT_SPECS_CONTEXT_RANGE.md))
   * Byte 2: option_flags — interpretation depends on version (see below)
 - # vertices: 5 bytes (little-endian UInt40)
 
@@ -157,6 +157,19 @@ sections:
    - entry[s]: total payload bit size
 
 This enables O(1) random access to any cluster and any vertex within a cluster.
+
+#### Context-Range Random Access (integer_encoding = 0x7)
+
+The `:context_range` backend uses a **different** random-access mechanism from the
+full per-vertex/cluster offset tables above. Because the range-coder state is
+continuous, a full index is not seekable — context-range random access **requires a
+sampled index** (`index_sample_k > 0`) and stores three extra per-chunk *byte*-offset
+tables (for the resid/refdist/copy range blobs) after the sampled bit-offset table.
+`k` is stored raw in 32 bits (not the legacy 8-bit `(k/4−1)`). Seeking is **O(k)**
+(decode the chunk + recursively materialise earlier chunks referenced from it), not
+O(1). Full details, including the on-disk table layout, are in
+[FORMAT_SPECS_CONTEXT_RANGE.md](FORMAT_SPECS_CONTEXT_RANGE.md) §6. Applies to BG and
+CS; CG context-range is children-mode only (no random access yet).
 
 ---
 
