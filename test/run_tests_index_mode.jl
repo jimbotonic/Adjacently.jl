@@ -86,9 +86,7 @@ nls = extract_neighbor_lists(g)
     t_enc = time()
     write_bg_mgs3_graph(g, bg_base;
         coding_scheme=:index, integer_encoding=:fibonacci,
-        ref_window_size=64, copy_blocks=true, adaptive_copy=true,
-        stop_deltas=true, compact_copy=true,
-        tight_intervals=true)
+        ref_window_size=64, copy_blocks=true, stop_deltas=true)
     dt_enc = round(time() - t_enc, digits=2)
 
     @test isfile(bg_mgz)
@@ -181,7 +179,7 @@ end
         intra_copy_blocks=true, intra_copy_adaptive=true,
         intra_ref_fixwidth=true, intra_ref_vlc=false,
         intra_add_adaptive=true, intra_raw_adaptive=true,
-        intra_adapt_mil=2,
+        intra_adapt_mil=4,   # must equal intra_mil; header encodes mil ∈ {3,4,5}
     )
 
     # Children mode reference (same clusters)

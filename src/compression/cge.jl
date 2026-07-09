@@ -1368,9 +1368,9 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
     # :context_range — residual (additions/raw) integers route to a streaming range
     # coder; structural integers stay fibonacci in the bitstream. Requires the clean
     # per-vertex path (directed + no bitset/mgs/block alternatives).
-    if ctx_range && (!is_directed(g) || params.intra_mgs || params.intra_block_try || cluster_offsets !== nothing ||
+    if ctx_range && (!is_directed(g) || params.intra_mgs || params.intra_block_try ||
                      (params.intra_ref_enabled && !params.intra_ref_fixwidth))
-        error(":context_range CG requires a directed graph, children mode, intra_mgs/intra_block_try disabled, and (if refs enabled) intra_ref_fixwidth")
+        error(":context_range CG requires a directed graph, intra_mgs/intra_block_try disabled, and (if refs enabled) intra_ref_fixwidth")
     end
     Compression._RESID_SINK[] = nothing   # clear any leaked global state from a prior call
     # Function barrier (fixes a Julia-1.12 flaky segfault): constructing the
@@ -1387,11 +1387,27 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
         resid_sink   = Compression.CtxRangeEncoder()   # residuals (additions/raw)
         refdist_sink = Compression.CtxRangeEncoder()   # ref deltas (CG-3)
         copy_sink    = Compression.BinRangeEncoder()   # copy bitmap (CG-2)
-        _encode_level_body!(w, g, P, params, stats, progress, cluster_offsets, resid_sink, refdist_sink, copy_sink)
+        if cluster_offsets !== nothing
+            # CG-RA: per-cluster chunked range streams. Finalize + reset the three
+            # coders at each intra-cluster boundary so every cluster is an
+            # independently-decodable chunk (the inter section writes no coder
+            # symbols — its lists are emitted outside the _RESID_SINK regions).
+            resid_blob = UInt8[]; refdist_blob = UInt8[]; copy_blob = UInt8[]
+            resid_coff = Int[0]; refdist_coff = Int[0]; copy_coff = Int[0]
+            chunk_cb = ci -> begin
+                append!(resid_blob,   Compression.rc_finish_and_reset!(resid_sink));   push!(resid_coff,   length(resid_blob))
+                append!(refdist_blob, Compression.rc_finish_and_reset!(refdist_sink)); push!(refdist_coff, length(refdist_blob))
+                append!(copy_blob,    Compression.brc_finish_and_reset!(copy_sink));   push!(copy_coff,    length(copy_blob))
+                nothing
+            end
+            _encode_level_body!(w, g, P, params, stats, progress, cluster_offsets, resid_sink, refdist_sink, copy_sink, chunk_cb)
+            return (resid_blob, refdist_blob, copy_blob, resid_coff, refdist_coff, copy_coff)
+        end
+        _encode_level_body!(w, g, P, params, stats, progress, cluster_offsets, resid_sink, refdist_sink, copy_sink, nothing)
         # finalize + return (residual, refdist, copy) range streams
         return (Compression.rc_finish!(resid_sink), Compression.rc_finish!(refdist_sink), Compression.brc_finish!(copy_sink))
     else
-        _encode_level_body!(w, g, P, params, stats, progress, cluster_offsets, nothing, nothing, nothing)
+        _encode_level_body!(w, g, P, params, stats, progress, cluster_offsets, nothing, nothing, nothing, nothing)
         return nothing
     end
 end
@@ -1399,7 +1415,7 @@ end
 # @noinline preserves the function barrier — inlining the worker back into the thin
 # wrapper would reintroduce the union-typed sink locals into a single huge method and
 # risk resurfacing the Julia-1.12 codegen miscompilation (see encode_level comment).
-@noinline function _encode_level_body!(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}, params::CGParams, stats::Union{Nothing,CGStats}, progress::Union{Nothing,Function}, cluster_offsets::Union{Nothing,Vector{Int}}, resid_sink, refdist_sink, copy_sink) where {T<:Unsigned}
+@noinline function _encode_level_body!(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}, params::CGParams, stats::Union{Nothing,CGStats}, progress::Union{Nothing,Function}, cluster_offsets::Union{Nothing,Vector{Int}}, resid_sink, refdist_sink, copy_sink, chunk_cb) where {T<:Unsigned}
     n = nv(g)
     directed = is_directed(g)
 
@@ -2051,6 +2067,8 @@ end
                 end
             end
         end
+        # CG-RA: finalize the per-cluster range-stream chunk (no-op unless chunked)
+        chunk_cb === nothing || chunk_cb(ci)
     end
     if stats !== nothing
         stats.bits_intra += _total_bits(w) - bits_before
@@ -2192,17 +2210,11 @@ end
 Decode one CG coarsening level from the bitstream.
 Returns a `Dict{T, Vector{T}}` mapping global vertex ID → sorted outneighbors.
 """
-function decode_level(r::BitReader, params::CGParams; T::Type{<:Unsigned}=UInt32, directed::Bool=true, coding_scheme::Symbol=:children, ctx_range::Bool=false, resid_bytes::Vector{UInt8}=UInt8[], refdist_bytes::Vector{UInt8}=UInt8[], copy_bytes::Vector{UInt8}=UInt8[])
-    Compression._RESID_SOURCE[] = nothing   # clear any leaked global state from a prior call
-    resid_source   = ctx_range ? Compression.CtxRangeDecoder(resid_bytes) : nothing
-    refdist_source = ctx_range ? Compression.CtxRangeDecoder(refdist_bytes) : nothing
-    copy_source    = ctx_range ? Compression.BinRangeDecoder(copy_bytes) : nothing
-    # ----------------------------------------------------------------
-    # Section 1: Read cluster membership
-    # ----------------------------------------------------------------
+# Section 1 (cluster membership) parser, shared by decode_level and the CG
+# random-access loader. Reads from r's current position.
+function _read_membership(r::BitReader, params::CGParams, ::Type{T}) where {T<:Unsigned}
     K = Int(read_encoded_value(r, params.varint, T))
     clusters = Vector{Vector{T}}(undef, K)
-
     if params.membership == :implicit_ranges
         # Clusters are contiguous ID ranges: cluster i = offset+1..offset+size_i
         offset = T(0)
@@ -2223,6 +2235,40 @@ function decode_level(r::BitReader, params::CGParams; T::Type{<:Unsigned}=UInt32
             end
         end
     end
+    return clusters
+end
+
+@inline function _bitreader_seek!(r::BitReader, bitpos::Int)
+    r.index = bitpos + 1
+    r.bit_count = bitpos
+    return nothing
+end
+
+function decode_level(r::BitReader, params::CGParams; T::Type{<:Unsigned}=UInt32, directed::Bool=true, coding_scheme::Symbol=:children, ctx_range::Bool=false, resid_bytes::Vector{UInt8}=UInt8[], refdist_bytes::Vector{UInt8}=UInt8[], copy_bytes::Vector{UInt8}=UInt8[],
+        cg_offsets::Union{Nothing,Vector{Int}}=nothing,
+        data_start_bit::Int=0,
+        chunk_offsets::Union{Nothing,NTuple{3,Vector{Int}}}=nothing,
+        only_cluster::Union{Nothing,Int}=nothing,
+        preparsed_clusters=nothing)
+    Compression._RESID_SOURCE[] = nothing   # clear any leaked global state from a prior call
+    # Chunked (CG-RA) streams: per-cluster decoders are (re)built on byte slices in
+    # the intra loop; whole-blob decoders otherwise.
+    ctx_chunked = ctx_range && chunk_offsets !== nothing
+    resid_source   = (ctx_range && !ctx_chunked) ? Compression.CtxRangeDecoder(resid_bytes) : nothing
+    refdist_source = (ctx_range && !ctx_chunked) ? Compression.CtxRangeDecoder(refdist_bytes) : nothing
+    copy_source    = (ctx_range && !ctx_chunked) ? Compression.BinRangeDecoder(copy_bytes) : nothing
+    function _setup_cluster_chunk!(ci::Int)
+        rc_off, rd_off, cp_off = chunk_offsets
+        resid_source   = Compression.CtxRangeDecoder(resid_bytes[rc_off[ci] + 1 : rc_off[ci + 1]])
+        refdist_source = Compression.CtxRangeDecoder(refdist_bytes[rd_off[ci] + 1 : rd_off[ci + 1]])
+        copy_source    = Compression.BinRangeDecoder(copy_bytes[cp_off[ci] + 1 : cp_off[ci + 1]])
+        return nothing
+    end
+    # ----------------------------------------------------------------
+    # Section 1: Read cluster membership
+    # ----------------------------------------------------------------
+    clusters = preparsed_clusters === nothing ? _read_membership(r, params, T) : preparsed_clusters
+    K = length(clusters)
 
     # Build global neighbor dict
     neighbor_lists = Dict{T, Vector{T}}()
@@ -2232,7 +2278,15 @@ function decode_level(r::BitReader, params::CGParams; T::Type{<:Unsigned}=UInt32
     # ----------------------------------------------------------------
     _mil_options = [2, 3, 4, 5]
 
-    for ci in 1:K
+    for ci in (only_cluster === nothing ? (1:K) : (only_cluster:only_cluster))
+        # Random access: jump the struct reader to this cluster's intra section.
+        if only_cluster !== nothing
+            cg_offsets === nothing && error("only_cluster requires cg_offsets")
+            _bitreader_seek!(r, data_start_bit + cg_offsets[ci])
+        end
+        # Chunked streams: fresh per-cluster decoders (fresh adaptive models),
+        # mirroring the encoder's per-cluster finalize+reset.
+        ctx_chunked && _setup_cluster_chunk!(ci)
         C = clusters[ci]
         s = length(C)
 
@@ -2528,7 +2582,12 @@ function decode_level(r::BitReader, params::CGParams; T::Type{<:Unsigned}=UInt32
     # ----------------------------------------------------------------
     # Section 3: Read inter-cluster edges
     # ----------------------------------------------------------------
-    for ia in 1:K
+    for ia in (only_cluster === nothing ? (1:K) : (only_cluster:only_cluster))
+        # Random access: jump to this source cluster's inter section
+        # (cg_offsets[K+1] = absolute inter start, cg_offsets[K+1+ia] = relative).
+        if only_cluster !== nothing
+            _bitreader_seek!(r, data_start_bit + cg_offsets[K + 1] + cg_offsets[K + 1 + ia])
+        end
         A = clusters[ia]
         # Read STOP-terminated delta list of target cluster indices
         Bs = read_stop_delta_list(r; encoding=params.gap, T=T)

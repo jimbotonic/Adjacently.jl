@@ -342,6 +342,28 @@ const _RESIDIDS_TAP = Ref{Any}(nothing)
 const _RESID_SINK = Ref{Union{Nothing,CtxRangeEncoder}}(nothing)
 const _RESID_SOURCE = Ref{Union{Nothing,CtxRangeDecoder}}(nothing)
 
+# Phase 2b: structural FLAG bits (stop-delta continuation bits, hybrid-RLE section
+# flags) redirect to an adaptive binary range coder when set — same gating pattern
+# as _RESID_SINK. Set by write/read_cmdstream_graph_data (children mode, ctx) around
+# the vertex loop; nothing = legacy raw bits in the struct bitstream.
+const _FLAG_SINK = Ref{Union{Nothing,BinRangeEncoder}}(nothing)
+const _FLAG_SOURCE = Ref{Union{Nothing,BinRangeDecoder}}(nothing)
+
+@inline function _struct_write_bit(w, b::Bool)
+    s = _FLAG_SINK[]
+    if s === nothing
+        write_bit(w, b)
+    else
+        brc_encode_bit!(s::BinRangeEncoder, b)
+    end
+    return nothing
+end
+
+@inline function _struct_read_bit(r)::Bool
+    s = _FLAG_SOURCE[]
+    return s === nothing ? read_bit(r) : brc_decode_bit!(s::BinRangeDecoder)
+end
+
 # --- Copy-aware rank gaps (Task A) -------------------------------------------
 # In the :context_range residual path, residual neighbour ids are recoded as
 # ranks in the complement of the already-copied set C (target ids copied from
@@ -1730,7 +1752,7 @@ function write_hybrid_mix_encoded_list(w::BitWriter, delta_list::Vector{T}, enco
     @debug "write_hybrid_mix_encoded_list: list_length=$(length(delta_list)), use_run_length_and_interval=$use_run_length_and_interval, hybrid_active=$hybrid_active"
 
     # Write hybrid mode flag
-    write_bit(w, hybrid_active)
+    _struct_write_bit(w, hybrid_active)
 
     # Write the first value (same as write_mix_encoded_list)
     if vertex_id !== nothing
@@ -1790,23 +1812,23 @@ function write_hybrid_mix_encoded_list(w::BitWriter, delta_list::Vector{T}, enco
     for section in sections
         if section.type == :delta
             # Delta section: flag=0, count, values
-            write_bit(w, false)
+            _struct_write_bit(w, false)
             write_encoded_value(w, T(length(section.data)), encoding)
             for val in section.data
                 write_encoded_value(w, val, encoding)
             end
         elseif section.type == :run_length
             # Run-length section: flag=1,0, count, value/length pairs
-            write_bit(w, true)
-            write_bit(w, false)
+            _struct_write_bit(w, true)
+            _struct_write_bit(w, false)
             write_encoded_value(w, T(length(section.data) ÷ 2), encoding)  # number of pairs
             for val in section.data
                 write_encoded_value(w, val, encoding)
             end
         elseif section.type == :interval
             # Interval section: flag=1,1, count, start/length pairs
-            write_bit(w, true)
-            write_bit(w, true)
+            _struct_write_bit(w, true)
+            _struct_write_bit(w, true)
             write_encoded_value(w, T(length(section.data) ÷ 2), encoding)  # number of pairs
             for val in section.data
                 write_encoded_value(w, val, encoding)
@@ -1834,7 +1856,7 @@ Returns the reconstructed delta-encoded values (like read_mix_encoded_list).
 """
 function read_hybrid_mix_encoded_list(r::BitReader, coding_scheme::Symbol, integer_encoding::Symbol, ::Type{T}=UInt8; max_elements::Union{Int,Nothing}=nothing, stop_value::Union{T,Nothing}=nothing, vertex_id=nothing) where {T<:Unsigned}
     # Read hybrid mode flag
-    use_run_length_and_interval = read_bit(r)
+    use_run_length_and_interval = _struct_read_bit(r)
 
     # Read the first value (same as read_mix_encoded_list)
     raw_first = vertex_id !== nothing ? read_encoded_value(r, integer_encoding, UInt64) : read_encoded_value(r, integer_encoding, T)
@@ -1906,7 +1928,7 @@ function read_hybrid_mix_encoded_list(r::BitReader, coding_scheme::Symbol, integ
         num_sections = read_encoded_value(r, integer_encoding, T)
     
     for i in 1:num_sections
-        section_flag = read_bit(r)
+        section_flag = _struct_read_bit(r)
         
         if !section_flag
             # Delta section: flag=0, count, values
@@ -1925,7 +1947,7 @@ function read_hybrid_mix_encoded_list(r::BitReader, coding_scheme::Symbol, integ
             
         else
             # Read second flag bit
-            second_flag = read_bit(r)
+            second_flag = _struct_read_bit(r)
             
             if !second_flag
                 # Run-length section: flag=1,0, count, value/length pairs
@@ -3097,6 +3119,43 @@ function _read_vertex_header_vlc(r; adaptive::Bool=false)
     mil = _read_mil_tag(r);                    return (:multi_ref, :rle, mil)             # 111111111+mm
 end
 
+# Phase 2b: BG vertex header as a single small-int symbol for the context-modeled
+# command stream. Non-adaptive alphabet = the 28 merged-VLC actions; adaptive
+# alphabet = the 4 (ref_flag × interval_flag) combos. All ids < 2^K → direct tokens.
+const _BG_CMD_ACTIONS = begin
+    acts = Tuple{Symbol,Symbol,Int}[
+        (:empty, :delta, 0), (:reference, :delta, 0),
+        (:none, :delta, 0), (:multi_ref, :delta, 0),
+    ]
+    for rm in (:none, :reference, :multi_ref), et in (:interval, :rle), m in MIL_OPTIONS
+        push!(acts, (rm, et, m))
+    end
+    acts
+end
+const _BG_CMD_INDEX = Dict{Tuple{Symbol,Symbol,Int},Int}(a => i - 1 for (i, a) in enumerate(_BG_CMD_ACTIONS))
+
+function _bg_cmd_id(ref_mode::Symbol, enc_type::Symbol, mil::Int; adaptive::Bool=false)::Int
+    if adaptive
+        return (ref_mode == :reference ? 1 : 0) | (enc_type == :interval ? 2 : 0)
+    end
+    ref_mode == :empty && return 0
+    if enc_type == :delta
+        return _BG_CMD_INDEX[(ref_mode, :delta, 0)]
+    end
+    # Mirror _write_mil_tag's fallback: unknown mil → MIL_OPTIONS[3]
+    m = mil in MIL_OPTIONS ? mil : MIL_OPTIONS[3]
+    return _BG_CMD_INDEX[(ref_mode, enc_type, m)]
+end
+
+function _bg_cmd_decode(id::Int; adaptive::Bool=false)
+    if adaptive
+        ref_mode = (id & 1) != 0 ? :reference : :none
+        interval = (id & 2) != 0
+        return (ref_mode, interval ? :interval : :delta, interval ? ADAPTIVE_MIL : 0)
+    end
+    return _BG_CMD_ACTIONS[id + 1]
+end
+
 @inline function _vlc_header_cost(ref_mode::Symbol, enc_type::Symbol, mil::Int; adaptive::Bool=false)::Int
     if adaptive; return 2; end  # Always 2 bits: ref_flag + adaptive_flag
     if ref_mode == :reference && enc_type == :delta;    return 1; end   # 0
@@ -3163,6 +3222,12 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
     resid_sink   = use_ctx_range ? CtxRangeEncoder() : nothing
     refdist_sink = use_ctx_range ? CtxRangeEncoder() : nothing   # reference distances
     copy_sink    = use_ctx_range ? BinRangeEncoder() : nothing   # copy bitmap bits
+    # Phase 2b: vertex headers → cmd range coder; stop-delta / RLE / split-residual /
+    # adaptive-delta flags → binary coder. In sampled-index (RA) mode both streams are
+    # chunked alongside resid/refdist/copy (headers decode sequentially within a chunk,
+    # so they don't need to stay in the seekable struct stream).
+    cmd_sink  = use_ctx_range ? CtxRangeEncoder() : nothing
+    flag_sink = use_ctx_range ? BinRangeEncoder() : nothing
     if use_ctx_range && coding_scheme == :index && index_sample_k <= 0
         # Full (per-vertex) index needs a continuous range blob → not seekable.
         error(":context_range index mode requires a sampled index (index_sample_k > 0)")
@@ -3212,10 +3277,18 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
             if !idx_mode || sampled_idx
                 # Children mode (or sampled index): write explicit empty marker
                 if adaptive_header
-                    _write_vertex_header_vlc(wr, :none, :delta, 0; adaptive=true)
-                    write_bit(wr, false)  # STOP terminator (0 elements)
+                    if cmd_sink !== nothing
+                        rc_encode_value!(cmd_sink, UInt64(_bg_cmd_id(:none, :delta, 0; adaptive=true)))
+                    else
+                        _write_vertex_header_vlc(wr, :none, :delta, 0; adaptive=true)
+                    end
+                    _struct_write_bit(wr, false)  # STOP terminator (0 elements)
                 else
-                    _write_vertex_header_vlc(wr, :empty, :delta, 0)
+                    if cmd_sink !== nothing
+                        rc_encode_value!(cmd_sink, UInt64(_bg_cmd_id(:empty, :delta, 0)))
+                    else
+                        _write_vertex_header_vlc(wr, :empty, :delta, 0)
+                    end
                 end
             end
             # Full index mode: nothing written (empty = offset[v] == offset[v+1])
@@ -3239,7 +3312,11 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
 
         # Write vertex header
         _hb0 = _STREAM_BITS[] === nothing ? 0 : _total_bits(wr)
-        _write_vertex_header_vlc(wr, actual_ref_mode, enc_type, mil; adaptive=adaptive_header)
+        if cmd_sink !== nothing
+            rc_encode_value!(cmd_sink, UInt64(_bg_cmd_id(actual_ref_mode, enc_type, mil; adaptive=adaptive_header)))
+        else
+            _write_vertex_header_vlc(wr, actual_ref_mode, enc_type, mil; adaptive=adaptive_header)
+        end
         if _STREAM_BITS[] !== nothing
             _sbh = _STREAM_BITS[]::Dict{Symbol,Int}
             _sbh[:header] = get(_sbh, :header, 0) + (_total_bits(wr) - _hb0)
@@ -3304,9 +3381,16 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
             # Split residual encoding: signal if residuals use a different enc_type
             if split_residual
                 same_enc = (res_enc_type == enc_type && (res_mil == mil || res_enc_type == :delta))
-                write_bit(wr, !same_enc)  # 0 = same, 1 = different
+                _struct_write_bit(wr, !same_enc)  # 0 = same, 1 = different
                 if !same_enc
-                    _write_enc_opt_tag(wr, res_enc_type, res_mil)
+                    if cmd_sink !== nothing
+                        opt = res_enc_type == :delta ? (:delta, 0) : (res_enc_type, res_mil)
+                        oidx = findfirst(==(opt), ENCODING_OPTIONS)
+                        oidx === nothing && (oidx = 3)
+                        rc_encode_value!(cmd_sink, UInt64(oidx - 1))
+                    else
+                        _write_enc_opt_tag(wr, res_enc_type, res_mil)
+                    end
                 end
             end
             target_list = residuals
@@ -3349,7 +3433,7 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
             # Determine delta format: adaptive (per-vertex) or global
             vertex_stop = adaptive_deltas ? use_stop : stop_deltas
             if adaptive_deltas
-                write_bit(wr, vertex_stop)  # 1-bit flag: true=stop, false=count
+                _struct_write_bit(wr, vertex_stop)  # 1-bit flag: true=stop, false=count
             end
             if vertex_stop
                 _write_stop_delta(wr, target_list, ie; vertex_id=_resid_vid)
@@ -3391,30 +3475,41 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
     # Per-chunk range blobs (ctx_chunked only): concatenated finalized chunks +
     # cumulative byte-offset tables (length nchunks+1, first entry 0, last = blob len).
     resid_blob = UInt8[]; refdist_blob = UInt8[]; copy_blob = UInt8[]
+    cmd_blob = UInt8[]; flag_blob = UInt8[]
     resid_coff = Int[0]; refdist_coff = Int[0]; copy_coff = Int[0]
+    cmd_coff = Int[0]; flag_coff = Int[0]
+    function _finalize_chunk!()
+        append!(resid_blob,   rc_finish_and_reset!(resid_sink));   push!(resid_coff,   length(resid_blob))
+        append!(refdist_blob, rc_finish_and_reset!(refdist_sink)); push!(refdist_coff, length(refdist_blob))
+        append!(copy_blob,    brc_finish_and_reset!(copy_sink));   push!(copy_coff,    length(copy_blob))
+        append!(cmd_blob,     rc_finish_and_reset!(cmd_sink));     push!(cmd_coff,     length(cmd_blob))
+        append!(flag_blob,    brc_finish_and_reset!(flag_sink));   push!(flag_coff,    length(flag_blob))
+        return nothing
+    end
     if idx_mode
         # Two-pass encoding: encode per-vertex data to buffer, then write offset table + data
         buf_bw = BitWriter()
         vertex_offsets = Vector{Int}(undef, vs + 1)
 
-        for v_idx in 1:vs
-            # At each chunk boundary (aligned to the sampled-index sample points),
-            # finalize + reset the range coders so each chunk is self-contained.
-            if ctx_chunked && v_idx > 1 && (v_idx - 1) % index_sample_k == 0
-                append!(resid_blob,   rc_finish_and_reset!(resid_sink));   push!(resid_coff,   length(resid_blob))
-                append!(refdist_blob, rc_finish_and_reset!(refdist_sink)); push!(refdist_coff, length(refdist_blob))
-                append!(copy_blob,    brc_finish_and_reset!(copy_sink));   push!(copy_coff,    length(copy_blob))
+        flag_sink === nothing || (_FLAG_SINK[] = flag_sink)
+        try
+            for v_idx in 1:vs
+                # At each chunk boundary (aligned to the sampled-index sample points),
+                # finalize + reset the range coders so each chunk is self-contained.
+                if ctx_chunked && v_idx > 1 && (v_idx - 1) % index_sample_k == 0
+                    _finalize_chunk!()
+                end
+                v = T(v_idx)
+                vertex_offsets[v_idx] = _total_bits(buf_bw)
+                current_neighbors = sort(get(neighbor_lists, v, T[]))
+                _encode_vertex!(buf_bw, v, current_neighbors)
             end
-            v = T(v_idx)
-            vertex_offsets[v_idx] = _total_bits(buf_bw)
-            current_neighbors = sort(get(neighbor_lists, v, T[]))
-            _encode_vertex!(buf_bw, v, current_neighbors)
+        finally
+            _FLAG_SINK[] = nothing
         end
         if ctx_chunked
             # Finalize the last chunk.
-            append!(resid_blob,   rc_finish_and_reset!(resid_sink));   push!(resid_coff,   length(resid_blob))
-            append!(refdist_blob, rc_finish_and_reset!(refdist_sink)); push!(refdist_coff, length(refdist_blob))
-            append!(copy_blob,    brc_finish_and_reset!(copy_sink));   push!(copy_coff,    length(copy_blob))
+            _finalize_chunk!()
         end
         flush_bitwriter(buf_bw; flush_last_bits=true)
         vertex_offsets[vs + 1] = bytes_written(buf_bw) * 8
@@ -3447,15 +3542,16 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
             # End marker: total data size
             write_value(w, UInt64(vertex_offsets[vs + 1]), entry_width)
 
-            # :context_range — per-chunk byte-offset tables for the three range
-            # streams (resid, refdist, copy), each length nchunks+1 (cumulative,
-            # last = blob length). Lets a reader slice + spin up fresh decoders on
-            # the chunk containing v.
+            # :context_range — per-chunk byte-offset tables for the five range
+            # streams (resid, refdist, copy, cmd, flag), each length nchunks+1
+            # (cumulative, last = blob length). Lets a reader slice + spin up fresh
+            # decoders on the chunk containing v.
             if ctx_chunked
-                max_boff = max(resid_coff[end], refdist_coff[end], copy_coff[end])
+                max_boff = max(resid_coff[end], refdist_coff[end], copy_coff[end],
+                               cmd_coff[end], flag_coff[end])
                 coff_width = max_boff > 0 ? max(Int(ceil(log2(max_boff + 1))), 1) : 1
                 write_value(w, UInt64(coff_width), 6)
-                for offs in (resid_coff, refdist_coff, copy_coff)
+                for offs in (resid_coff, refdist_coff, copy_coff, cmd_coff, flag_coff)
                     for o in offs
                         write_value(w, UInt64(o), coff_width)
                     end
@@ -3476,22 +3572,28 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         write_bytes(w, buf_data)
     else
         # Children mode: legacy degree-count index table (not used) + sequential encoding
-        # Unified Data section
-        for v_idx in 1:vs
-            v = T(v_idx)
-            current_neighbors = sort(get(neighbor_lists, v, T[]))
-            _encode_vertex!(w, v, current_neighbors)
+        # Unified Data section. Gate the flag sink for the whole loop (2b).
+        flag_sink === nothing || (_FLAG_SINK[] = flag_sink)
+        try
+            for v_idx in 1:vs
+                v = T(v_idx)
+                current_neighbors = sort(get(neighbor_lists, v, T[]))
+                _encode_vertex!(w, v, current_neighbors)
+            end
+        finally
+            _FLAG_SINK[] = nothing
         end
     end
-    # :context_range — finalize the three range streams (all empty otherwise)
+    # :context_range — finalize the five range streams (all empty otherwise)
     if ctx_chunked
         # Already finalized per chunk; return the concatenated blobs.
-        return (resid_blob, refdist_blob, copy_blob)
+        return (resid_blob, refdist_blob, copy_blob, cmd_blob, flag_blob)
     end
     if use_ctx_range
-        return (rc_finish!(resid_sink), rc_finish!(refdist_sink), brc_finish!(copy_sink))
+        return (rc_finish!(resid_sink), rc_finish!(refdist_sink), brc_finish!(copy_sink),
+                rc_finish!(cmd_sink), brc_finish!(flag_sink))
     end
-    return (UInt8[], UInt8[], UInt8[])
+    return (UInt8[], UInt8[], UInt8[], UInt8[], UInt8[])
 end
 
 function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Type{T};
@@ -3507,6 +3609,8 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
         resid_bytes::Vector{UInt8}=UInt8[],
         refdist_bytes::Vector{UInt8}=UInt8[],
         copy_bytes::Vector{UInt8}=UInt8[],
+        cmd_bytes::Union{Nothing,Vector{UInt8}}=nothing,
+        flag_bytes::Union{Nothing,Vector{UInt8}}=nothing,
         decode_range::Union{Nothing,UnitRange{Int}}=nothing,
         seed_window::Vector{T}=T[],
         ref_resolver::Union{Nothing,Function}=nothing) where {T<:Unsigned}
@@ -3519,6 +3623,13 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
     resid_source   = ctx_range ? CtxRangeDecoder(resid_bytes) : nothing
     refdist_source = ctx_range ? CtxRangeDecoder(refdist_bytes) : nothing
     copy_source    = ctx_range ? BinRangeDecoder(copy_bytes) : nothing
+    # Phase 2b: command + flag streams. nothing = non-ctx / fibonacci files.
+    cmd_source  = (ctx_range && cmd_bytes  !== nothing) ? CtxRangeDecoder(cmd_bytes)  : nothing
+    flag_source = (ctx_range && flag_bytes !== nothing) ? BinRangeDecoder(flag_bytes) : nothing
+    # Capture the caller's flag-source global NOW — before any _setup_chunk! call
+    # mutates it — so nested RA chunk decodes (via ref_resolver) restore the OUTER
+    # call's decoder on exit, not their own.
+    _flag_prev = _FLAG_SOURCE[]
     # Read `n` copy bits from the binary range decoder into a Bool bitmap.
     _read_copy_bits(n::Int) = Bool[brc_decode_bit!(copy_source::BinRangeDecoder) for _ in 1:n]
     # Referenced-vertex adjacency lookup: local (already-decoded) first, then an
@@ -3539,6 +3650,7 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
     samp_k = 0
     # Per-chunk range-blob byte offsets (ctx_range + sampled index).
     resid_coff = Int[]; refdist_coff = Int[]; copy_coff = Int[]
+    cmd_coff = Int[]; flag_coff = Int[]
     data_start_bit = 0
     if is_index_mode
         is_sampled_index = read_bit(r)
@@ -3553,15 +3665,13 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
             for _ in 1:(n_sampled + 1)
                 push!(sampled_offsets, Int(read_value(r, entry_width, UInt64)))
             end
-            # :context_range — per-chunk byte-offset tables for the three range
+            # :context_range — per-chunk byte-offset tables for the five range
             # streams (each length nchunks+1). Enables seeking to the chunk of v.
             if ctx_range
                 coff_width = Int(read_value(r, 6, UInt64))
-                for tbl in (0, 1, 2)
+                for tbl in (resid_coff, refdist_coff, copy_coff, cmd_coff, flag_coff)
                     for _ in 1:(n_sampled + 1)
-                        o = Int(read_value(r, coff_width, UInt64))
-                        tbl == 0 ? push!(resid_coff, o) :
-                        tbl == 1 ? push!(refdist_coff, o) : push!(copy_coff, o)
+                        push!(tbl, Int(read_value(r, coff_width, UInt64)))
                     end
                 end
             end
@@ -3598,6 +3708,11 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
         resid_source   = CtxRangeDecoder(resid_bytes[resid_coff[c] + 1 : resid_coff[c + 1]])
         refdist_source = CtxRangeDecoder(refdist_bytes[refdist_coff[c] + 1 : refdist_coff[c + 1]])
         copy_source    = BinRangeDecoder(copy_bytes[copy_coff[c] + 1 : copy_coff[c + 1]])
+        if cmd_bytes !== nothing && !isempty(cmd_coff)
+            cmd_source  = CtxRangeDecoder(cmd_bytes[cmd_coff[c] + 1 : cmd_coff[c + 1]])
+            flag_source = BinRangeDecoder(flag_bytes[flag_coff[c] + 1 : flag_coff[c + 1]])
+            _FLAG_SOURCE[] = flag_source   # refresh the global gate to the new chunk decoder
+        end
         return nothing
     end
 
@@ -3632,7 +3747,7 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
                 end
             elseif enc_type == :delta
                 # Determine delta format: adaptive (per-vertex) or global
-                vertex_stop = adaptive_deltas ? read_bit(r_in) : stop_deltas
+                vertex_stop = adaptive_deltas ? _struct_read_bit(r_in) : stop_deltas
                 if vertex_stop
                     return _read_stop_delta(r_in, ie, T; vertex_id=v)
                 else
@@ -3691,9 +3806,19 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
         return copied
     end
 
+    # Split-residual override tag: from the cmd stream when 2b is active, else raw.
+    function _read_split_enc_opt(r_in::BitReader)
+        if cmd_source !== nothing
+            return ENCODING_OPTIONS[Int(rc_decode_value!(cmd_source::CtxRangeDecoder)) + 1]
+        end
+        return _read_enc_opt_tag(r_in)
+    end
+
     function _decode_vertex!(r_in::BitReader, v::T)
         # Read vertex header
-        ref_mode, enc_type, mil = _read_vertex_header_vlc(r_in; adaptive=adaptive_header)
+        ref_mode, enc_type, mil = cmd_source !== nothing ?
+            _bg_cmd_decode(Int(rc_decode_value!(cmd_source::CtxRangeDecoder)); adaptive=adaptive_header) :
+            _read_vertex_header_vlc(r_in; adaptive=adaptive_header)
 
         # Empty vertex (merged VLC code)
         if ref_mode == :empty
@@ -3741,8 +3866,8 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
                 copy_bitmap = _read_copy_bits(length(ref_nbs))
                 res_et, res_m = enc_type, mil
                 if split_residual
-                    if read_bit(r_in)
-                        res_et, res_m = _read_enc_opt_tag(r_in)
+                    if _struct_read_bit(r_in)
+                        res_et, res_m = _read_split_enc_opt(r_in)
                     end
                 end
                 # Copy-aware rank gaps: C = copied ids; decode Q in rank space then
@@ -3768,8 +3893,8 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
                 copy_bitmap = _read_adaptive_copy(r_in, ref_len, ie, T; bv_blocks=bv_blocks, compact_copy=compact_copy)
                 res_et, res_m = enc_type, mil
                 if split_residual
-                    if read_bit(r_in)
-                        res_et, res_m = _read_enc_opt_tag(r_in)
+                    if _struct_read_bit(r_in)
+                        res_et, res_m = _read_split_enc_opt(r_in)
                     end
                 end
                 residuals = _read_encoded_list_body(r_in, v, res_et, res_m)
@@ -3778,8 +3903,8 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
                 copy_positions = _read_copy_blocks(r_in, ie, T)
                 res_et, res_m = enc_type, mil
                 if split_residual
-                    if read_bit(r_in)
-                        res_et, res_m = _read_enc_opt_tag(r_in)
+                    if _struct_read_bit(r_in)
+                        res_et, res_m = _read_split_enc_opt(r_in)
                     end
                 end
                 residuals = _read_encoded_list_body(r_in, v, res_et, res_m)
@@ -3795,8 +3920,8 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
                 copy_bitmap = read_bitmap_adaptive(r_in, ie)
                 res_et, res_m = enc_type, mil
                 if split_residual
-                    if read_bit(r_in)
-                        res_et, res_m = _read_enc_opt_tag(r_in)
+                    if _struct_read_bit(r_in)
+                        res_et, res_m = _read_split_enc_opt(r_in)
                     end
                 end
                 residuals = _read_encoded_list_body(r_in, v, res_et, res_m)
@@ -3817,32 +3942,38 @@ function read_greedy_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Ty
     end
 
     # Unified Data loop. In seek mode only `decode_range` is visited; otherwise the
-    # whole graph is decoded sequentially.
+    # whole graph is decoded sequentially. (_flag_prev captured at function entry;
+    # restored in the finally so nested RA decodes hand back the outer decoder.)
     loop_range = decode_range === nothing ? (1:Int(vs)) : decode_range
-    for v_idx in loop_range
-        v = T(v_idx)
+    flag_source === nothing || (_FLAG_SOURCE[] = flag_source)
+    try
+        for v_idx in loop_range
+            v = T(v_idx)
 
-        # Chunked :context_range full decode: swap to fresh per-chunk decoders at
-        # each sample boundary. (In seek mode the chunk is already set up and the
-        # range never crosses a boundary.)
-        if ctx_chunked && decode_range === nothing && (v_idx - 1) % samp_k == 0
-            _setup_chunk!(((v_idx - 1) ÷ samp_k) + 1)
-        end
-
-        if is_index_mode && !isempty(vertex_offsets)
-            # Full index mode: empty vertex = offset[v] == offset[v+1]
-            if vertex_offsets[v_idx] == vertex_offsets[v_idx + 1]
-                neighbor_lists[v] = T[]
-                add_to_ref_window!(v)
-                continue
+            # Chunked :context_range full decode: swap to fresh per-chunk decoders at
+            # each sample boundary. (In seek mode the chunk is already set up and the
+            # range never crosses a boundary.)
+            if ctx_chunked && decode_range === nothing && (v_idx - 1) % samp_k == 0
+                _setup_chunk!(((v_idx - 1) ÷ samp_k) + 1)
             end
+
+            if is_index_mode && !isempty(vertex_offsets)
+                # Full index mode: empty vertex = offset[v] == offset[v+1]
+                if vertex_offsets[v_idx] == vertex_offsets[v_idx + 1]
+                    neighbor_lists[v] = T[]
+                    add_to_ref_window!(v)
+                    continue
+                end
+            end
+            # Sampled index mode: decode normally (count-prefixed handles empty vertices via count=0+1=1 → 0 elements)
+
+            current_neighbors = _decode_vertex!(r, v)
+
+            neighbor_lists[v] = current_neighbors
+            add_to_ref_window!(v)
         end
-        # Sampled index mode: decode normally (count-prefixed handles empty vertices via count=0+1=1 → 0 elements)
-
-        current_neighbors = _decode_vertex!(r, v)
-
-        neighbor_lists[v] = current_neighbors
-        add_to_ref_window!(v)
+    finally
+        _FLAG_SOURCE[] = _flag_prev
     end
 
     return neighbor_lists
@@ -3869,14 +4000,16 @@ function parse_bg_ctxrange_index(struct_bytes::Vector{UInt8}, vs::Int)
     end
     coff_width = Int(read_value(r, 6, UInt64))
     resid_coff = Int[]; refdist_coff = Int[]; copy_coff = Int[]
-    for tbl in (resid_coff, refdist_coff, copy_coff)
+    cmd_coff = Int[]; flag_coff = Int[]
+    for tbl in (resid_coff, refdist_coff, copy_coff, cmd_coff, flag_coff)
         for _ in 1:(n_sampled + 1)
             push!(tbl, Int(read_value(r, coff_width, UInt64)))
         end
     end
     data_start_bit = r.bit_count
     return (samp_k=samp_k, sampled_offsets=sampled_offsets, resid_coff=resid_coff,
-        refdist_coff=refdist_coff, copy_coff=copy_coff, data_start_bit=data_start_bit,
+        refdist_coff=refdist_coff, copy_coff=copy_coff, cmd_coff=cmd_coff,
+        flag_coff=flag_coff, data_start_bit=data_start_bit,
         ie=ie, n_sampled=n_sampled)
 end
 
@@ -4191,11 +4324,11 @@ end
 
 function _write_stop_delta(w::BitWriter, sorted_vals::Vector{T}, ie::Symbol; vertex_id=nothing) where {T<:Unsigned}
     if isempty(sorted_vals)
-        write_bit(w, false)  # STOP
+        _struct_write_bit(w, false)  # STOP
         return
     end
     # First value
-    write_bit(w, true)
+    _struct_write_bit(w, true)
     if vertex_id !== nothing
         offset = Int64(sorted_vals[1]) - Int64(vertex_id)
         write_encoded_value(w, UInt64(_zigzag_encode(offset) + 1), ie)
@@ -4204,17 +4337,17 @@ function _write_stop_delta(w::BitWriter, sorted_vals::Vector{T}, ie::Symbol; ver
     end
     # Remaining: gaps (>= 1 for sorted unique lists)
     for i in 2:length(sorted_vals)
-        write_bit(w, true)
+        _struct_write_bit(w, true)
         write_encoded_value(w, sorted_vals[i] - sorted_vals[i-1], ie)
     end
-    write_bit(w, false)  # STOP
+    _struct_write_bit(w, false)  # STOP
 end
 
 function _read_stop_delta(r::BitReader, ie::Symbol, ::Type{T}; vertex_id=nothing) where {T<:Unsigned}
     result = T[]
     first = true
     prev = zero(T)
-    while read_bit(r)  # '1' = more values, '0' = STOP
+    while _struct_read_bit(r)  # '1' = more values, '0' = STOP
         if first
             if vertex_id !== nothing
                 raw64 = read_encoded_value(r, ie, UInt64)
@@ -4887,6 +5020,28 @@ function _read_cs_header(r)
     return (false, ref_mode, enc_type, mil)
 end
 
+# Phase 2b: CS command as a single small integer for the context-modeled command
+# stream. 0 = empty; else 1 + (ref ? |OPTS| : 0) + (opt_idx - 1) over
+# ENCODING_OPTIONS (9 options) → ids 0..18, all direct hybrid-uint tokens (< 2^K).
+function _cs_cmd_id(ref_mode::Symbol, enc_type::Symbol, mil::Int, is_empty::Bool)::Int
+    is_empty && return 0
+    opt = enc_type == :delta ? (:delta, 0) : (enc_type, mil)
+    idx = findfirst(==(opt), ENCODING_OPTIONS)
+    idx === nothing && (idx = 3)
+    return 1 + (ref_mode == :reference ? length(ENCODING_OPTIONS) : 0) + (idx - 1)
+end
+
+# Inverse of _cs_cmd_id; returns (is_empty, ref_mode, enc_type, mil) matching the
+# _read_cs_header tuple shape (mil = 0 for :delta, as in the raw header codes).
+function _cs_cmd_decode(id::Int)
+    id == 0 && return (true, :none, :delta, 0)
+    t = id - 1
+    nopt = length(ENCODING_OPTIONS)
+    ref_mode = t >= nopt ? :reference : :none
+    enc_type, mil = ENCODING_OPTIONS[(t % nopt) + 1]
+    return (false, ref_mode, enc_type, mil)
+end
+
 function _cs_vertex_search(neighbors::Vector{T}, neighbor_lists::Dict{T,Vector{T}},
                            ref_window::Vector{T}, ie::Symbol;
                            vertex_id=nothing, compact_copy::Bool=true,
@@ -5006,6 +5161,12 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
     refdist_sink = use_ctx_range ? CtxRangeEncoder() : nothing
     copy_sink    = use_ctx_range ? BinRangeEncoder() : nothing
     idx_mode = coding_scheme == :index
+    # Phase 2b: CS command headers → context range coder; stop-delta / RLE-section
+    # flags → adaptive binary coder. In sampled-index (RA) mode both streams are
+    # chunked alongside resid/refdist/copy (headers decode sequentially within a
+    # chunk, so they don't need to stay in the seekable struct stream).
+    cmd_sink  = use_ctx_range ? CtxRangeEncoder() : nothing
+    flag_sink = use_ctx_range ? BinRangeEncoder() : nothing
     sampled_idx = idx_mode && index_sample_k > 0
     if use_ctx_range && idx_mode && !sampled_idx
         # Full (per-vertex) index needs a continuous range blob → not seekable.
@@ -5040,7 +5201,11 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         if isempty(current_neighbors)
             if !idx_mode || sampled_idx
                 # Children mode (or sampled index): write explicit empty CS header
-                _write_cs_header(wr, :none, :delta, 0, true)
+                if cmd_sink !== nothing
+                    rc_encode_value!(cmd_sink, UInt64(_cs_cmd_id(:none, :delta, 0, true)))
+                else
+                    _write_cs_header(wr, :none, :delta, 0, true)
+                end
             end
             # Full index mode: nothing written (empty = offset[v] == offset[v+1])
             add_to_ref_window!(v)
@@ -5055,7 +5220,11 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
             ws=_ws, cost_model=cost_model)
 
         # Write CS header
-        _write_cs_header(wr, ref_mode, enc_type, mil, false)
+        if cmd_sink !== nothing
+            rc_encode_value!(cmd_sink, UInt64(_cs_cmd_id(ref_mode, enc_type, mil, false)))
+        else
+            _write_cs_header(wr, ref_mode, enc_type, mil, false)
+        end
 
         target_list = current_neighbors
         if ref_mode != :none && ref_result !== nothing
@@ -5125,30 +5294,41 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
     # Per-chunk range blobs (ctx_chunked only): concatenated finalized chunks +
     # cumulative byte-offset tables (length nchunks+1, first entry 0, last = blob len).
     resid_blob = UInt8[]; refdist_blob = UInt8[]; copy_blob = UInt8[]
+    cmd_blob = UInt8[]; flag_blob = UInt8[]
     resid_coff = Int[0]; refdist_coff = Int[0]; copy_coff = Int[0]
+    cmd_coff = Int[0]; flag_coff = Int[0]
+    function _finalize_chunk!()
+        append!(resid_blob,   rc_finish_and_reset!(resid_sink));   push!(resid_coff,   length(resid_blob))
+        append!(refdist_blob, rc_finish_and_reset!(refdist_sink)); push!(refdist_coff, length(refdist_blob))
+        append!(copy_blob,    brc_finish_and_reset!(copy_sink));   push!(copy_coff,    length(copy_blob))
+        append!(cmd_blob,     rc_finish_and_reset!(cmd_sink));     push!(cmd_coff,     length(cmd_blob))
+        append!(flag_blob,    brc_finish_and_reset!(flag_sink));   push!(flag_coff,    length(flag_blob))
+        return nothing
+    end
     if idx_mode
         # Two-pass encoding: encode per-vertex data to buffer, then write offset table + data
         buf_bw = BitWriter()
         vertex_offsets = Vector{Int}(undef, vs + 1)
 
-        for v_idx in 1:vs
-            # At each chunk boundary (aligned to the sample points), finalize + reset
-            # the range coders so each chunk is independently decodable.
-            if ctx_chunked && v_idx > 1 && (v_idx - 1) % index_sample_k == 0
-                append!(resid_blob,   rc_finish_and_reset!(resid_sink));   push!(resid_coff,   length(resid_blob))
-                append!(refdist_blob, rc_finish_and_reset!(refdist_sink)); push!(refdist_coff, length(refdist_blob))
-                append!(copy_blob,    brc_finish_and_reset!(copy_sink));   push!(copy_coff,    length(copy_blob))
+        flag_sink === nothing || (_FLAG_SINK[] = flag_sink)
+        try
+            for v_idx in 1:vs
+                # At each chunk boundary (aligned to the sample points), finalize + reset
+                # the range coders so each chunk is independently decodable.
+                if ctx_chunked && v_idx > 1 && (v_idx - 1) % index_sample_k == 0
+                    _finalize_chunk!()
+                end
+                v = T(v_idx)
+                vertex_offsets[v_idx] = _total_bits(buf_bw)
+                current_neighbors = sort(get(neighbor_lists, v, T[]))
+                _encode_cs_vertex!(buf_bw, v, current_neighbors)
             end
-            v = T(v_idx)
-            vertex_offsets[v_idx] = _total_bits(buf_bw)
-            current_neighbors = sort(get(neighbor_lists, v, T[]))
-            _encode_cs_vertex!(buf_bw, v, current_neighbors)
+        finally
+            _FLAG_SINK[] = nothing
         end
         if ctx_chunked
             # Finalize the last chunk.
-            append!(resid_blob,   rc_finish_and_reset!(resid_sink));   push!(resid_coff,   length(resid_blob))
-            append!(refdist_blob, rc_finish_and_reset!(refdist_sink)); push!(refdist_coff, length(refdist_blob))
-            append!(copy_blob,    brc_finish_and_reset!(copy_sink));   push!(copy_coff,    length(copy_blob))
+            _finalize_chunk!()
         end
         flush_bitwriter(buf_bw; flush_last_bits=true)
         vertex_offsets[vs + 1] = bytes_written(buf_bw) * 8
@@ -5174,14 +5354,15 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
             end
             write_value(w, UInt64(vertex_offsets[vs + 1]), entry_width)
 
-            # :context_range — per-chunk byte-offset tables for the three range
+            # :context_range — per-chunk byte-offset tables for the five range
             # streams (each length nchunks+1). Same layout BG writes / the shared
             # parse_bg_ctxrange_index reads.
             if ctx_chunked
-                max_boff = max(resid_coff[end], refdist_coff[end], copy_coff[end])
+                max_boff = max(resid_coff[end], refdist_coff[end], copy_coff[end],
+                               cmd_coff[end], flag_coff[end])
                 coff_width = max_boff > 0 ? max(Int(ceil(log2(max_boff + 1))), 1) : 1
                 write_value(w, UInt64(coff_width), 6)
-                for offs in (resid_coff, refdist_coff, copy_coff)
+                for offs in (resid_coff, refdist_coff, copy_coff, cmd_coff, flag_coff)
                     for o in offs
                         write_value(w, UInt64(o), coff_width)
                     end
@@ -5200,21 +5381,28 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         buf_data = collect(get_bytes(buf_bw))
         write_bytes(w, buf_data)
     else
-        # Children mode: sequential encoding
-        for v_idx in 1:vs
-            v = T(v_idx)
-            current_neighbors = sort(get(neighbor_lists, v, T[]))
-            _encode_cs_vertex!(w, v, current_neighbors)
+        # Children mode: sequential encoding. Gate the flag sink for the whole
+        # loop (stop-delta / RLE flags divert to the binary coder in ctx mode).
+        flag_sink === nothing || (_FLAG_SINK[] = flag_sink)
+        try
+            for v_idx in 1:vs
+                v = T(v_idx)
+                current_neighbors = sort(get(neighbor_lists, v, T[]))
+                _encode_cs_vertex!(w, v, current_neighbors)
+            end
+        finally
+            _FLAG_SINK[] = nothing
         end
     end
-    # :context_range — finalize the three range streams.
+    # :context_range — finalize the five range streams.
     if ctx_chunked
         # Already finalized per chunk; return the concatenated blobs.
-        return (resid_blob, refdist_blob, copy_blob)
+        return (resid_blob, refdist_blob, copy_blob, cmd_blob, flag_blob)
     elseif use_ctx_range
-        return (rc_finish!(resid_sink), rc_finish!(refdist_sink), brc_finish!(copy_sink))
+        return (rc_finish!(resid_sink), rc_finish!(refdist_sink), brc_finish!(copy_sink),
+                rc_finish!(cmd_sink), brc_finish!(flag_sink))
     end
-    return (UInt8[], UInt8[], UInt8[])
+    return (UInt8[], UInt8[], UInt8[], UInt8[], UInt8[])
 end
 
 function read_cmdstream_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, ::Type{T};
@@ -5225,6 +5413,8 @@ function read_cmdstream_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, :
         resid_bytes::Vector{UInt8}=UInt8[],
         refdist_bytes::Vector{UInt8}=UInt8[],
         copy_bytes::Vector{UInt8}=UInt8[],
+        cmd_bytes::Union{Nothing,Vector{UInt8}}=nothing,
+        flag_bytes::Union{Nothing,Vector{UInt8}}=nothing,
         decode_range::Union{Nothing,UnitRange{Int}}=nothing,
         seed_window::Vector{T}=T[],
         ref_resolver::Union{Nothing,Function}=nothing) where {T<:Unsigned}
@@ -5234,6 +5424,13 @@ function read_cmdstream_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, :
     resid_source   = ctx_range ? CtxRangeDecoder(resid_bytes) : nothing
     refdist_source = ctx_range ? CtxRangeDecoder(refdist_bytes) : nothing
     copy_source    = ctx_range ? BinRangeDecoder(copy_bytes) : nothing
+    # Phase 2b: command + flag streams. nothing = non-ctx / fibonacci files.
+    cmd_source  = (ctx_range && cmd_bytes  !== nothing) ? CtxRangeDecoder(cmd_bytes)  : nothing
+    flag_source = (ctx_range && flag_bytes !== nothing) ? BinRangeDecoder(flag_bytes) : nothing
+    # Capture the caller's flag-source global NOW — before any _setup_chunk! call
+    # mutates it — so nested RA chunk decodes (via ref_resolver) restore the OUTER
+    # call's decoder on exit, not their own.
+    _flag_prev = _FLAG_SOURCE[]
     _read_copy_bits(n::Int) = Bool[brc_decode_bit!(copy_source::BinRangeDecoder) for _ in 1:n]
     # Referenced-vertex adjacency lookup: local (already-decoded) first, then an
     # optional external resolver (random-access: materialise a referenced vertex in
@@ -5252,6 +5449,7 @@ function read_cmdstream_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, :
     is_sampled_index = false
     samp_k = 0
     resid_coff = Int[]; refdist_coff = Int[]; copy_coff = Int[]
+    cmd_coff = Int[]; flag_coff = Int[]
     data_start_bit = 0
     if is_index_mode
         is_sampled_index = read_bit(r)
@@ -5269,11 +5467,9 @@ function read_cmdstream_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, :
             # :context_range — per-chunk byte-offset tables (each length nchunks+1).
             if ctx_range
                 coff_width = Int(read_value(r, 6, UInt64))
-                for tbl in (0, 1, 2)
+                for tbl in (resid_coff, refdist_coff, copy_coff, cmd_coff, flag_coff)
                     for _ in 1:(n_sampled + 1)
-                        o = Int(read_value(r, coff_width, UInt64))
-                        tbl == 0 ? push!(resid_coff, o) :
-                        tbl == 1 ? push!(refdist_coff, o) : push!(copy_coff, o)
+                        push!(tbl, Int(read_value(r, coff_width, UInt64)))
                     end
                 end
             end
@@ -5308,6 +5504,11 @@ function read_cmdstream_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, :
         resid_source   = CtxRangeDecoder(resid_bytes[resid_coff[c] + 1 : resid_coff[c + 1]])
         refdist_source = CtxRangeDecoder(refdist_bytes[refdist_coff[c] + 1 : refdist_coff[c + 1]])
         copy_source    = BinRangeDecoder(copy_bytes[copy_coff[c] + 1 : copy_coff[c + 1]])
+        if cmd_bytes !== nothing && !isempty(cmd_coff)
+            cmd_source  = CtxRangeDecoder(cmd_bytes[cmd_coff[c] + 1 : cmd_coff[c + 1]])
+            flag_source = BinRangeDecoder(flag_bytes[flag_coff[c] + 1 : flag_coff[c + 1]])
+            _FLAG_SOURCE[] = flag_source   # refresh the global gate to the new chunk decoder
+        end
         return nothing
     end
 
@@ -5363,7 +5564,9 @@ function read_cmdstream_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, :
 
     # Decode one vertex's neighbor list (header already positioned at r_in).
     function _decode_cs_vertex!(r_in::BitReader, v::T)
-        is_empty, ref_mode, enc_type, mil = _read_cs_header(r_in)
+        is_empty, ref_mode, enc_type, mil = cmd_source !== nothing ?
+            _cs_cmd_decode(Int(rc_decode_value!(cmd_source::CtxRangeDecoder))) :
+            _read_cs_header(r_in)
         is_empty && return T[]
 
         if ref_mode != :none
@@ -5393,28 +5596,35 @@ function read_cmdstream_graph_data(r::BitReader, vs::T, coding_scheme::Symbol, :
         end
     end
 
-    # Unified data loop. In seek mode only `decode_range` is visited.
+    # Unified data loop. In seek mode only `decode_range` is visited. (_flag_prev
+    # captured at function entry; restored in the finally so nested RA decodes
+    # hand back the outer decoder.)
     loop_range = decode_range === nothing ? (1:Int(vs)) : decode_range
-    for v_idx in loop_range
-        v = T(v_idx)
+    flag_source === nothing || (_FLAG_SOURCE[] = flag_source)
+    try
+        for v_idx in loop_range
+            v = T(v_idx)
 
-        # Chunked full decode: swap to fresh per-chunk decoders at each sample
-        # boundary. (In seek mode the chunk is already set up.)
-        if ctx_chunked && decode_range === nothing && (v_idx - 1) % samp_k == 0
-            _setup_chunk!(((v_idx - 1) ÷ samp_k) + 1)
-        end
-
-        if is_index_mode && !is_sampled_index
-            # Full index mode: empty vertex = offset[v] == offset[v+1]
-            if vertex_offsets[v_idx] == vertex_offsets[v_idx + 1]
-                neighbor_lists[v] = T[]
-                add_to_ref_window!(v)
-                continue
+            # Chunked full decode: swap to fresh per-chunk decoders at each sample
+            # boundary. (In seek mode the chunk is already set up.)
+            if ctx_chunked && decode_range === nothing && (v_idx - 1) % samp_k == 0
+                _setup_chunk!(((v_idx - 1) ÷ samp_k) + 1)
             end
-        end
 
-        neighbor_lists[v] = _decode_cs_vertex!(r, v)
-        add_to_ref_window!(v)
+            if is_index_mode && !is_sampled_index
+                # Full index mode: empty vertex = offset[v] == offset[v+1]
+                if vertex_offsets[v_idx] == vertex_offsets[v_idx + 1]
+                    neighbor_lists[v] = T[]
+                    add_to_ref_window!(v)
+                    continue
+                end
+            end
+
+            neighbor_lists[v] = _decode_cs_vertex!(r, v)
+            add_to_ref_window!(v)
+        end
+    finally
+        _FLAG_SOURCE[] = _flag_prev
     end
 
     return neighbor_lists

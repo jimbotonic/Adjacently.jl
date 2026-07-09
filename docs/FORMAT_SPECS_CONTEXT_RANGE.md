@@ -16,9 +16,9 @@ self-describing: `load_compressed_mgs3_graph(path)` needs no parameters.
 
 ---
 
-## 1. Three-stream design
+## 1. Five-stream design (BG/CS, v3.3 "phase 2b") / three-stream (CG)
 
-A reference-compressed adjacency record splits into three kinds of integers, each
+A reference-compressed adjacency record splits into distinct symbol kinds, each
 routed to its own coder so the adaptive statistics never mix:
 
 | Stream | Coder | Carries |
@@ -26,27 +26,34 @@ routed to its own coder so the adaptive statistics never mix:
 | `resid` | `CtxRangeEncoder` (hybrid-uint) | residual neighbor ids (the non-copied part of each list) |
 | `refdist` | `CtxRangeEncoder` (hybrid-uint) | reference distances (window back-pointers) |
 | `copy` | `BinRangeEncoder` (binary) | the copy bitmap bits (which reference neighbors are reused) |
+| `cmd` (BG/CS) | `CtxRangeEncoder` (hybrid-uint) | per-vertex command headers as single small-int symbols — CS: `_cs_cmd_id` (empty + ref×ENCODING_OPTIONS, ids 0–18); BG: `_bg_cmd_id` (the 28 merged-VLC actions; 4-id alphabet in `adaptive_header` mode). Split-residual enc-opt tags also ride this stream. |
+| `flag` (BG/CS) | `BinRangeEncoder` (binary) | structural flag bits: stop-delta continuation/STOP bits, hybrid-RLE section flags, empty-vertex STOP, split-residual signal, adaptive-delta per-vertex flag — diverted via `_struct_write_bit`/`_struct_read_bit` gated on `_FLAG_SINK`/`_FLAG_SOURCE` |
 
-Structural bits that are **not** value integers — vertex/VLC headers, adaptive-stop
-flags, interval-mode continuation bits, split-residual tags — stay in the classic
-bitstream (`struct`), written with Fibonacci as before. Only value integers move to
-the range coders. (This is why a naïve "range-code the whole residual region"
-estimate over-counts: ~0.2–0.3 BPE of that region is structural flag bits that never
-route through a coder.)
+After 2b the BG/CS `struct` stream carries only the global tag + (in index mode)
+the offset tables — no per-vertex raw bits remain. CG still uses the original
+three-stream design (its headers/flags stay Fibonacci in `struct`). Historical
+note: pre-2b files kept headers/flags raw in `struct` (~0.2–0.3 BPE of never-
+entropy-coded bits — the reason Zuckerli used to win in-2004); v3.2 ctx files are
+no longer decodable, re-encode them.
 
 ## 2. File layout (multi-section)
 
-Whole-graph `:context_range` files use a four-section body after the 12-byte header:
+`:context_range` BG/CS files (children **and** index/RA, header minor = `0x03`)
+use a six-section body after the 12-byte header:
+
+```
+[12-byte header (minor 0x03)]
+[8-byte LE lengths ×5: struct, refdist, copy, cmd, flag]
+[struct] [refdist] [copy] [cmd] [flag] [resid bytes → EOF]
+```
+
+CG ctx files keep the three-length, four-section layout:
 
 ```
 [12-byte header]
-[8-byte LE length: struct] [8-byte LE length: refdist] [8-byte LE length: copy]
-[struct bytes] [refdist bytes] [copy bytes] [resid bytes]
+[8-byte LE lengths ×3: struct, refdist, copy]
+[struct] [refdist] [copy] [resid bytes → EOF]
 ```
-
-The three explicit lengths let the loader slice the four blobs; `resid` runs to EOF.
-`struct` is the classic bitstream (headers, offset tables, flags); the other three
-are finalized range-coder byte streams. Identical layout for BG, CS, and CG.
 
 ## 3. Hybrid-uint token
 
@@ -106,10 +113,12 @@ a sampled index** (`index_sample_k > 0`, a multiple of 4). Requesting `coding_sc
 
 ### Chunking
 
-Every `index_sample_k` vertices, the three coders are finalized to bytes and reset to
-fresh adaptive models (`rc_finish_and_reset!` / `brc_finish_and_reset!`), producing a
-sequence of independently-decodable chunks aligned to the sample points. The
-concatenated chunk bytes are the `resid` / `refdist` / `copy` blobs.
+Every `index_sample_k` vertices, all **five** coders are finalized to bytes and reset
+to fresh adaptive models (`rc_finish_and_reset!` / `brc_finish_and_reset!`), producing
+a sequence of independently-decodable chunks aligned to the sample points. The
+concatenated chunk bytes are the `resid` / `refdist` / `copy` / `cmd` / `flag` blobs.
+Per-vertex command headers live in the chunked `cmd` stream (a chunk decodes
+sequentially from its start, so headers don't need to stay in the seekable `struct`).
 
 ### On-disk additions (in the `struct` stream)
 
@@ -122,12 +131,13 @@ for `:context_range` only:
 [6 bits: entry_width]
 [ (⌈n/k⌉+1) × entry_width ]         # sampled per-vertex bit offsets (jump to chunk's first vertex)
 [6 bits: coff_width]
-[ 3 × (⌈n/k⌉+1) × coff_width ]      # per-chunk cumulative BYTE offsets: resid, refdist, copy
+[ 5 × (⌈n/k⌉+1) × coff_width ]      # per-chunk cumulative BYTE offsets: resid, refdist, copy, cmd, flag
 ```
 
-The three per-chunk byte-offset tables let a reader slice out the byte range of any
-chunk. `k` is stored in 32 bits (vs the classic 8-bit `(k/4−1)`, capped at 1024) so
-large chunk sizes are expressible.
+The per-chunk byte-offset tables let a reader slice out the byte range of any chunk.
+`k` is stored in 32 bits (vs the classic 8-bit `(k/4−1)`, capped at 1024) so large
+chunk sizes are expressible. Larger `k` trades seek granularity for ratio (fewer
+model resets); on small graphs `k ≥ 2048` is markedly better.
 
 ### Seek + cross-chunk references
 
@@ -151,9 +161,9 @@ identical). Overhead is small: eat `k=1024` ≈ +0.07–0.08 BPE (~1%).
 
 | Encoder | Whole-graph `:context_range` | Random access (`:index` + sampled) |
 |---------|:---:|:---:|
-| **BG** | ✅ 3-stream, multi-ref, rank gaps | ✅ chunked (`_load_bg_ctxrange_random_access`) |
-| **CS** | ✅ 3-stream, rank gaps | ✅ chunked (`_load_cs_ctxrange_random_access`) |
-| **CG** | ✅ children mode (CG-1/2/3), rank gaps | ❌ not implemented — the ctx path falls back to Fibonacci when `cluster_offsets` is set; index-mode ctx is future work |
+| **BG** | ✅ 5-stream (2b), multi-ref, rank gaps | ✅ chunked ×5 (`_load_bg_ctxrange_random_access`) |
+| **CS** | ✅ 5-stream (2b), rank gaps | ✅ chunked ×5 (`_load_cs_ctxrange_random_access`) |
+| **CG** | ✅ children mode (CG-1/2/3), rank gaps, 3-stream | ✅ cluster-chunked (`_load_cg_ctxrange_random_access`): cluster = chunk; struct = `[cluster offset table][coff_width + 3×(K+1) chunk byte-offset tables][data]`; `decode_level(only_cluster=…)` decodes one cluster's intra + inter sections; intra refs never cross clusters, so no resolver recursion |
 
 BG and CS share the same `struct`-header layout, so `parse_bg_ctxrange_index` and the
 chunked reader logic are common. CG routes residual/copy/refdist through the same three
@@ -170,6 +180,11 @@ _encode_level_body!`) that keeps the union-typed sink locals out of the large bo
 - `_RESID_SINK` / `_RESID_SOURCE` are process globals gating the residual redirect;
   they are reset at each encode/decode entry so a prior run cannot leak into the next
   graph's Fibonacci path.
+- `_FLAG_SINK` / `_FLAG_SOURCE` gate the 2b flag-bit redirect. The decoder **saves the
+  global at function entry and restores it on exit** (not null-on-exit): RA chunk
+  decodes recurse via `ref_resolver`, and the nested call must hand the outer call's
+  chunk decoder back. The save must happen before the seek-mode `_setup_chunk!`
+  mutates the global.
 - Lossless and byte-exact: the range coders reproduce the prototype `ctx_encode_typed`
   output bit-for-bit; whole-graph and random-access decodes are verified against the
   original adjacency.

@@ -1011,7 +1011,8 @@ per grid point — expensive on very large graphs, so prefer a fixed `Int` there
 """
 function relabel_graph_leiden_llp(g::AbstractGraph{T}; llp_mode::Symbol=:sym, llp_passes::Int=5,
                                   sort_clusters::Symbol=:size_desc,
-                                  merge_clusters::Union{Nothing,Integer,Symbol}=nothing) where {T<:Unsigned}
+                                  merge_clusters::Union{Nothing,Integer,Symbol}=nothing,
+                                  return_clusters::Bool=false) where {T<:Unsigned}
     # Step 1: Leiden partition → fine clusters (label vector)
     part = leiden_partition(g)
 
@@ -1034,6 +1035,22 @@ function relabel_graph_leiden_llp(g::AbstractGraph{T}; llp_mode::Symbol=:sym, ll
     vertex_map = Dict{T,T}()
     for (new_id, old_id) in enumerate(new_order)
         vertex_map[old_id] = T(new_id)
+    end
+    if return_clusters
+        # Cluster sizes in concatenation order: in the NEW labeling each Leiden
+        # cluster occupies one contiguous ID range (new_order concatenates whole
+        # clusters), so the sizes fully describe the partition (implicit_ranges).
+        seg_sizes = Int[]
+        prev_label = -1
+        for old_id in new_order
+            l = part[Int(old_id)]
+            if l != prev_label
+                push!(seg_sizes, 0)
+                prev_label = l
+            end
+            seg_sizes[end] += 1
+        end
+        return relabel_graph(g, vertex_map), vertex_map, seg_sizes
     end
     return relabel_graph(g, vertex_map), vertex_map
 end
