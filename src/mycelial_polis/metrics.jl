@@ -275,6 +275,23 @@ default_phi_weights() = (
 )
 
 """
+    phi_components(world) -> NamedTuple
+
+Per-step raw inputs to the Φ composite, each already normalised to `[0, 1]`
+(`kcore` is clamped by `kcore_scale`). Returned separately so the composite is
+transparent and Φ can be recomputed offline under arbitrary `phi_weights`
+(Path 1 R_NH sensitivity). `phi` is the `phi_weights`-weighted sum of these.
+"""
+function phi_components(world::World)
+    kcore_scale = Float32(get(world.params, :kcore_scale, 10))
+    return (core       = committed_frac(world),
+            giant      = giant_active_frac(world),
+            kcore      = min(Float32(kcore_depth(world) / kcore_scale), 1f0),
+            psi_T      = psi_T(world),
+            lambda_sat = lambda_sat(world))
+end
+
+"""
     phi(world; partition=nothing) -> Float32 in [0,1]
 
 §14 viability composite. Uses `world.params.phi_weights` if present,
@@ -286,18 +303,13 @@ function phi(world::World; partition::Union{Nothing,Vector{Int}}=nothing)
     n = length(world.agents)
     n == 0 && return 0f0
     w = get(world.params, :phi_weights, default_phi_weights())
-    kcore_scale = Float32(get(world.params, :kcore_scale, 10))
-    core_f  = committed_frac(world)
-    giant_f = giant_active_frac(world)
-    kcore_f = Float32(kcore_depth(world) / kcore_scale)
-    psi     = psi_T(world)
-    lsat    = lambda_sat(world)
+    c = phi_components(world)
     return clamp(
-        w.core      * core_f +
-        w.giant     * giant_f +
-        w.kcore     * min(kcore_f, 1f0) +
-        w.psi_T     * psi +
-        w.lambda_sat * lsat,
+        w.core       * c.core +
+        w.giant      * c.giant +
+        w.kcore      * c.kcore +
+        w.psi_T      * c.psi_T +
+        w.lambda_sat * c.lambda_sat,
         0f0, 1f0)
 end
 
@@ -431,6 +443,8 @@ function snapshot(world::World; t::Int, attacked::Int=0,
                   partition::Union{Nothing,Vector{Int}}=nothing)
     Λ   = lambda(world)
     Λs  = lambda_sat(world)
+    pc  = phi_components(world)        # 5 Φ inputs, each ∈ [0,1]
+    hc  = hierarchy_components(world)  # 4 H inputs, each ∈ [0,1]
     return (
         t              = t,
         n_active       = active_count(world),
@@ -452,8 +466,49 @@ function snapshot(world::World; t::Int, attacked::Int=0,
         Gamma          = gamma(world),
         Phi            = phi(world; partition=partition),
         H              = hierarchy_score(world),
+        # --- Φ components (Path 1: offline R_NH sensitivity to phi_weights) ---
+        phi_core       = pc.core,
+        phi_giant      = pc.giant,
+        phi_kcore      = pc.kcore,
+        phi_psi_T      = pc.psi_T,
+        phi_lambda_sat = pc.lambda_sat,
+        # --- H components (offline sensitivity to H-weighting / thresholds) ---
+        h_steward_conc = hc.steward_concentration,
+        h_infra_conc   = hc.infra_concentration,
+        h_faction_dom  = hc.faction_dominance,
+        h_steward_frac = hc.steward_fraction,
         n_attacked     = attacked,
         n_defected     = defected,
         n_backfired    = backfired,
     )
+end
+
+"""
+    write_metrics_tsv(path, snaps; prefix=nothing)
+
+Serialise a vector of `snapshot` NamedTuples to a TSV at `path`, one row per
+snapshot, header derived dynamically from the snapshot keys (so the Φ/H
+component columns added for Path 1 are always included — no hand-maintained
+column list to fall out of sync).
+
+`prefix`, if given, is a vector of NamedTuples of the same length as `snaps`
+providing leading run-identifier columns (e.g. `(scenario=..., seed=...)`);
+its keys are prepended to the header and its values to each row. All `prefix`
+entries must share the same keys.
+"""
+function write_metrics_tsv(path::AbstractString, snaps::AbstractVector;
+                           prefix::Union{Nothing,AbstractVector}=nothing)
+    isempty(snaps) && (touch(path); return path)
+    prefix !== nothing && length(prefix) != length(snaps) &&
+        throw(ArgumentError("prefix length $(length(prefix)) != snaps length $(length(snaps))"))
+    pcols = prefix === nothing ? () : keys(prefix[1])
+    scols = keys(snaps[1])
+    open(path, "w") do io
+        println(io, join(string.((pcols..., scols...)), '\t'))
+        for (i, s) in enumerate(snaps)
+            pvals = prefix === nothing ? () : values(prefix[i])
+            println(io, join(string.((pvals..., values(s)...)), '\t'))
+        end
+    end
+    return path
 end
