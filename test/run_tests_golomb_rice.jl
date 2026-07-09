@@ -18,7 +18,7 @@
 # Test Golomb-Rice encoding/decoding
 
 using Pkg
-Pkg.activate(@__DIR__)
+Pkg.activate(normpath(joinpath(@__DIR__, "..")))
 
 using Adjacently.Compression: write_golomb_rice, read_golomb_rice
 using Adjacently.IO: BitWriter, BitReader, flush_bitwriter

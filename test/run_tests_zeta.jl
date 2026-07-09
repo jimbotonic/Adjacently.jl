@@ -15,6 +15,8 @@
 
 include("run_tests_main.jl")
 
+using Adjacently.MGS: write_bg_mgs3_graph
+
 """
     unary_bits(v::T) where {T<:Unsigned}
 
@@ -55,7 +57,7 @@ Return zeta code as a BitVector for a given value.
 function zeta_bits(v::T, k::Int) where {T<:Unsigned}
     io = IOBuffer()
     writer = BitWriter(io)
-    write_zeta_coding(writer, v, k)
+    write_zeta(writer, v, k)
     nbits = writer.bits_in # capture number of bits before flush resets it
     flush_bitwriter(writer; flush_last_bits=true)
     seekstart(io)
@@ -160,14 +162,14 @@ end
 end
 
 @testset "Zeta Decoding" begin
-    @test read_zeta_coding(bitvector_to_bitreader(BitVector([1])), 1, UInt8) == UInt8(1)
-    @test read_zeta_coding(bitvector_to_bitreader(BitVector([0, 1, 0])), 1, UInt8) == UInt8(2)
-    @test read_zeta_coding(bitvector_to_bitreader(BitVector([0, 1, 1])), 1, UInt8) == UInt8(3)
-    @test read_zeta_coding(bitvector_to_bitreader(BitVector([0, 0, 1, 0, 0])), 1, UInt8) == UInt8(4)
-    @test read_zeta_coding(bitvector_to_bitreader(BitVector([0, 0, 1, 0, 1])), 1, UInt8) == UInt8(5)
-    @test read_zeta_coding(bitvector_to_bitreader(BitVector([0, 0, 1, 1, 0])), 1, UInt8) == UInt8(6)
-    @test read_zeta_coding(bitvector_to_bitreader(BitVector([0, 0, 1, 1, 1])), 1, UInt8) == UInt8(7)
-    @test read_zeta_coding(bitvector_to_bitreader(BitVector([0, 0, 0, 1, 0, 0, 0])), 1, UInt8) == UInt8(8)
+    @test read_zeta(bitvector_to_bitreader(BitVector([1])), 1, UInt8) == UInt8(1)
+    @test read_zeta(bitvector_to_bitreader(BitVector([0, 1, 0])), 1, UInt8) == UInt8(2)
+    @test read_zeta(bitvector_to_bitreader(BitVector([0, 1, 1])), 1, UInt8) == UInt8(3)
+    @test read_zeta(bitvector_to_bitreader(BitVector([0, 0, 1, 0, 0])), 1, UInt8) == UInt8(4)
+    @test read_zeta(bitvector_to_bitreader(BitVector([0, 0, 1, 0, 1])), 1, UInt8) == UInt8(5)
+    @test read_zeta(bitvector_to_bitreader(BitVector([0, 0, 1, 1, 0])), 1, UInt8) == UInt8(6)
+    @test read_zeta(bitvector_to_bitreader(BitVector([0, 0, 1, 1, 1])), 1, UInt8) == UInt8(7)
+    @test read_zeta(bitvector_to_bitreader(BitVector([0, 0, 0, 1, 0, 0, 0])), 1, UInt8) == UInt8(8)
 end
 
 @testset "Zeta Compression" begin
@@ -194,7 +196,7 @@ end
     for encoding_type in encoding_types
         for compression_type in compression_types
             @info("Writing compressed MGS3 graph with $encoding_type encoding and $compression_type compression")
-            write_compressed_mgs3_graph(amz_core, mgs_output_file * "_" * string(encoding_type) * "_" * string(compression_type), encoding_type, compression_type)
+            write_bg_mgs3_graph(amz_core, mgs_output_file * "_" * string(encoding_type) * "_" * string(compression_type); coding_scheme=encoding_type, integer_encoding=compression_type)
         end
     end
 

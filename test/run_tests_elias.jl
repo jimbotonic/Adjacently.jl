@@ -15,6 +15,8 @@
 
 include("run_tests_main.jl")
 
+using Adjacently.MGS: write_bg_mgs3_graph
+
 """
     elias_bits(v::T) where {T<:Unsigned}
 
@@ -84,7 +86,7 @@ end
     for encoding_type in encoding_types
         for compression_type in compression_types
             @info("Writing compressed MGS3 graph with $encoding_type encoding and $compression_type compression")
-            write_compressed_mgs3_graph(amz_core, mgs_output_file * "_" * string(encoding_type) * "_" * string(compression_type), encoding_type, compression_type)
+            write_bg_mgs3_graph(amz_core, mgs_output_file * "_" * string(encoding_type) * "_" * string(compression_type); coding_scheme=encoding_type, integer_encoding=compression_type)
         end
     end
 
