@@ -177,10 +177,14 @@ CS; CG context-range is children-mode only (no random access yet).
 
 The loader checks the version (bytes 3-4):
 - **Version 3.0**: byte 2 interpreted with legacy range logic; caller must pass params
-- **Version 3.1**: byte 2 self-describing; CG uses v3.1 mixed-radix (`decode_cge_params_v31`)
-- **Version 3.2**: byte 2 self-describing; CG uses v3.2 mixed-radix with mil (`decode_cge_params`)
+- **Version 3.1**: byte 2 self-describing (removed from the codebase; no legacy decode)
+- **Version 3.2**: byte 2 self-describing; CG uses v3.2 mixed-radix with mil (`decode_cg_params`)
+- **Version 3.3**: BG/CS `:context_range` files only — marks the five-stream body
+  layout (`[8-byte lens ×5: struct, refdist, copy, cmd, flag]`); byte-2 semantics
+  identical to v3.2
 
-CG writer now produces v3.2. BG/CS writers still produce v3.1.
-Old `.mgz` files (v3.0, v3.1) continue to load unchanged.
+All writers produce v3.2, except BG/CS `:context_range` (children and index/RA
+alike) which produce v3.3. Pre-2b (v3.2) `:context_range` BG/CS files are not
+decodable — re-encode them.
 
 

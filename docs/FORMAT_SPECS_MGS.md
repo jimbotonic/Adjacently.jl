@@ -21,7 +21,7 @@ File extension: `.mgs`
 |--------|------|-------|
 | 0 | 3 bytes | Signature: `MGS` (0x4D 0x47 0x53) |
 | 3 | 1 byte | Major version: `0x03` |
-| 4 | 1 byte | Minor version: `0x02` (self-describing v3.2) |
+| 4 | 1 byte | Minor version: `0x02` (self-describing v3.2); `0x03` for BG/CS `:context_range` files (v3.3 five-stream body layout) |
 | 5 | 1 byte | Flags byte 1: graph_type (2b) | coding_scheme (2b) | integer_encoding (4b) |
 | 6 | 1 byte | Flags byte 2: `0x00` (ALG_LEGACY_MGS) |
 | 7 | 5 bytes | Number of vertices N (little-endian UInt40) |

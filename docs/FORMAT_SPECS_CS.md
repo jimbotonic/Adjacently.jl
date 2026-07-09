@@ -3,9 +3,12 @@
 ## Overview
 
 > **Context-Range backend:** CS supports `integer_encoding=:context_range` (header
-> `0x7`) — a context-adaptive range coder with a 3-stream layout, copy-aware rank
-> gaps, and chunked random access (CS-RA). This document specifies the classic
-> (prefix-code) format; the shared context-range format is in
+> `0x7`, minor version `0x03`) — a context-adaptive range coder with a **five-stream**
+> layout (resid, refdist, copy, cmd, flag), copy-aware rank gaps, and chunked random
+> access (CS-RA). In ctx mode the per-vertex CS prefix codes described below are
+> replaced by symbols on the `cmd` stream and the stop-delta/RLE flag bits move to
+> the `flag` stream. This document specifies the classic (prefix-code) format; the
+> shared context-range format is in
 > [FORMAT_SPECS_CONTEXT_RANGE.md](FORMAT_SPECS_CONTEXT_RANGE.md).
 
 Command Stream (CS) is a single-pass graph compression format that replaces the greedy encoder's separate empty-prefix flag and VLC vertex header with a unified frequency-optimized prefix code tree. All proven greedy optimizations are preserved: 3-way adaptive copy, STOP-terminated deltas, tight intervals, Fibonacci encoding, and w=64 reference windows. Only the per-vertex header layer changes.

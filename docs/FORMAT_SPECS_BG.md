@@ -3,10 +3,14 @@
 ## Overview
 
 > **Context-Range backend:** in addition to the prefix/varint integer codes below,
-> BG supports `integer_encoding=:context_range` (header `0x7`) — a context-adaptive
-> range coder with a 3-stream layout, copy-aware rank gaps, and chunked random
-> access. This document specifies the classic (prefix-code) format; the shared
-> context-range format is in [FORMAT_SPECS_CONTEXT_RANGE.md](FORMAT_SPECS_CONTEXT_RANGE.md).
+> BG supports `integer_encoding=:context_range` (header `0x7`, minor version `0x03`)
+> — a context-adaptive range coder with a **five-stream** layout (resid, refdist,
+> copy, cmd, flag), copy-aware rank gaps, and chunked random access. In ctx mode the
+> per-vertex VLC headers described below are replaced by symbols on the `cmd` stream
+> and the stop/flag bits move to the `flag` stream; the struct bitstream keeps only
+> the global tag and offset tables. This document specifies the classic (prefix-code)
+> format; the shared context-range format is in
+> [FORMAT_SPECS_CONTEXT_RANGE.md](FORMAT_SPECS_CONTEXT_RANGE.md).
 
 MGS v3 extends v2 with two changes:
 

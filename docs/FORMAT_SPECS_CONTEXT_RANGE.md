@@ -3,8 +3,10 @@
 The `:context_range` integer encoding (header `integer_encoding = 0x7`) is a
 context-adaptive range-coding backend shared by the **BG**, **CS**, and **CG**
 encoders. It replaces the per-value prefix/varint codes (Fibonacci, Elias, Zeta)
-of the classic backends with three adaptive range coders, and adds a random-access
-mode built on independently-decodable chunks.
+of the classic backends with adaptive range coders — five streams for BG/CS
+(resid, refdist, copy, cmd, flag; "phase 2b"), three for CG — and adds a
+random-access mode built on independently-decodable chunks (k-vertex chunks for
+BG/CS, cluster = chunk for CG).
 
 It is selected per-encoder with `integer_encoding=:context_range` and is fully
 self-describing: `load_compressed_mgs3_graph(path)` needs no parameters.
@@ -106,10 +108,11 @@ bit — it is implied by `:context_range` + reference mode. For multi-reference 
 ## 6. Random access (sampled-index + chunked streams)
 
 `:context_range` supports true seekable random access via **chunking**, available for
-**BG** and **CS** (not CG — see §7). A full (per-vertex) index is *not* seekable under
-range coding because the coder state is continuous; random access therefore **requires
-a sampled index** (`index_sample_k > 0`, a multiple of 4). Requesting `coding_scheme=
-:index` with `:context_range` and `index_sample_k ≤ 0` is an error.
+**BG**, **CS** (k-vertex chunks, this section) and **CG** (cluster = chunk — see §7).
+A full (per-vertex) index is *not* seekable under range coding because the coder state
+is continuous; BG/CS random access therefore **requires a sampled index**
+(`index_sample_k > 0`, a multiple of 4). Requesting `coding_scheme=:index` with
+`:context_range` and `index_sample_k ≤ 0` is an error.
 
 ### Chunking
 
