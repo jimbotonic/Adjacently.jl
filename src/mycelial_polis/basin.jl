@@ -263,7 +263,7 @@ function run_sample(sp::SampleParams; topology::Symbol, n_world::Int,
     if accommodation_rate > 0
         host.accommodation_rate = accommodation_rate
     end
-    part = natural_partition(topology, n_world)
+    part = scoped_partition(world, topology)
     phi_hist  = Vector{Float32}(undef, t_max)
     comm_hist = Vector{Int}(undef, t_max)
     atk_hist  = Vector{Int}(undef, t_max)

@@ -69,9 +69,15 @@ function _build_GS(topology::Symbol, n::Int, seed::Int)
     elseif topology === :p2p_mesh
         return Adjacently.Generators.random_watts_strogatz_digraph(
             n, 8, 0.05; seed=seed)
+    elseif topology === :scale_free
+        # Barabási–Albert: emergent power-law hubs act as *informal brokers*
+        # (high-degree, no designated role) — and there are NO cells, so the
+        # per-cell FDF scope is undefined here (needs `ego_partition`). This is
+        # the Path-2 stress topology for the modular_cells-overfit critique.
+        return Adjacently.Generators.random_barabasi_albert_digraph(n, 3; seed=seed)
     else
-        throw(ArgumentError("unknown topology: $topology " *
-                            "(expected :modular_cells, :federated_hubs, :p2p_mesh)"))
+        throw(ArgumentError("unknown topology: $topology (expected :modular_cells, " *
+                            ":federated_hubs, :p2p_mesh, :scale_free)"))
     end
 end
 
@@ -351,4 +357,89 @@ function natural_partition(topology::Symbol, n::Int)
     else
         return nothing
     end
+end
+
+"""
+    ego_partition(g, n; target_size=30) -> Vector{Int}
+
+Topology-agnostic "local scope" partition (Path 2.1): greedy k-hop ego-ball
+clustering that works on ANY graph, including those with no natural cells
+(`:p2p_mesh`, `:scale_free`). Repeatedly takes the lowest-index unassigned
+vertex as a seed and grows a connected BFS ball (undirected neighbourhood) until
+it reaches ~`target_size` members, then starts a new cell. This gives the FDF /
+DCS per-cell mechanisms a well-defined local scope on every topology, comparable
+to the ~30-member native cells of `:modular_cells`.
+
+Use this in place of `natural_partition` when the latter returns `nothing`, so a
+topology-general matrix run has a consistent notion of "local".
+"""
+function ego_partition(g, n::Int; target_size::Int=30)
+    T = eltype(g)
+    assigned = zeros(Int, n)
+    # Seed from high-degree vertices first so hubs anchor cells and absorb their
+    # many leaves — otherwise scale-free leaves seed singleton cells.
+    deg = [length(outneighbors(g, T(v))) + length(inneighbors(g, T(v))) for v in 1:n]
+    order = sortperm(deg; rev=true)
+    cell = 0
+    q = Int[]
+    for seed in order
+        assigned[seed] == 0 || continue
+        cell += 1
+        empty!(q); push!(q, seed); assigned[seed] = cell
+        cnt = 1; head = 1
+        while head <= length(q) && cnt < target_size
+            u = q[head]; head += 1
+            for nbrs in (outneighbors(g, T(u)), inneighbors(g, T(u)))
+                for v in nbrs
+                    iv = Int(v)
+                    if assigned[iv] == 0
+                        assigned[iv] = cell; cnt += 1; push!(q, iv)
+                        cnt < target_size || break
+                    end
+                end
+                cnt < target_size || break
+            end
+        end
+    end
+    # Merge tiny residual cells into the adjacent cell they share the most edges
+    # with (keeps per-cell scope non-degenerate on fragmented/scale-free graphs).
+    min_size = max(2, target_size ÷ 4)
+    sizes = zeros(Int, cell)
+    for c in assigned; sizes[c] += 1; end
+    for v in 1:n
+        c = assigned[v]
+        sizes[c] < min_size || continue
+        best = 0; bestcnt = 0
+        counts = Dict{Int,Int}()
+        for nbrs in (outneighbors(g, T(v)), inneighbors(g, T(v)))
+            for u in nbrs
+                cu = assigned[Int(u)]
+                (cu == c || sizes[cu] < min_size) && continue
+                counts[cu] = get(counts, cu, 0) + 1
+                if counts[cu] > bestcnt; bestcnt = counts[cu]; best = cu; end
+            end
+        end
+        best != 0 && (sizes[c] -= 1; assigned[v] = best; sizes[best] += 1)
+    end
+    # Renumber cells to be contiguous 1..K.
+    remap = Dict{Int,Int}(); k = 0
+    @inbounds for v in 1:n
+        c = assigned[v]
+        haskey(remap, c) || (k += 1; remap[c] = k)
+        assigned[v] = remap[c]
+    end
+    return assigned
+end
+
+"""
+    scoped_partition(world, topology; target_size=30) -> Vector{Int}
+
+Partition used by a topology-general run: the topology's `natural_partition`
+when defined, else the graph-derived [`ego_partition`](@ref) on `G_S`.
+"""
+function scoped_partition(world, topology::Symbol; target_size::Int=30)
+    n = length(world.agents)
+    p = natural_partition(topology, n)
+    return p === nothing ? ego_partition(world.multiplex.layers[:S], n;
+                                         target_size=target_size) : p
 end
