@@ -514,6 +514,33 @@ Informal-hierarchy order parameter: Gini of realised-influence centrality on
 """
 H_informal(world::World) = informal_hierarchy(world).H_informal
 
+"""
+    influence_share(world, ids; mode=:eigenvector) -> Float32 in [0,1]
+
+Fraction of total realised-influence centrality (see [`influence_centrality`])
+held by the agents in `ids`. Compared against `length(ids)/n_active`, this is a
+monotonic, group-level measure of informal capture: a small group whose
+influence share far exceeds its population share is an informal elite,
+independent of any formal role. Robust to the non-monotonicity of the global
+Gini `H_informal` w.r.t. single-tier vs nested hub structure.
+"""
+function influence_share(world::World, ids; mode::Symbol=:eigenvector)
+    g = layer(world.multiplex, :S)
+    mask = _polis_mask(world)
+    active = findall(mask)
+    length(active) < 3 && return 0f0
+    c = influence_centrality(world; mode=mode)      # aligned to `active` order
+    s = sum(c)
+    s <= 0 && return 0f0
+    pos = Dict(v => i for (i, v) in enumerate(active))
+    tot = 0f0
+    for id in ids
+        p = get(pos, Int(id), 0)
+        p > 0 && (tot += c[p])
+    end
+    return Float32(tot / s)
+end
+
 # --- per-step snapshot ------------------------------------------------------
 
 """
