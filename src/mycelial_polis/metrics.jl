@@ -426,6 +426,94 @@ function hierarchy_score(world::World)
                           c.faction_dominance, c.steward_fraction)))
 end
 
+# --- informal hierarchy H_informal (paper 2 — Path 3) -----------------------
+#
+# The structural H above is role-based: it can only see hierarchy that is
+# *declared* (steward roles, infra keys, faction labels). It is blind to the
+# "tyranny of structurelessness" — an agent that dominates the realised
+# interaction network while holding no title. H_informal measures domination
+# from the realised trust graph G_S itself, independent of any role:
+#
+#   H_informal = Gini of the eigenvector-centrality distribution over the
+#                polis-active induced subgraph of G_S.
+#
+# High Gini = influence concentrated in a few agents (informal elite);
+# low Gini = flat / genuinely non-hierarchical. Because it reads the network,
+# not the role labels, a captured-but-untitled elite scores high here even when
+# structural H reads low.
+
+"""
+    _gini(x) -> Float32 in [0,1]
+
+Gini coefficient of a non-negative vector (concentration; 0 = perfectly flat).
+"""
+function _gini(x::AbstractVector{<:Real})
+    n = length(x)
+    n == 0 && return 0f0
+    s = sum(x)
+    s <= 0 && return 0f0
+    xs = sort(x)
+    cum = 0.0
+    @inbounds for i in 1:n
+        cum += i * xs[i]
+    end
+    g = (2cum) / (n * s) - (n + 1) / n
+    return Float32(clamp(g, 0f0, 1f0))
+end
+
+"""
+    influence_centrality(world; mode=:eigenvector) -> Vector{Float32}
+
+Centrality of each polis-active agent on the realised trust graph `G_S`,
+restricted to the active-vertex induced subgraph. `:eigenvector` (default) uses
+eigenvector centrality on the undirected projection (Perron–Frobenius stable);
+`:pagerank` uses PageRank on the directed subgraph (robust to disconnection).
+Returns `Float32[]` when fewer than 3 active agents.
+"""
+function influence_centrality(world::World; mode::Symbol=:eigenvector)
+    g = layer(world.multiplex, :S)
+    mask = _polis_mask(world)
+    ids = findall(mask)
+    length(ids) < 3 && return Float32[]
+    sub, _ = LightGraphs.induced_subgraph(g, ids)
+    if mode === :pagerank
+        return Float32.(LightGraphs.pagerank(sub))
+    end
+    ug = LightGraphs.Graph(sub)                     # undirected projection
+    LightGraphs.ne(ug) == 0 && return zeros(Float32, length(ids))
+    try
+        return Float32.(LightGraphs.eigenvector_centrality(ug))
+    catch                                            # non-convergence fallback
+        d = Float32.(LightGraphs.degree(ug)); sd = sum(d)
+        return sd > 0 ? d ./ sd : zeros(Float32, length(ids))
+    end
+end
+
+"""
+    informal_hierarchy(world; mode=:eigenvector) -> NamedTuple
+
+Realised-influence concentration on `G_S`, role-independent.
+`H_informal` = Gini of `influence_centrality`; `top_decile_share` = fraction of
+total centrality held by the top 10% of active agents; `n` = active count.
+"""
+function informal_hierarchy(world::World; mode::Symbol=:eigenvector)
+    c = influence_centrality(world; mode=mode)
+    isempty(c) && return (H_informal = 0f0, top_decile_share = 0f0, n = 0)
+    xs = sort(c; rev=true)
+    k = max(1, ceil(Int, 0.1 * length(xs)))
+    s = sum(c)
+    tds = s > 0 ? Float32(sum(xs[1:k]) / s) : 0f0
+    return (H_informal = _gini(c), top_decile_share = tds, n = length(c))
+end
+
+"""
+    H_informal(world) -> Float32 in [0,1]
+
+Informal-hierarchy order parameter: Gini of realised-influence centrality on
+`G_S`. See [`informal_hierarchy`](@ref).
+"""
+H_informal(world::World) = informal_hierarchy(world).H_informal
+
 # --- per-step snapshot ------------------------------------------------------
 
 """
@@ -445,6 +533,7 @@ function snapshot(world::World; t::Int, attacked::Int=0,
     Λs  = lambda_sat(world)
     pc  = phi_components(world)        # 5 Φ inputs, each ∈ [0,1]
     hc  = hierarchy_components(world)  # 4 H inputs, each ∈ [0,1]
+    ih  = informal_hierarchy(world)    # realised-influence concentration (Path 3)
     return (
         t              = t,
         n_active       = active_count(world),
@@ -477,6 +566,9 @@ function snapshot(world::World; t::Int, attacked::Int=0,
         h_infra_conc   = hc.infra_concentration,
         h_faction_dom  = hc.faction_dominance,
         h_steward_frac = hc.steward_fraction,
+        # --- informal hierarchy (Path 3): realised-influence concentration ---
+        H_informal          = ih.H_informal,
+        informal_top_decile = ih.top_decile_share,
         n_attacked     = attacked,
         n_defected     = defected,
         n_backfired    = backfired,
