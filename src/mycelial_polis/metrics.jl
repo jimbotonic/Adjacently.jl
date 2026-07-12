@@ -541,6 +541,82 @@ function influence_share(world::World, ids; mode::Symbol=:eigenvector)
     return Float32(tot / s)
 end
 
+# --- null-corrected informal hierarchy (Path 3 deferred refinement) ---------
+#
+# Raw H_informal has a non-zero baseline set by the trust topology's intrinsic
+# hub structure: a graph with power-law degrees scores high Gini even with no
+# *designed* elite. H_informal_excess subtracts the mean H_informal of degree-
+# preserving rewirings of the same active subgraph, isolating influence
+# concentration BEYOND what the degree sequence alone forces. ~0 = influence is
+# exactly as concentrated as the degrees imply (topological baseline only);
+# > 0 = concentration in excess of degree (nested / rich-club hierarchy). This
+# gives the clean zero point the raw Gini lacks and makes the order parameter
+# comparable across topologies with different intrinsic hub structure.
+
+function _degree_preserving_null_gini(ug, rng; n_null::Int, swaps_mult::Int)
+    m = LightGraphs.ne(ug)
+    m < 2 && return 0f0
+    n = LightGraphs.nv(ug)
+    ginis = Float32[]
+    for _ in 1:n_null
+        h = LightGraphs.Graph(n)
+        E = Vector{Tuple{Int,Int}}(undef, m)
+        i = 0
+        for e in LightGraphs.edges(ug)
+            i += 1
+            E[i] = (LightGraphs.src(e), LightGraphs.dst(e))
+            LightGraphs.add_edge!(h, E[i][1], E[i][2])
+        end
+        for _ in 1:(swaps_mult * m)          # double-edge swaps preserve degrees
+            p = rand(rng, 1:m); q = rand(rng, 1:m)
+            p == q && continue
+            a, b = E[p]
+            c, d = E[q]
+            rand(rng, Bool) && ((c, d) = (d, c))
+            length(Set((a, b, c, d))) < 4 && continue
+            (LightGraphs.has_edge(h, a, d) || LightGraphs.has_edge(h, c, b)) && continue
+            LightGraphs.rem_edge!(h, a, b); LightGraphs.rem_edge!(h, c, d)
+            LightGraphs.add_edge!(h, a, d); LightGraphs.add_edge!(h, c, b)
+            E[p] = (a, d); E[q] = (c, b)
+        end
+        cent = try
+            Float32.(LightGraphs.eigenvector_centrality(h))
+        catch
+            deg = Float32.(LightGraphs.degree(h)); sd = sum(deg)
+            sd > 0 ? deg ./ sd : zeros(Float32, n)
+        end
+        push!(ginis, _gini(cent))
+    end
+    return mean(ginis)
+end
+
+"""
+    H_informal_excess(world; mode=:eigenvector, n_null=6, swaps_mult=8,
+                      rng=MersenneTwister(0)) -> Float32
+
+Null-corrected informal-hierarchy order parameter: `H_informal(world)` minus the
+mean `H_informal` of `n_null` degree-preserving rewirings of the same active
+induced subgraph of `G_S`. Isolates realised-influence concentration in excess
+of the degree sequence, giving a clean ~0 zero point on a run whose only
+concentration is topological (see [`informal_hierarchy`](@ref)). Deterministic
+given `rng`; does not touch `world.rng`. May be slightly negative (sampling noise
+around a true zero).
+"""
+function H_informal_excess(world::World; mode::Symbol=:eigenvector,
+                           n_null::Int=6, swaps_mult::Int=8,
+                           rng::AbstractRNG=MersenneTwister(0))
+    g = layer(world.multiplex, :S)
+    mask = _polis_mask(world)
+    ids = findall(mask)
+    length(ids) < 3 && return 0f0
+    sub, _ = LightGraphs.induced_subgraph(g, ids)
+    ug = LightGraphs.Graph(sub)
+    LightGraphs.ne(ug) == 0 && return 0f0
+    observed = _gini(influence_centrality(world; mode=mode))
+    null = _degree_preserving_null_gini(ug, rng; n_null=n_null, swaps_mult=swaps_mult)
+    return Float32(observed - null)
+end
+
 # --- per-step snapshot ------------------------------------------------------
 
 """
