@@ -539,3 +539,87 @@ function act!(host::AttritionHost, world::World, t::Int)
     end
     return arrested
 end
+
+# --- 8. AdaptiveHost (Path 5 — co-evolving adversary) ------------------------
+
+# Self-contained factory for a named static arm (host.jl must not depend on
+# basin.jl's `_make_host`).
+function _arm_host(name::Symbol, budget::Int)
+    name === :random             ? RandomHost(budget=budget)             :
+    name === :degree             ? DegreeHost(budget=budget)             :
+    name === :betweenness        ? BetweennessHost(budget=budget)        :
+    name === :legibility         ? LegibilityHost(budget=budget)         :
+    name === :localized          ? LocalizedHost(budget=budget)          :
+    name === :infiltration_first ? InfiltrationFirstHost(budget=budget)  :
+    name === :attrition          ? AttritionHost(budget=budget)          :
+    throw(ArgumentError("unknown adaptive-host arm: $name"))
+end
+
+"""
+    AdaptiveHost(; budget=5,
+                 arms=[:random, :degree, :infiltration_first, :attrition],
+                 epsilon=0.15, lr=0.25)
+
+Non-stationary ε-greedy **bandit** host (Path 5 — the co-evolving adversary).
+Each step it selects one of its sub-strategy `arms` and delegates the attack to
+it; the reward is the polis-size loss (drop in committed count) over that step,
+credited to the arm played, and its per-arm value estimate `Q` is updated by an
+EWMA with rate `lr`. With probability `epsilon` it explores a random arm,
+otherwise it plays the current best. Unlike any single static host, it learns
+online which fixed strategy most damages *this* polis on *this* topology — the
+adversary the "constitution as boundary-shifter" claim must survive.
+
+`plays` logs the chosen arm index per step; `Q`/`counts` expose the learned
+values. Carries the standard host budget/pressure fields so `step!`'s generic
+`_resolve_rho_pressure!` / `_decay_budget!` / `_accommodate!` apply unchanged.
+"""
+mutable struct AdaptiveHost <: HostStrategy
+    arms::Vector{HostStrategy}
+    arm_names::Vector{Symbol}
+    Q::Vector{Float64}
+    counts::Vector{Int}
+    plays::Vector{Int}
+    epsilon::Float64
+    lr::Float64
+    last_arm::Int
+    prev_committed::Int
+    budget::Int
+    rho_H::Float64
+    budget_decay::Float64
+    accommodation_rate::Float64
+    _rho_acc::Float64
+    _decay_buffer::Float64
+    _committed_ewma::Float32
+end
+
+function AdaptiveHost(; budget::Int=5,
+                       arms::Vector{Symbol}=[:random, :degree,
+                                             :infiltration_first, :attrition],
+                       epsilon::Float64=0.15, lr::Float64=0.25,
+                       rho_H::Float64=0.0, budget_decay::Float64=0.0,
+                       accommodation_rate::Float64=0.0)
+    inst = HostStrategy[_arm_host(a, budget) for a in arms]
+    return AdaptiveHost(inst, collect(arms), zeros(Float64, length(arms)),
+                        zeros(Int, length(arms)), Int[], epsilon, lr, 0, -1,
+                        budget, rho_H, budget_decay, accommodation_rate,
+                        0.0, 0.0, -1f0)
+end
+
+function act!(host::AdaptiveHost, world::World, t::Int)
+    cur = count(is_committed, world.agents)
+    # credit the previous step's arm with the polis loss it produced
+    if host.last_arm > 0 && host.prev_committed >= 0
+        r = Float64(host.prev_committed - cur)
+        a = host.last_arm
+        host.counts[a] += 1
+        host.Q[a] += host.lr * (r - host.Q[a])
+    end
+    k = length(host.arms)
+    a = rand(world.rng) < host.epsilon ? rand(world.rng, 1:k) : argmax(host.Q)
+    host.last_arm = a
+    host.prev_committed = cur
+    push!(host.plays, a)
+    arm = host.arms[a]
+    arm.budget = host.budget            # spend the host's current budget via the chosen arm
+    return act!(arm, world, t)
+end
