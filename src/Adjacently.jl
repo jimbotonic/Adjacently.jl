@@ -1,6 +1,6 @@
 #
 # Adjacently: Julia Complex Directed Networks Library
-# Copyright (C) 2016-2026 Jimmy Dubuisson <jimmy@dubuisson.ch>
+# Copyright (C) 2016-2026 Anonymous (double-blind review)
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -71,10 +71,6 @@ include("compression/utils.jl")
 using .CompressionUtils
 export CompressionUtils
 
-include("gnn/GNN.jl")
-using .GNN
-export GNN
-
 include("compression.jl")
 using .Compression
 export Compression
@@ -102,21 +98,5 @@ export MGS
 include("metrics.jl")
 using .Metrics
 export Metrics
-
-include("param_prediction.jl")
-using .ParamPrediction
-export ParamPrediction
-
-include("metabolic/Metabolic.jl")
-using .Metabolic
-export Metabolic
-
-include("fingerprints/Fingerprints.jl")
-using .Fingerprints
-export Fingerprints
-
-include("mycelial_polis/MycelialPolis.jl")
-using .MycelialPolis
-export MycelialPolis
 
 end # module Adjacently

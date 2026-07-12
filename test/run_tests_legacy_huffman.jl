@@ -1,6 +1,6 @@
 #
 # Adjacently: Julia Complex Directed Networks Library
-# Copyright (C) 2016-2026 Jimmy Dubuisson <jimmy@dubuisson.ch>
+# Copyright (C) 2016-2026 Anonymous (double-blind review)
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by

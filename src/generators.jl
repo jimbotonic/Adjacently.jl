@@ -1,6 +1,6 @@
 #
 # Adjacently: Julia Complex Directed Networks Library
-# Copyright (C) 2016-2026 Jimmy Dubuisson <jimmy@dubuisson.ch>
+# Copyright (C) 2016-2026 Anonymous (double-blind review)
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -465,9 +465,6 @@ side before rewiring. `β ∈ [0,1]` is the rewire probability — `β=0`
 gives the pure ring lattice (high clustering, long average path),
 `β=1` gives a near-random graph. Small β (≈ 0.01–0.1) gives the
 small-world regime: high clustering plus short paths.
-
-Used by `Adjacently.MycelialPolis.build_topology(:p2p_mesh, ...)` to
-realise the peer-to-peer mesh of roadmap §7.
 """
 function random_watts_strogatz_digraph(n::Int, k::Int=8, β::Float64=0.05;
                                        seed::Int=42)
