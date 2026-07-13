@@ -17,10 +17,26 @@ graphs. Run each from the repo root with the project activated:
 |---|---|---|---|
 | `tab:ord-ablation` (orderings × encoders, Fibonacci) | `ord_ablation.jl` | web-google, amazon-0601, arxiv-hep-ph, EAT | **done** (4 SNAP; verified on EAT, 8/9 cells) |
 | `tab:transfer` (Leiden+LLP-vs-LLP gain, 3 seeds, 2 backends) | `transfer.jl` | web-google, amazon-0601, arxiv-hep-ph, EAT | **done** (verified on EAT, exact) |
-| `tab:ablation` (encoder feature history) | `feature_ablation.jl` | cnr-2000 | not started — needs reconstruction (uses removed encoder params; cnr-2000 ships only as `.mgz`, not the `.csv` the old script used) |
-| cnr-2000 rows of `tab:ord-ablation` | — | cnr-2000 | not started — K=2 (Orig) vs K=1 (Leiden+LLP) split, medium-confidence params |
-| `tab:encoder_comparison` (whole-graph, context-range) | `sota_wholegraph.jl` | all 7 | not started — needs LAW fetch |
-| `tab:ra-sota` (random access, context-range) | `sota_ra.jl` | all 7 | not started — needs LAW fetch |
+| `tab:ablation` (encoder feature history) | `feature_ablation.jl` | cnr-2000 | blocked — uses removed encoder params; needs reconstruction |
+| cnr-2000 rows of `tab:ord-ablation` | — | cnr-2000 | blocked — see note 1 (Leiden+LLP BG/CS do reproduce: ~2.32/2.30) |
+| `tab:highlight` (whole-graph, context-range) | `sota_wholegraph.jl` | all 7 | blocked — see notes 2 & 3 |
+| `tab:ra-sota` (random access, context-range) | `sota_ra.jl` | all 7 | blocked — see notes 2 & 3 |
+
+### Why the remaining tables are not reproducible from this repo
+
+1. **The committed `cnr-2000.mgz` is not in LAW crawl order** — it is a pre-reordered
+   (locality-optimized) graph. So the cnr **Orig./native** cells cannot be reproduced
+   from it; they require the true LAW `cnr-2000` from `law.di.unimi.it/webdata/cnr-2000/`.
+   The cnr *Leiden+LLP* cells reproduce because that ordering is re-derived from the edge
+   set regardless of input order.
+2. **`in-2004` and `enwiki-2013` are not committed** (too large) — the context-range SOTA
+   tables span all seven datasets; a LAW/SNAP fetch script is needed for these two.
+3. **Context-range encoder generation** — the committed `:context_range` backend matches
+   the SOTA table on BG but drifts ~0.03–0.08 bpe on CS/CG (a later reference-selection
+   refinement is not in this tree). BG-ctx reproduces; CS/CG-ctx do not match exactly.
+
+The two ordering drivers above (`ord_ablation.jl`, `transfer.jl`) reproduce the paper's
+**ordering-transfer** claim exactly from committed data, which is the paper's headline.
 
 ## Datasets
 
