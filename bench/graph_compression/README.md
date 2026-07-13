@@ -15,11 +15,12 @@ graphs. Run each from the repo root with the project activated:
 
 | Paper table | Driver | Datasets | Status |
 |---|---|---|---|
-| `tab:ord-ablation` (orderings × encoders, Fibonacci) | `ord_ablation.jl` | cnr-2000, web-google, amazon-0601, arxiv-hep-ph, EAT | committed-subset |
-| `tab:transfer` (Leiden+LLP-vs-LLP gain, 3 seeds) | `transfer.jl` | 5 weakly-ordered | committed-subset |
-| `tab:ablation` (feature ablation) | `feature_ablation.jl` | cnr-2000 | committed-subset |
-| `tab:encoder_comparison` (whole-graph, context-range) | `sota_wholegraph.jl` | all 7 | needs LAW fetch |
-| `tab:ra-sota` (random access, context-range) | `sota_ra.jl` | all 7 | needs LAW fetch |
+| `tab:ord-ablation` (orderings × encoders, Fibonacci) | `ord_ablation.jl` | web-google, amazon-0601, arxiv-hep-ph, EAT | **done** (4 SNAP; verified on EAT, 8/9 cells) |
+| `tab:transfer` (Leiden+LLP-vs-LLP gain, 3 seeds, 2 backends) | `transfer.jl` | web-google, amazon-0601, arxiv-hep-ph, EAT | **done** (verified on EAT, exact) |
+| `tab:ablation` (encoder feature history) | `feature_ablation.jl` | cnr-2000 | not started — needs reconstruction (uses removed encoder params; cnr-2000 ships only as `.mgz`, not the `.csv` the old script used) |
+| cnr-2000 rows of `tab:ord-ablation` | — | cnr-2000 | not started — K=2 (Orig) vs K=1 (Leiden+LLP) split, medium-confidence params |
+| `tab:encoder_comparison` (whole-graph, context-range) | `sota_wholegraph.jl` | all 7 | not started — needs LAW fetch |
+| `tab:ra-sota` (random access, context-range) | `sota_ra.jl` | all 7 | not started — needs LAW fetch |
 
 ## Datasets
 
