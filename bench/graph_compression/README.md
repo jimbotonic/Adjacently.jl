@@ -26,11 +26,12 @@ graphs. Run each from the repo root with the project activated:
 
 1. **The committed `cnr-2000.mgz` is not in LAW crawl order** — it is a pre-reordered
    (locality-optimized) graph. So the cnr **Orig./native** cells cannot be reproduced
-   from it; they require the true LAW `cnr-2000` from `law.di.unimi.it/webdata/cnr-2000/`.
-   The cnr *Leiden+LLP* cells reproduce because that ordering is re-derived from the edge
-   set regardless of input order.
-2. **`in-2004` and `enwiki-2013` are not committed** (too large) — the context-range SOTA
-   tables span all seven datasets; a LAW/SNAP fetch script is needed for these two.
+   from it; they require the true LAW `cnr-2000`. Run **`fetch_datasets.sh`** to download
+   it (data.law.di.unimi.it) and use the resulting `cnr-2000.csv`. The cnr *Leiden+LLP*
+   cells reproduce from the committed data because that ordering is re-derived from the
+   edge set regardless of input order.
+2. **`in-2004` and `enwiki-2013` are not committed** (too large) — fetch them with
+   **`fetch_datasets.sh`** (needs WebGraph on `WEBGRAPH_CP` to convert BVGraph → CSV).
 3. **Context-range encoder generation** — the committed `:context_range` backend matches
    the SOTA table on BG but drifts ~0.03–0.08 bpe on CS/CG (a later reference-selection
    refinement is not in this tree). BG-ctx reproduces; CS/CG-ctx do not match exactly.
