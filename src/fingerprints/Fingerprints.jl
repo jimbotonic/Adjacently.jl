@@ -42,6 +42,7 @@ include("ndf.jl")
 include("training.jl")
 include("text.jl")
 include("text_gcn.jl")
+include("perdoc.jl")
 
 export NDF, NDFEncoder, propagate, prepare_adjacency,
        prepare_adjacency_directed_ppr, default_node_features,
@@ -53,6 +54,8 @@ export NDF, NDFEncoder, propagate, prepare_adjacency,
        porter_stem_lite,
        TextGcnDoc, read_text_gcn_corpus,
        textgcn_to_documents, build_text_gcn_vocab,
-       load_bert_word_features, read_blog_posts
+       load_bert_word_features, read_blog_posts,
+       LocalGraph, build_local_window_graph, docs_to_local_graphs,
+       LocalBatch, build_local_batch, PerDocGNN, train_perdoc!
 
 end # module
