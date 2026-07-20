@@ -264,17 +264,60 @@ struct PerDocGNN{EM,IP,LW,AT,DR,CL}
 end
 Flux.@layer PerDocGNN trainable=(emb, Win, Ws, att, classifier)
 
+"""
+    load_glove_embeddings(path, vocab; d_emb) -> (E::Matrix{Float32}, n_covered)
+
+Build a `d_emb × V` embedding matrix for `vocab` (word→id, 1..V) from a GloVe
+text file (`word v1 v2 … v_d` per line). In-vocab words get their pretrained
+vector (column = id); words absent from the file keep a small Glorot-scale
+random vector so they stay trainable rather than dead. Returns the matrix and
+the number of vocab words the file covered.
+
+Pretrained vectors do NOT break inductivity: they come from an external corpus,
+independent of the test set — each test document is still assembled into its own
+graph at inference. `d_emb` must equal the file's vector width.
+"""
+function load_glove_embeddings(path::AbstractString, vocab::Dict{String,Int};
+                               d_emb::Int)
+    V = length(vocab)
+    scale = 2f0 * sqrt(6f0 / (d_emb + V))
+    E = Float32.((rand(Float32, d_emb, V) .- 0.5f0) .* scale)   # OOV fallback
+    covered = falses(V)
+    open(path, "r") do io
+        for line in eachline(io)
+            # split on whitespace (UTF-8 safe — GloVe has multibyte tokens);
+            # parts[1] = word, parts[2:end] = the d_emb floats.
+            parts = split(line)
+            length(parts) == d_emb + 1 || continue
+            id = get(vocab, String(parts[1]), 0)
+            id == 0 && continue
+            @inbounds for k in 1:d_emb
+                E[k, id] = parse(Float32, parts[k+1])
+            end
+            covered[id] = true
+        end
+    end
+    return E, count(covered)
+end
+
 function PerDocGNN(V::Int, n_classes::Int;
                    d_emb::Int=200, hidden::Int=200, n_layers::Int=2,
                    dropout::Float32=0.5f0, readout::Symbol=:meanattn,
-                   head_hidden::Int=256)
+                   head_hidden::Int=256,
+                   emb_init::Union{Nothing,AbstractMatrix}=nothing)
     readout ∈ (:mean, :meanattn) ||
         throw(ArgumentError("readout must be :mean or :meanattn"))
     n_layers >= 1 || throw(ArgumentError("n_layers must be >= 1"))
     n_classes > 0 || throw(ArgumentError("PerDocGNN requires n_classes > 0"))
 
     glorot(a, b) = Float32.((rand(Float32, a, b) .- 0.5f0) .* (2f0 * sqrt(6f0 / (a + b))))
-    emb = glorot(d_emb, V)                 # column per word (NNlib.gather by id)
+    if emb_init === nothing
+        emb = glorot(d_emb, V)             # column per word (NNlib.gather by id)
+    else
+        size(emb_init) == (d_emb, V) ||
+            throw(ArgumentError("emb_init must be ($d_emb, $V), got $(size(emb_init))"))
+        emb = Float32.(emb_init)           # pretrained (e.g. GloVe) init
+    end
     Win = glorot(d_emb + 1, hidden)
     Ws  = ntuple(_ -> begin
         W = zeros(Float32, hidden, hidden)
@@ -370,11 +413,13 @@ function train_perdoc!(model::PerDocGNN,
                        n_classes::Int,
                        config::TrainConfig=TrainConfig(),
                        movebatch::Function=identity,
-                       movearr::Function=identity)
+                       movearr::Function=identity,
+                       freeze_emb::Bool=false)
     optimizer = config.weight_decay > 0f0 ?
         Flux.AdamW(config.lr, (0.9f0, 0.999f0), config.weight_decay) :
         Flux.Adam(config.lr)
     opt_state = Flux.setup(optimizer, model)
+    freeze_emb && Flux.Optimisers.freeze!(opt_state.emb)
     rng = MersenneTwister(config.seed)
     n_train = length(train_graphs)
     history = (train_loss=Float32[], train_acc=Float32[], val_loss=Float32[],

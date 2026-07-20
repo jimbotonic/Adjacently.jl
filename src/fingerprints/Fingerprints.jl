@@ -56,6 +56,7 @@ export NDF, NDFEncoder, propagate, prepare_adjacency,
        textgcn_to_documents, build_text_gcn_vocab,
        load_bert_word_features, read_blog_posts,
        LocalGraph, build_local_window_graph, docs_to_local_graphs,
-       LocalBatch, build_local_batch, PerDocGNN, train_perdoc!
+       LocalBatch, build_local_batch, PerDocGNN, train_perdoc!,
+       load_glove_embeddings
 
 end # module
