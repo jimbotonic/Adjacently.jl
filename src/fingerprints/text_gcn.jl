@@ -29,6 +29,15 @@ struct TextGcnDoc
 end
 
 """
+    to_char_ngrams(doc::TextGcnDoc; nmin=3, nmax=5) -> TextGcnDoc
+
+Copy of `doc` with word tokens replaced by char-n-gram tokens (see
+`char_ngram_tokens` / GLOSSARY.md).
+"""
+to_char_ngrams(d::TextGcnDoc; nmin::Int=3, nmax::Int=5) =
+    TextGcnDoc(char_ngram_tokens(d.tokens; nmin=nmin, nmax=nmax), d.label, d.split)
+
+"""
     read_text_gcn_corpus(dataset::AbstractString;
                         data_dir::AbstractString = joinpath(@__DIR__, "..", "..",
                             "datasets", "text_gcn", "text_gcn", "data"),

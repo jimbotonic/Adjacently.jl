@@ -203,6 +203,40 @@ function _parse_blog_posts(path::AbstractString; stem::Bool=false)
 end
 
 """
+    char_ngram_tokens(words; nmin=3, nmax=5) -> Vector{String}
+
+Turn a word-token stream into a **character-n-gram** token stream (`char_wb` /
+word-boundary style: each word is padded with a boundary space and n-grams are
+taken within it). Feeding these to the NDF pipeline builds the co-occurrence graph
+and diffuses over **sub-word stylometric units** (affixes, spelling, function-word
+morphology) instead of words — the representation that dominates authorship /
+gender. `nmin:nmax` inclusive. See GLOSSARY.md (stylometric).
+"""
+function char_ngram_tokens(words::Vector{String}; nmin::Int=3, nmax::Int=5)
+    out = String[]
+    for w in words
+        cs = collect(' ' * w * ' ')            # boundary-padded, unicode-safe
+        len = length(cs)
+        for n in nmin:nmax
+            n > len && continue
+            @inbounds for i in 1:(len - n + 1)
+                push!(out, String(cs[i:i+n-1]))
+            end
+        end
+    end
+    return out
+end
+
+"""
+    to_char_ngrams(doc::BlogDoc; nmin=3, nmax=5) -> BlogDoc
+
+Return a copy of `doc` whose word tokens are replaced by char-n-gram tokens.
+"""
+to_char_ngrams(d::BlogDoc; nmin::Int=3, nmax::Int=5) =
+    BlogDoc(d.blogger_id, d.gender, d.age, d.industry, d.sign,
+            char_ngram_tokens(d.tokens; nmin=nmin, nmax=nmax))
+
+"""
     read_blog_corpus(dir; max_docs=typemax(Int), min_tokens=8,
                           balance_genders=false, seed=0) -> Vector{BlogDoc}
 
