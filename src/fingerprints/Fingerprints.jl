@@ -43,6 +43,8 @@ include("training.jl")
 include("text.jl")
 include("text_gcn.jl")
 include("perdoc.jl")
+include("hypergraph.jl")
+include("hypergat.jl")
 
 export NDF, NDFEncoder, propagate, prepare_adjacency,
        prepare_adjacency_directed_ppr, default_node_features,
@@ -53,10 +55,13 @@ export NDF, NDFEncoder, propagate, prepare_adjacency,
        build_domain_graph, blogdocs_to_documents,
        porter_stem_lite,
        TextGcnDoc, read_text_gcn_corpus,
-       textgcn_to_documents, build_text_gcn_vocab,
+       textgcn_to_documents, build_text_gcn_vocab, word_class_weights,
        load_bert_word_features, read_blog_posts,
        LocalGraph, build_local_window_graph, docs_to_local_graphs,
        LocalBatch, build_local_batch, PerDocGNN, train_perdoc!,
-       load_glove_embeddings
+       load_glove_embeddings,
+       lda_topic_words, augment_with_semantics, docs_to_hyper_graphs,
+       HyperGAT, HyperDoc, HyperBatch, build_hyper_doc, build_hyper_batch,
+       docs_to_hyper_docs, train_hypergat!
 
 end # module

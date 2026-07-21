@@ -71,39 +71,98 @@ identity, `K→∞`, and Φ is the personalization vector v_k.
 - `n_central`: size of the central-node set for `:opc_flatten`. Required
       when `readout=:opc_flatten`.
 """
-struct NDF{E, C}
+struct NDF{E, C, G, W}
     encoder::E
     classifier::C
     K::Int
     α::Float32
     readout::Symbol
+    propagation::Symbol      # :appnp (fixed) | :gpr (learnable γ_k, still LINEAR) | :nonlin (ReLU MP)
+    gamma::G                 # length-(K+1) learnable per-hop weights (:gpr); else Float32[]
+    Wprop::W                 # hidden×hidden learnable transform for :nonlin ReLU MP; else 0×0
 end
-Flux.@layer NDF
+Flux.@layer NDF trainable=(encoder, classifier, gamma, Wprop)
 
 function NDF(d_in::Int, n_classes::Int;
              hidden::Int=64, K::Int=10, α::Float32=0.15f0,
              dropout::Float32=0.1f0, readout::Symbol=:mean,
-             n_vertices::Int=0, n_central::Int=0)
-    readout ∈ (:mean, :sum, :seed_mean, :flatten, :opc_flatten) ||
-        throw(ArgumentError("readout must be :mean, :sum, :seed_mean, :flatten, or :opc_flatten"))
-    if readout === :flatten && n_vertices <= 0
-        throw(ArgumentError("readout=:flatten requires n_vertices > 0"))
+             n_vertices::Int=0, n_central::Int=0,
+             head::Symbol=:linear, head_hidden::Int=256,
+             head_style::Symbol=:widemlp, propagation::Symbol=:appnp,
+             n_gates::Int=4)
+    readout ∈ (:mean, :sum, :seed_mean, :flatten, :opc_flatten, :flatten_seed_residual, :seed_multipool) ||
+        throw(ArgumentError("readout must be :mean, :sum, :seed_mean, :flatten, :opc_flatten, :flatten_seed_residual, or :seed_multipool"))
+    if readout ∈ (:flatten, :flatten_seed_residual) && n_vertices <= 0
+        throw(ArgumentError("readout=$readout requires n_vertices > 0"))
     end
     if readout === :opc_flatten && n_central <= 0
         throw(ArgumentError("readout=:opc_flatten requires n_central > 0"))
     end
+    head ∈ (:linear, :mlp) || throw(ArgumentError("head must be :linear or :mlp"))
+    head_style ∈ (:widemlp, :pre_dropout) ||
+        throw(ArgumentError("head_style must be :widemlp or :pre_dropout"))
+    propagation ∈ (:appnp, :gpr, :nonlin, :gate) ||
+        throw(ArgumentError("propagation must be :appnp, :gpr, :nonlin, or :gate"))
+    if propagation === :gate && n_vertices <= 0
+        throw(ArgumentError("propagation=:gate requires n_vertices > 0"))
+    end
+    # idea C: learnable per-hop weights γ_0..γ_K (GPR-GNN). Init to the APPNP
+    # geometric weights α(1-α)^k so :gpr CONTAINS the fixed-α diffusion and
+    # learns away from it only if that lowers loss.
+    #
+    # THE KEY (:gate): multiplicative seed-masked gate.
+    #   Z[w] = v[w] · (1 + Σ_j g_j·σ(a_j·(Âv)[w] + b_j))
+    # Reuse `gamma` to hold the 3r gate params [a₁..aᵣ ‖ b₁..bᵣ ‖ g₁..gᵣ]. Init
+    # g=0 ⇒ Z=v EXACTLY (BoW floor is exact); the gate is a masked, absent-word-
+    # vanishing, degree-2 graph correction that ESCAPES the linear-BoW ceiling.
+    gamma = if propagation === :gpr
+        Float32[α * (1f0 - α)^k for k in 0:K]
+    elseif propagation === :gate
+        vcat(fill(0.1f0, n_gates), zeros(Float32, n_gates), zeros(Float32, n_gates))
+    else
+        Float32[]
+    end
+    # NONLINEAR message passing: Z_{k+1}=ReLU((1-α)Â Z_k W + α H0). W init=I so
+    # the first pass ≈ linear-APPNP-with-ReLU; ReLU breaks Z=Pv (escapes the
+    # BoW-reparametrization ceiling). Needs hidden>1 + a pooling readout.
+    Wprop = zeros(Float32, 0, 0)
+    if propagation === :nonlin
+        Wprop = zeros(Float32, hidden, hidden)
+        @inbounds for i in 1:hidden; Wprop[i, i] = 1f0; end
+    end
     encoder = NDFEncoder(d_in, hidden; dropout=dropout)
-    classifier_in = if readout === :flatten
+    classifier_in = if propagation === :gate
+        n_vertices                     # gated seed Z is V-dim (BoW-shaped)
+    elseif readout === :flatten
         n_vertices * hidden
+    elseif readout === :flatten_seed_residual
+        # flatten(Z_K) ⊕ raw seed vector — the diffused fingerprint plus the
+        # verbatim BoW lexical channel WideMLP keeps. (idea B)
+        n_vertices * hidden + n_vertices
+    elseif readout === :seed_multipool
+        # learned document aggregator: [tfidf-weighted-sum ‖ max ‖ mean] over the
+        # doc's words — a NONLINEAR pool (max) that replaces near-linear seed_mean.
+        3 * hidden
     elseif readout === :opc_flatten
         n_central * hidden
     else
         hidden
     end
-    classifier = n_classes > 0 ?
-        Chain(Dropout(dropout), Dense(classifier_in => n_classes)) :
+    classifier = if n_classes <= 0
         identity
-    return NDF(encoder, classifier, K, α, readout)
+    elseif head === :mlp && head_style === :widemlp
+        # WideMLP-EXACT head (Galke & Scherp): Dense→Dropout→Dense, NO input
+        # dropout. Makes idea B a strict superset of WideMLP (head can ignore Z).
+        Chain(Dense(classifier_in => head_hidden, relu),
+              Dropout(dropout), Dense(head_hidden => n_classes))
+    elseif head === :mlp
+        # :pre_dropout — extra input dropout (heavier regularization variant).
+        Chain(Dropout(dropout), Dense(classifier_in => head_hidden, relu),
+              Dropout(dropout), Dense(head_hidden => n_classes))
+    else
+        Chain(Dropout(dropout), Dense(classifier_in => n_classes))
+    end
+    return NDF(encoder, classifier, K, α, readout, propagation, gamma, Wprop)
 end
 
 # Sparse-aware SpMV wrapper. Zygote's generic `*` adjoint for `A * X` computes
@@ -113,10 +172,26 @@ end
 # `A^T * ΔY` (sparse * dense) gradient for X. Drops peak memory from 17 GB
 # to <1 GB on the modern-pipeline 60K-vertex graph.
 _spmm(A::AbstractMatrix, X::AbstractMatrix) = A * X
+
+# Zygote may hand this pullback a CPU Matrix cotangent even when the primal
+# sparse multiply returned a CuArray. Materialize ΔY on the same array backend
+# as the primal output Y before computing A' * ΔY — otherwise
+# `CuSparseMatrix' * Matrix{CPU}` falls back to generic CPU matmul and
+# scalar-indexes the CuSparse object (disallowed on GPU).
+function _spmm_tangent_like(ΔY, Y::AbstractMatrix)
+    ΔY = ChainRulesCore.unthunk(ΔY)
+    ΔY isa AbstractMatrix || return ΔY
+    typeof(ΔY) === typeof(Y) && return ΔY
+    out = similar(Y, eltype(Y), size(ΔY))
+    copyto!(out, ΔY)
+    return out
+end
+
 function ChainRulesCore.rrule(::typeof(_spmm), A::AbstractMatrix, X::AbstractMatrix)
     Y = A * X
     function _spmm_pullback(ΔY)
-        return ChainRulesCore.NoTangent(), ChainRulesCore.NoTangent(), A' * ΔY
+        ΔY_dev = _spmm_tangent_like(ΔY, Y)
+        return ChainRulesCore.NoTangent(), ChainRulesCore.NoTangent(), A' * ΔY_dev
     end
     return Y, _spmm_pullback
 end
@@ -148,6 +223,91 @@ function propagate(Â::AbstractMatrix, H_0::AbstractArray{T,3}, K::Int, α::Floa
     return reshape(Z, n, h, B)
 end
 
+"""
+    propagate_gpr(Â, H_0, K, γ)
+
+Generalized-PageRank propagation (idea C, GPR-GNN): `Z = Σ_{k=0}^{K} γ_k Â^k H_0`
+with LEARNABLE per-hop weights `γ` (length K+1). Recovers APPNP when
+`γ_k = α(1-α)^k`. `γ` is sliced as 1-element arrays (`γ[i:i]`) so the weighting
+broadcasts on GPU without scalar indexing, and stays differentiable.
+"""
+function propagate_gpr(Â::AbstractMatrix, H_0::AbstractMatrix, K::Int, γ::AbstractVector)
+    acc = reshape(γ[1:1], 1, 1) .* H_0
+    Hk = H_0
+    for k in 1:K
+        Hk = _spmm(Â, Hk)
+        acc = acc .+ reshape(γ[k+1:k+1], 1, 1) .* Hk
+    end
+    return acc
+end
+
+function propagate_gpr(Â::AbstractMatrix, H_0::AbstractArray{T,3}, K::Int, γ::AbstractVector) where T
+    n, h, B = size(H_0)
+    H_flat = reshape(H_0, n, h * B)
+    acc = reshape(γ[1:1], 1, 1) .* H_flat
+    Hk = H_flat
+    for k in 1:K
+        Hk = _spmm(Â, Hk)
+        acc = acc .+ reshape(γ[k+1:k+1], 1, 1) .* Hk
+    end
+    return reshape(acc, n, h, B)
+end
+
+"""
+    propagate_nonlin(Â, H_0, K, W, α)
+
+NONLINEAR message passing: `Z_{k+1} = ReLU((1-α) Â Z_k W + α H_0)`, with a
+learnable `hidden×hidden` transform `W` and a ReLU between hops. Unlike APPNP/GPR
+(both linear ⇒ `Z=Pv`), this is a nonlinear function of the seed that requires
+the graph — it escapes the BoW-reparametrization ceiling (AND-like adjacency-
+gated conjunctions). `W` init = I ⇒ first pass ≈ linear-APPNP-with-ReLU.
+"""
+function propagate_nonlin(Â::AbstractMatrix, H_0::AbstractMatrix, K::Int, W::AbstractMatrix, α::Float32)
+    oma = 1f0 - α
+    Z = H_0
+    for _ in 1:K
+        Z = relu.(oma .* (_spmm(Â, Z) * W) .+ α .* H_0)
+    end
+    return Z
+end
+
+function propagate_nonlin(Â::AbstractMatrix, H_0::AbstractArray{T,3}, K::Int, W::AbstractMatrix, α::Float32) where T
+    V, h, B = size(H_0)
+    oma = 1f0 - α
+    Z = H_0
+    for _ in 1:K
+        AZ = reshape(_spmm(Â, reshape(Z, V, h * B)), V, h, B)     # Â-message over vertices
+        M = reshape(permutedims(AZ, (2, 1, 3)), h, V * B)         # (h × V*B)
+        trans = permutedims(reshape(W' * M, h, V, B), (2, 1, 3))  # apply W to hidden dim
+        Z = relu.(oma .* trans .+ α .* H_0)
+    end
+    return Z
+end
+
+"""
+    _seed_gate(Â, v, γ)
+
+THE KEY — multiplicative seed-masked gate:
+    Z[w] = v[w] · (1 + Σ_{j=1..r} g_j · σ(a_j·(Âv)[w] + b_j))
+with `γ = [a₁..aᵣ ‖ b₁..bᵣ ‖ g₁..gᵣ]` (learnable). `v` is the raw seed (V,) or
+(V×B). Escapes the linear-BoW ceiling (degree-2 word×neighbor product ≠ P·v),
+VANISHES on absent words (v[w]=0 ⇒ Z[w]=0, keeps the per-word BoW signal clean +
+no capacity on absent dims), and is BoW-exact at init (g=0 ⇒ Z=v). γ sliced as
+1-element arrays for GPU safety. Returns the same shape as `v`.
+"""
+function _seed_gate(Â::AbstractMatrix, v::AbstractVecOrMat, γ::AbstractVector)
+    r = length(γ) ÷ 3
+    vmat = v isa AbstractVector ? reshape(v, :, 1) : v          # (V×1) or (V×B)
+    Av = _spmm(Â, vmat)                                          # neighbor context
+    corr = zero(Av)
+    for j in 1:r
+        aj = reshape(γ[j:j], 1, 1); bj = reshape(γ[r+j:r+j], 1, 1); gj = reshape(γ[2r+j:2r+j], 1, 1)
+        corr = corr .+ gj .* sigmoid.(aj .* Av .+ bj)
+    end
+    Zmat = vmat .* (1f0 .+ corr)
+    return v isa AbstractVector ? vec(Zmat) : Zmat
+end
+
 # Differentiable masked mean. mask is converted to Float32 and the result is
 # `sum(Z .* mask) / sum(mask)`, avoiding non-differentiable logical indexing.
 function _masked_mean(Z::AbstractMatrix, mask::AbstractVector{Bool})
@@ -163,6 +323,28 @@ function _masked_mean(Z::AbstractArray{T,3}, mask::AbstractMatrix{Bool}) where T
     weighted = dropdims(sum(Z .* mask_3d; dims=1); dims=1)          # (h × B)
     norm = reshape(max.(sum(mask_f; dims=1), 1.0f0), 1, B)          # (1 × B)
     return weighted ./ norm
+end
+
+# Learned document aggregator: concat [tfidf-weighted-sum ‖ max ‖ mean] over the
+# doc's seed words. `max` is a NONLINEAR pool (cannot collapse to BoW); the
+# weighted sum uses the tfidf seed weights. Replaces near-linear seed_mean.
+function _seed_multipool(Z::AbstractMatrix, mask::AbstractVector{Bool}, seed_w::AbstractVector)
+    mask_f = Float32.(mask)
+    wsum = vec(sum(Z .* reshape(seed_w, :, 1); dims=1))
+    mean_p = _masked_mean(Z, mask)
+    Zneg = Z .+ reshape((1f0 .- mask_f) .* -1f9, :, 1)             # non-seed rows → -inf
+    maxp = vec(maximum(Zneg; dims=1))
+    return vcat(wsum, maxp, mean_p)
+end
+
+function _seed_multipool(Z::AbstractArray{T,3}, mask::AbstractMatrix{Bool}, seed_w::AbstractMatrix) where T
+    V, h, B = size(Z)
+    mask_f = Float32.(mask)
+    wsum = dropdims(sum(Z .* reshape(seed_w, V, 1, B); dims=1); dims=1)     # (h × B)
+    mean_p = _masked_mean(Z, mask)                                          # (h × B)
+    Zneg = Z .+ reshape((1f0 .- mask_f) .* -1f9, V, 1, B)
+    maxp = dropdims(maximum(Zneg; dims=1); dims=1)                          # (h × B)
+    return vcat(wsum, maxp, mean_p)
 end
 
 """
@@ -184,13 +366,18 @@ configured, otherwise the pooled fingerprint of length `hidden` or shape
 function (m::NDF)(Φ::AbstractMatrix, Â::AbstractMatrix;
                   seed_mask::Union{Nothing,AbstractVector{Bool}}=nothing,
                   central_nodes::Union{Nothing,AbstractVector{<:Integer}}=nothing)
+    if m.propagation === :gate     # THE KEY: multiplicative seed-masked gate (V-dim, BoW-exact at init)
+        return m.classifier(_seed_gate(Â, Φ[:, 1], m.gamma))
+    end
     H_0 = transpose(m.encoder(transpose(Φ)))                       # (n × hidden)
 
     if seed_mask !== nothing
         H_0 = H_0 .* reshape(Float32.(seed_mask), :, 1)
     end
 
-    Z = propagate(Â, H_0, m.K, m.α)
+    Z = m.propagation === :gpr    ? propagate_gpr(Â, H_0, m.K, m.gamma) :
+        m.propagation === :nonlin ? propagate_nonlin(Â, H_0, m.K, m.Wprop, m.α) :
+                                    propagate(Â, H_0, m.K, m.α)
 
     f = if m.readout === :mean
         vec(mean(Z; dims=1))
@@ -198,6 +385,12 @@ function (m::NDF)(Φ::AbstractMatrix, Â::AbstractMatrix;
         vec(sum(Z; dims=1))
     elseif m.readout === :flatten
         vec(Z)
+    elseif m.readout === :flatten_seed_residual
+        vcat(vec(Z), Φ[:, 1])                                      # (n*hidden + n,)
+    elseif m.readout === :seed_multipool
+        seed_mask === nothing &&
+            throw(ArgumentError("seed_mask is required for readout=:seed_multipool"))
+        _seed_multipool(Z, seed_mask, Φ[:, 1])                     # (3*hidden,)
     elseif m.readout === :opc_flatten
         central_nodes === nothing &&
             throw(ArgumentError("central_nodes required for readout=:opc_flatten"))
@@ -214,6 +407,9 @@ end
 function (m::NDF)(Φ::AbstractArray{T,3}, Â::AbstractMatrix;
                   seed_mask::Union{Nothing,AbstractMatrix{Bool}}=nothing,
                   central_nodes::Union{Nothing,AbstractVector{<:Integer}}=nothing) where T
+    if m.propagation === :gate     # THE KEY: multiplicative seed-masked gate (V-dim, BoW-exact at init)
+        return m.classifier(_seed_gate(Â, Φ[:, 1, :], m.gamma))
+    end
     n, d_in, B = size(Φ)
     # Flatten (n × d_in × B) → (d_in × n*B) for the Dense encoder, then reshape
     # back to (n × hidden × B). permutedims is required because Dense operates
@@ -227,7 +423,9 @@ function (m::NDF)(Φ::AbstractArray{T,3}, Â::AbstractMatrix;
         H_0 = H_0 .* reshape(Float32.(seed_mask), n, 1, B)
     end
 
-    Z = propagate(Â, H_0, m.K, m.α)
+    Z = m.propagation === :gpr    ? propagate_gpr(Â, H_0, m.K, m.gamma) :
+        m.propagation === :nonlin ? propagate_nonlin(Â, H_0, m.K, m.Wprop, m.α) :
+                                    propagate(Â, H_0, m.K, m.α)
 
     f = if m.readout === :mean
         dropdims(mean(Z; dims=1); dims=1)                          # (hidden × B)
@@ -235,6 +433,12 @@ function (m::NDF)(Φ::AbstractArray{T,3}, Â::AbstractMatrix;
         dropdims(sum(Z; dims=1); dims=1)
     elseif m.readout === :flatten
         reshape(Z, n * size(Z, 2), B)                              # (n*hidden × B)
+    elseif m.readout === :flatten_seed_residual
+        vcat(reshape(Z, n * size(Z, 2), B), Φ[:, 1, :])           # (n*hidden + n × B)
+    elseif m.readout === :seed_multipool
+        seed_mask === nothing &&
+            throw(ArgumentError("seed_mask is required for readout=:seed_multipool"))
+        _seed_multipool(Z, seed_mask, Φ[:, 1, :])                 # (3*hidden × B)
     elseif m.readout === :opc_flatten
         central_nodes === nothing &&
             throw(ArgumentError("central_nodes required for readout=:opc_flatten"))

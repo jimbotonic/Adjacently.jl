@@ -103,11 +103,11 @@ function textgcn_to_documents(docs::Vector{TextGcnDoc},
                               vocab::Dict{String,Int},
                               label2id::Dict{String,Int};
                               weight::Symbol = :freq)
-    weight ∈ (:freq, :binary, :tfidf) ||
-        throw(ArgumentError("weight must be :freq, :binary, or :tfidf"))
+    weight ∈ (:freq, :binary, :tfidf, :tfidf_l2, :binary_raw) ||
+        throw(ArgumentError("weight must be :freq, :binary, :tfidf, :tfidf_l2, or :binary_raw"))
 
     # Precompute IDF from the training split only (no test leakage).
-    idf = if weight === :tfidf
+    idf = if weight === :tfidf || weight === :tfidf_l2
         df = zeros(Int, length(vocab))
         n_train_docs = 0
         for d in docs
@@ -151,6 +151,16 @@ function textgcn_to_documents(docs::Vector{TextGcnDoc},
             raw = Float32[(seed_counts[i] / total) * idf[i] for i in seed_ids]
             s = sum(raw)
             s > 0f0 ? raw ./ s : Float32[1.0f0 / length(seed_ids) for _ in seed_ids]
+        elseif weight === :tfidf_l2
+            # L2-normalized TF-IDF — matches WideMLP's feature geometry (Galke &
+            # Scherp 2022) for a fair-input comparison. Breaks the sum-to-1 v_k
+            # probability semantics on purpose; keep :tfidf/:freq for v1-faithful.
+            raw = Float32[(seed_counts[i] / total) * idf[i] for i in seed_ids]
+            nrm = sqrt(sum(abs2, raw))
+            nrm > 0f0 ? raw ./ nrm : Float32[1.0f0 / length(seed_ids) for _ in seed_ids]
+        elseif weight === :binary_raw
+            # Raw presence (unnormalized 1s) — WideMLP-style binary BoW.
+            ones(Float32, length(seed_ids))
         else  # :binary
             Float32[1.0f0 / length(seed_ids) for _ in seed_ids]
         end
@@ -331,4 +341,48 @@ function build_text_gcn_vocab(docs::Vector{TextGcnDoc}; min_freq::Int = 5)
     survivors = [(w, c) for (w, c) in counts if c >= min_freq]
     sort!(survivors; by = x -> (-x[2], x[1]))
     return Dict{String,Int}(w => i for (i, (w, _)) in enumerate(survivors))
+end
+
+"""
+    word_class_weights(docs, vocab, label2id; smooth=1f0, floor=0.05f0) -> Vector{Float32}
+
+Per-word class-discriminativeness, computed from the TRAINING split only (no
+leakage). For each word `w`, take its class distribution `p(c|w)` over training
+docs that contain `w`, and score it by the KL divergence from the class prior
+`p(c)` — words concentrated in a few classes (e.g. class-specific jargon) score
+high, stopword-like words spread across classes score ~0. Returned weights are
+rescaled to `[floor, 1]` so no edge is fully zeroed. Used to reweight PPMI edges
+so diffusion flows along class-consistent co-occurrences (class-aware graph).
+"""
+function word_class_weights(docs::Vector{TextGcnDoc}, vocab::Dict{String,Int},
+                            label2id::Dict{String,Int};
+                            smooth::Float32=1f0, floor::Float32=0.05f0)
+    V = length(vocab); C = length(label2id)
+    wc = zeros(Float32, V, C)          # wc[w,c] = # train docs of class c with word w
+    classtot = zeros(Float32, C)
+    for d in docs
+        d.split === :train || continue
+        c = label2id[d.label]
+        classtot[c] += 1f0
+        seen = Set{Int}()
+        for t in d.tokens
+            id = get(vocab, t, 0); id == 0 && continue
+            if !(id in seen); push!(seen, id); wc[id, c] += 1f0; end
+        end
+    end
+    ntrain = sum(classtot)
+    pc = (classtot .+ smooth) ./ (ntrain + C * smooth)   # class prior
+    score = Vector{Float32}(undef, V)
+    @inbounds for i in 1:V
+        row = @view wc[i, :]
+        s = sum(row) + C * smooth
+        kl = 0f0
+        for c in 1:C
+            pcw = (row[c] + smooth) / s
+            kl += pcw * log(pcw / pc[c])
+        end
+        score[i] = kl
+    end
+    mx = maximum(score); mx = mx > 0f0 ? mx : 1f0
+    return floor .+ (1f0 - floor) .* (score ./ mx)
 end

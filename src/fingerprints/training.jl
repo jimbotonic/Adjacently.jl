@@ -368,7 +368,8 @@ function fingerprints(model::NDF,
 
     # Run model with classifier replaced by identity so we get the pooled
     # fingerprint regardless of whether the trained model has a classifier.
-    fp_model = NDF(model.encoder, identity, model.K, model.α, model.readout)
+    fp_model = NDF(model.encoder, identity, model.K, model.α, model.readout,
+                   model.propagation, model.gamma, model.Wprop)
     Flux.testmode!(fp_model)
 
     N = length(docs)
