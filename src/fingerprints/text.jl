@@ -311,7 +311,7 @@ matrix of size `|V| × |V|`.
 """
 function compute_ppmi(docs::AbstractVector,
                       vocab::Dict{String,Int};
-                      window::Int=20)
+                      window::Int=20, directed::Bool=false)
     V = length(vocab)
     pair_counts = Dict{Tuple{Int,Int},Int}()
     token_counts = zeros(Int, V)
@@ -327,20 +327,34 @@ function compute_ppmi(docs::AbstractVector,
         n == 0 && continue
         for i in 1:n
             stop = min(n, i + window - 1)
-            in_window = unique(ids[i:stop])
+            wv = ids[i:stop]                      # in reading order
+            in_window = unique(wv)
             for u in in_window
                 token_counts[u] += 1
             end
-            for a in 1:length(in_window), b in a+1:length(in_window)
-                u, v = in_window[a], in_window[b]
-                u, v = min(u, v), max(u, v)
-                pair_counts[(u, v)] = get(pair_counts, (u, v), 0) + 1
+            if directed
+                # ORDERED pairs: u precedes v within the window → directed edge u→v.
+                # (once per window per distinct ordered pair, to match undirected counting).
+                seen = Set{Tuple{Int,Int}}()
+                for a in 1:length(wv), b in a+1:length(wv)
+                    u, v = wv[a], wv[b]
+                    u == v && continue
+                    (u, v) in seen && continue
+                    push!(seen, (u, v))
+                    pair_counts[(u, v)] = get(pair_counts, (u, v), 0) + 1
+                end
+            else
+                for a in 1:length(in_window), b in a+1:length(in_window)
+                    u, v = in_window[a], in_window[b]
+                    u, v = min(u, v), max(u, v)
+                    pair_counts[(u, v)] = get(pair_counts, (u, v), 0) + 1
+                end
             end
             n_windows += 1
         end
     end
 
-    # Build PPMI sparse matrix.
+    # Build PPMI sparse matrix. `directed`: keep asymmetric (u→v only).
     rows = Int[]; cols = Int[]; vals = Float32[]
     for ((u, v), c) in pair_counts
         p_uv = c / n_windows
@@ -349,7 +363,7 @@ function compute_ppmi(docs::AbstractVector,
         pmi = log(p_uv / (p_u * p_v + 1.0f-12))
         pmi <= 0 && continue
         push!(rows, u); push!(cols, v); push!(vals, Float32(pmi))
-        push!(rows, v); push!(cols, u); push!(vals, Float32(pmi))
+        directed || (push!(rows, v); push!(cols, u); push!(vals, Float32(pmi)))
     end
     return sparse(rows, cols, vals, V, V)
 end
