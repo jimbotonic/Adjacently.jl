@@ -19,7 +19,7 @@ graphs. Run each from the repo root with the project activated:
 | `tab:transfer` (Leiden+LLP-vs-LLP gain, 3 seeds, 2 backends) | `transfer.jl` | web-google, amazon-0601, arxiv-hep-ph, EAT | **done** (verified on EAT, exact) |
 | `tab:ablation` (encoder feature history) | `feature_ablation.jl` | cnr-2000 | blocked — uses removed encoder params; needs reconstruction |
 | cnr-2000 rows of `tab:ord-ablation` | — | cnr-2000 | blocked — see note 1 (Leiden+LLP BG/CS do reproduce: ~2.32/2.30) |
-| `tab:highlight` (whole-graph, context-range) | `sota_wholegraph.jl` | all 7 | blocked — see notes 2 & 3 |
+| `tab:highlight` (whole-graph, context-range) | `sota_wholegraph.jl` | all 7 | **done** for our BG/CS/CG columns (spot-checked: arxiv/EAT native BG match the published cells); baseline columns need external tools, LAW rows need `fetch_datasets.sh` — see notes 2 & 3 |
 | `tab:ra-sota` (random access, context-range) | `sota_ra.jl` | all 7 | blocked — see notes 2 & 3 |
 
 ### Why the remaining tables are not reproducible from this repo
@@ -47,6 +47,20 @@ graphs. Run each from the repo root with the project activated:
    Differences are ≤0.08 bpe, cell-specific, and bidirectional (only native CS is higher, by
    0.04; every other cell matches or improves). A merge-threshold (τ) × seed sweep does not
    close them, confirming the residual is per-cell config, not something a driver can recover.
+
+   `sota_wholegraph.jl` now drives our three columns of that table directly, at the τ per
+   dataset and the seeded mean±std the benchmark plan specified. Its committed-encoder
+   figures land where note 3 predicts — e.g. `arxiv-hep-ph` native BG 8.9537 (published
+   8.954) and `eat` native BG 9.1019 (published 9.102), with CS/CG differing per cell in
+   both directions.
+
+4. **Watch which graph a row was measured on.** The paper's dataset table mixes reductions:
+   `web-google` (434,818v), `amazon-0601` (395,234v) and `EAT` (7,754v) are largest-SCC
+   cores, but `arxiv-hep-ph` (34,546v) is the **whole** graph — its core is only 12,711v and
+   reads ~0.6 bpe lower. `sota_wholegraph.jl` encodes this per dataset in its `core=` field.
+   Note that `ord_ablation.jl` and `transfer.jl` core-reduce arxiv-hep-ph; their
+   arxiv absolute cells are therefore on the smaller graph (the ordering *gains* those
+   drivers exist to show are unaffected).
 
 The two ordering drivers above (`ord_ablation.jl`, `transfer.jl`) reproduce the paper's
 **ordering-transfer** claim exactly from committed data, which is the paper's headline.

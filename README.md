@@ -242,15 +242,18 @@ directly comparable to the ordering-ablation numbers reproduced by
 unmerged ordering. With that classic backend, the best cnr-2000 results are CS 2.304 and
 BG 2.326 (Leiden+LLP) and CG K=2 2.329 (LAW order), against BV 2.898 and BV-HC 2.448.
 
-> **Reproducibility of these two tables.** The shipped drivers reproduce the paper's
-> *ordering-transfer* result, not the SOTA grids above. Reproducing these cells needs
-> three things this repository does not currently provide end-to-end: the two largest
-> LAW graphs (fetch them, see [Datasets](#datasets)), the WebGraph and Zuckerli binaries
-> for the baseline columns, and a context-range SOTA driver — `sota_wholegraph.jl` /
-> `sota_ra.jl` are not written yet. The committed encoder is the latest one; on the
-> dataset swept end-to-end (EAT) it matches or beats the published CS/CG cells, so the
-> residual is per-cell configuration, not an encoder regression. See
-> [bench/graph_compression/README.md](bench/graph_compression/README.md) for the exact
+> **Reproducibility of these two tables.** `bench/graph_compression/sota_wholegraph.jl`
+> drives the **BG / CS / CG columns of the whole-graph table** — both orderings, the
+> per-dataset merge threshold, seeded mean±std. The **BV-HC and Zuckerli columns** need
+> those external tools (`WEBGRAPH_CP`, `ZUCKERLI_ENCODER`); without them the driver exports
+> the ordered graph and prints the exact commands. The **random-access table has no driver
+> yet** (`sota_ra.jl`), and the three LAW rows need `fetch_datasets.sh` first.
+>
+> Expect per-cell differences of up to ~0.08 BPE against the values above, in both
+> directions: those cells used slightly different per-cell configurations. Spot-checks of
+> the shipped driver against the published numbers — arxiv-hep-ph native BG 8.9537 (vs
+> 8.954), EAT native BG 9.1019 (vs 9.102). See
+> [bench/graph_compression/README.md](bench/graph_compression/README.md) for the full
 > per-cell comparison.
 
 A dual cost model is available for the greedy encoders: the full model (`cost_model=0`)
@@ -389,12 +392,24 @@ graph with `load_adjacency_list_from_csv("datasets/webgraph/<name>/<name>.csv", 
 ### Step 3 — run the drivers
 
 ```bash
-julia --project=. bench/graph_compression/ord_ablation.jl   # orderings × encoders
-julia --project=. bench/graph_compression/transfer.jl       # Leiden+LLP vs LLP gain
+julia --project=. bench/graph_compression/ord_ablation.jl     # orderings × encoders
+julia --project=. bench/graph_compression/transfer.jl         # Leiden+LLP vs LLP gain
+julia --project=. bench/graph_compression/sota_wholegraph.jl  # context-range vs baselines
 ```
 
-Both reorder in memory from the committed graphs — no intermediate ordering files — and
-verify every encode by roundtrip decompression.
+Each takes an optional dataset name (`… ord_ablation.jl eat`). They reorder in memory from
+the committed graphs — no intermediate ordering files — and verify every encode by
+roundtrip decompression.
+
+`sota_wholegraph.jl` additionally picks up the baseline columns when the external tools are
+available, and writes a TSV of every cell:
+
+```bash
+WEBGRAPH_CP='/path/to/webgraph-3.6.12.jar:/path/to/deps/*' \
+ZUCKERLI_ENCODER=/path/to/zuckerli/build/encoder \
+OUT_TSV=sota.tsv \
+  julia --project=. bench/graph_compression/sota_wholegraph.jl
+```
 
 ### What reproduces, and what does not
 
@@ -403,11 +418,16 @@ verify every encode by roundtrip decompression.
 | Ordering ablation (orderings × encoders, Fibonacci) | reproduces from committed data (verified on EAT: 8/9 cells; see the Orig-CG caveat in the bench README) |
 | Ordering transfer (3 seeds, 2 backends) | reproduces from committed data (verified on EAT, exact) |
 | cnr-2000 *native* rows | needs the fetched LAW graph — the committed `.mgz` is pre-reordered |
-| Context-range SOTA grids (whole-graph and random access) | **no driver yet** — `sota_wholegraph.jl` / `sota_ra.jl` are unwritten |
+| Whole-graph SOTA table, BG/CS/CG columns | reproduces from committed data (spot-checked against the published cells) |
+| Whole-graph SOTA table, BV-HC / Zuckerli columns | needs the external tools (see below) |
+| Random-access SOTA table | **no driver yet** — `sota_ra.jl` is unwritten |
 | Encoder feature ablation | blocked — uses encoder parameters that no longer exist |
 
 Baseline columns need external tools, which this repository does not vendor: WebGraph
-3.6.12 (Java 21) for the BV and BV-HC rows, and Zuckerli for the Zuckerli rows.
+3.6.12 (Java 21) for the BV and BV-HC rows, and Zuckerli for the Zuckerli rows. Point
+`WEBGRAPH_CP` and `ZUCKERLI_ENCODER` at them and `sota_wholegraph.jl` fills those columns
+in; otherwise it exports the ordered graph as `.graph-txt` and Zuckerli `.csr` and prints
+the commands to run by hand.
 
 Note the ordering used: the drivers above call
 `relabel_graph_leiden_llp(g; merge_clusters=nothing)`, matching the paper's ablation
