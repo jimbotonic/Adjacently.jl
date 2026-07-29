@@ -235,12 +235,23 @@ Reading the tables:
   is therefore compared in its own mode rather than across modes.
 - All compressed files are verified by roundtrip decompression.
 
-The `leiden` rows use the Leiden+LLP ordering with the small-cluster merge refinement,
-so these absolute values are not directly comparable to the ordering-ablation numbers
-reproduced by `bench/graph_compression/ord_ablation.jl`, which use the Fibonacci backend
-and the unmerged ordering. With that classic backend, the best cnr-2000 results are
-CS 2.304 and BG 2.326 (Leiden+LLP) and CG K=2 2.329 (LAW order), against BV 2.898 and
-BV-HC 2.448.
+The `leiden` rows use the Leiden+LLP ordering with the small-cluster merge refinement
+(`relabel_graph_leiden_llp(g; merge_clusters=:auto)`), so these absolute values are not
+directly comparable to the ordering-ablation numbers reproduced by
+`bench/graph_compression/ord_ablation.jl`, which use the Fibonacci backend and the
+unmerged ordering. With that classic backend, the best cnr-2000 results are CS 2.304 and
+BG 2.326 (Leiden+LLP) and CG K=2 2.329 (LAW order), against BV 2.898 and BV-HC 2.448.
+
+> **Reproducibility of these two tables.** The shipped drivers reproduce the paper's
+> *ordering-transfer* result, not the SOTA grids above. Reproducing these cells needs
+> three things this repository does not currently provide end-to-end: the two largest
+> LAW graphs (fetch them, see [Datasets](#datasets)), the WebGraph and Zuckerli binaries
+> for the baseline columns, and a context-range SOTA driver — `sota_wholegraph.jl` /
+> `sota_ra.jl` are not written yet. The committed encoder is the latest one; on the
+> dataset swept end-to-end (EAT) it matches or beats the published CS/CG cells, so the
+> residual is per-cell configuration, not an encoder regression. See
+> [bench/graph_compression/README.md](bench/graph_compression/README.md) for the exact
+> per-cell comparison.
 
 A dual cost model is available for the greedy encoders: the full model (`cost_model=0`)
 explores all encoding options and candidates for the best ratio, while the fast model
@@ -342,19 +353,69 @@ models, basin estimation, ablations, and distributed constitutional sensing. Ord
 parameters include Φ, Ψ_T, Λ, Γ, hierarchy scores, and `H_informal_excess`
 (degree-preserving-null-corrected informal hierarchy).
 
-## Benchmarks
+## Benchmarks and reproduction
 
 `bench/graph_compression/` holds reproduction drivers for the bits-per-edge tables of
-the community-aware vertex-ordering paper. They are **not** part of the test suite and
-can take a long time on the larger graphs:
+the [companion paper](https://arxiv.org/abs/2605.21510). They are **not** part of the
+test suite and can take a long time on the larger graphs.
+
+### Step 1 — environment
+
+```bash
+julia --project=. -e 'using Pkg; Pkg.instantiate()'
+```
+
+BPE is machine-independent, so results do not depend on the box. The ordering pipeline
+is stochastic only through LLP's random visit order; both drivers fix the seeds, so runs
+are deterministic. Defaults are overridable by environment variable —
+`SEEDS=0,1,2`, `COST_MODEL=0`, `VERIFY=true`, and `BACKENDS=fib,ctx` for `transfer.jl`.
+
+### Step 2 — datasets
+
+The four SNAP graphs and a pre-reordered cnr-2000 are committed, so the ordering drivers
+run with no downloads. For the LAW graphs (`in-2004`, `enwiki-2013`, and the true
+crawl-order `cnr-2000`):
+
+```bash
+# downloads + md5-verifies, then converts BVGraph -> CSV
+WEBGRAPH_CP='/path/to/webgraph-3.6.12.jar:/path/to/deps/*' \
+  bash bench/graph_compression/fetch_datasets.sh
+```
+
+Without `WEBGRAPH_CP` the files are still downloaded and verified, and the script prints
+the exact `ArcListASCIIGraph` command to finish the conversion by hand. Load a fetched
+graph with `load_adjacency_list_from_csv("datasets/webgraph/<name>/<name>.csv", ',', true)`.
+
+### Step 3 — run the drivers
 
 ```bash
 julia --project=. bench/graph_compression/ord_ablation.jl   # orderings × encoders
 julia --project=. bench/graph_compression/transfer.jl       # Leiden+LLP vs LLP gain
 ```
 
-See [bench/graph_compression/README.md](bench/graph_compression/README.md) for the
-table → driver map and for which cells cannot be reproduced from committed data.
+Both reorder in memory from the committed graphs — no intermediate ordering files — and
+verify every encode by roundtrip decompression.
+
+### What reproduces, and what does not
+
+| Result | Status |
+|--------|--------|
+| Ordering ablation (orderings × encoders, Fibonacci) | reproduces from committed data (verified on EAT: 8/9 cells; see the Orig-CG caveat in the bench README) |
+| Ordering transfer (3 seeds, 2 backends) | reproduces from committed data (verified on EAT, exact) |
+| cnr-2000 *native* rows | needs the fetched LAW graph — the committed `.mgz` is pre-reordered |
+| Context-range SOTA grids (whole-graph and random access) | **no driver yet** — `sota_wholegraph.jl` / `sota_ra.jl` are unwritten |
+| Encoder feature ablation | blocked — uses encoder parameters that no longer exist |
+
+Baseline columns need external tools, which this repository does not vendor: WebGraph
+3.6.12 (Java 21) for the BV and BV-HC rows, and Zuckerli for the Zuckerli rows.
+
+Note the ordering used: the drivers above call
+`relabel_graph_leiden_llp(g; merge_clusters=nothing)`, matching the paper's ablation
+tables. The SOTA grids instead use the small-cluster merge (`merge_clusters=:auto`),
+which is implemented and public (`src/relabeling.jl`) but not driven by any script here.
+
+See [bench/graph_compression/README.md](bench/graph_compression/README.md) for the full
+table → driver map and the per-cell comparison against the published numbers.
 
 ## Tests
 
