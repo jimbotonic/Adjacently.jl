@@ -65,7 +65,7 @@ function linear_limit_ndf(α::Float32, K::Int)
     encoder[1].weight .= 1.0f0; encoder[1].bias .= 0.0f0
     encoder[3].weight .= 1.0f0; encoder[3].bias .= 0.0f0
     classifier = identity
-    return NDF(encoder, classifier, K, α, :flatten)
+    return NDF(encoder, classifier, K, α, :flatten, :appnp, Float32[], zeros(Float32, 0, 0))
 end
 
 α = 0.15f0
