@@ -166,29 +166,92 @@ idx = load_indexed_mgs3_graph("graph.mgz")
 nbrs = idx.neighbors(42)
 ```
 
-### Performance
+### Compression ratio
 
-On the CNR-2000 web graph (325,557 vertices, 3,216,152 edges):
+Bits per edge (BPE = `8 × filesize / m`) is a property of the encoded bitstream and is
+therefore machine-independent, so every figure below is reproducible on any machine.
+Encoder throughput is not — it depends on the CPU, the JIT, and the I/O path — so no
+timings are published here; see the companion paper for the speed discussion.
 
-| Method | Ordering | Bits per edge | sec/edge |
-|--------|----------|--------------|----------|
-| **CS** (w=256) | Leiden+LLP | **2.3043** | 5.63e-05 |
-| BG (w=64, multi-ref) | Leiden+LLP | 2.3259 | 1.95e-05 |
-| CG K=2 (w=64) | Original | 2.3286 | 5.63e-06 |
-| WebGraph BV (w=7) | Original | 2.898 | 2.198e-07 |
-| WebGraph BV-HC | Host-compressed | 2.448 | — |
+The tables report the `:context_range` backend at K=1 against the strongest
+reference-based baselines: WebGraph **BV-HC** (high-compression) and **Zuckerli**
+(max-compression mode), on seven datasets in both their native and Leiden+LLP orderings.
+The best of the three Adjacently encoders is in bold; the last column is its relative
+reduction over Zuckerli.
 
-All methods achieve perfect round-trip fidelity. CS with Leiden+LLP ordering beats
-WebGraph BV by 21% and BV-HC by 6% on this dataset. CG K=2 is the fastest Adjacently
-encoder at 5.63e-06 sec/edge thanks to analytical cost estimation. A dual cost model is
-available: full model (`cost_model=0`) maximizes compression quality, fast model
-(`cost_model=1`) trades modest BPE for significant speedup (e.g. CS: 19× faster at
-+0.28 BPE).
+**Whole-graph compression (BPE)**
+
+| Dataset | Ordering | BV-HC | Zuckerli | BG | CS | CG | vs Zuck. |
+|---|---|---|---|---|---|---|---|
+| amazon-0601 | native | 12.853 | 10.254 | 10.155 | 10.380 | **9.903** | +3.4% |
+| amazon-0601 | leiden | 8.196 | 6.886 | 6.557 | 6.629 | **6.381** | +7.3% |
+| arxiv-hep-ph | native | 10.132 | 9.379 | 8.954 | **8.823** | 8.899 | +5.9% |
+| arxiv-hep-ph | leiden | 7.710 | 7.382 | 6.704 | 6.637 | **6.572** | +11.0% |
+| cnr-2000 | native | 2.565 | 1.886 | 1.773 | **1.702** | 1.946 | +9.8% |
+| cnr-2000 | leiden | 2.714 | 2.063 | 1.937 | **1.870** | 2.121 | +9.4% |
+| EAT | native | 10.725 | 9.703 | 9.102 | **9.002** | 9.061 | +7.2% |
+| EAT | leiden | 9.725 | 9.148 | 8.462 | 8.546 | **8.407** | +8.1% |
+| enwiki-2013 | native | 15.625 | 13.299 | 13.007 | **12.945** | 13.121 | +2.7% |
+| enwiki-2013 | leiden | 12.412 | 10.934 | **10.561** | 10.668 | 10.615 | +3.4% |
+| in-2004 | native | 1.839 | 1.319 | 1.282 | **1.245** | 1.483 | +5.6% |
+| in-2004 | leiden | 1.923 | 1.417 | 1.367 | **1.344** | 1.576 | +5.2% |
+| web-google | native | 6.165 | 4.957 | 4.807 | **4.790** | 4.884 | +3.4% |
+| web-google | leiden | 4.095 | 3.408 | 3.188 | **3.142** | 3.349 | +7.8% |
+
+**Random access (BPE)**, each system in its own random-access mode: BV at w=7 with
+bounded reference chains (m=3), Zuckerli with `--allow_random_access`, ours with the
+embedded sampled index.
+
+| Dataset | Ordering | BV w=7 | Zuck.-RA | BG | CS | CG | vs Zuck. |
+|---|---|---|---|---|---|---|---|
+| amazon-0601 | native | 13.001 | 10.514 | **10.260** | 10.485 | 20.629 | +2.4% |
+| amazon-0601 | leiden | 8.343 | 7.055 | **6.695** | 6.800 | 8.451 | +5.1% |
+| arxiv-hep-ph | native | 10.263 | 9.130 | 9.149 | **9.102** | 14.545 | +0.3% |
+| arxiv-hep-ph | leiden | 7.964 | 7.176 | 6.948 | **6.918** | 8.437 | +3.6% |
+| cnr-2000 | native | 3.178 | 2.443 | 1.749 | **1.698** | 5.437 | +30.5% |
+| cnr-2000 | leiden | 3.225 | 2.497 | 1.890 | **1.845** | 3.050 | +26.1% |
+| EAT | native | 10.754 | 9.322 | 9.130 | **9.081** | 12.608 | +2.6% |
+| EAT | leiden | 9.769 | 8.756 | **8.508** | 8.598 | 10.411 | +2.8% |
+| enwiki-2013 | native | 16.195 | 13.722 | **13.001** | 13.017 | 25.799 | +5.3% |
+| enwiki-2013 | leiden | 12.867 | 11.304 | **10.505** | 10.672 | 13.775 | +7.1% |
+| in-2004 | native | 2.388 | 1.932 | 1.278 | **1.251** | 4.185 | +35.2% |
+| in-2004 | leiden | 2.352 | 1.883 | 1.354 | **1.337** | 2.354 | +29.0% |
+| web-google | native | 6.717 | 5.526 | 4.920 | **4.917** | 11.772 | +11.0% |
+| web-google | leiden | 4.690 | 3.900 | 3.328 | **3.299** | 4.272 | +15.4% |
+
+Reading the tables:
+
+- The best of the three encoders beats Zuckerli in all 28 cells, by +0.3% to +35%. The
+  margin is largest on the most compressible graphs (in-2004, cnr-2000), where
+  entropy-coding the control bits — previously 0.2–0.3 BPE of raw overhead — matters most.
+- **BG-RA and CS-RA are the random-access winners.** CG-RA uses the K>1 cluster layer
+  directly (cluster = seek chunk), so its cross-cluster edges cannot use reference or
+  interval compression and pay the expensive inter-cluster stub encoding.
+- BV-HC (w=16, unbounded reference chains) has no practical random access, which is why
+  the random-access table uses BV w=7, m=3 instead.
+- WebGraph's `.offsets` sidecar is excluded from every BV figure, conservatively against
+  us. Zuckerli's random-access file can be *smaller* than its max-compression file on
+  small graphs (per-block coder reset amortizes table overhead differently); each system
+  is therefore compared in its own mode rather than across modes.
+- All compressed files are verified by roundtrip decompression.
+
+The `leiden` rows use the Leiden+LLP ordering with the small-cluster merge refinement,
+so these absolute values are not directly comparable to the ordering-ablation numbers
+reproduced by `bench/graph_compression/ord_ablation.jl`, which use the Fibonacci backend
+and the unmerged ordering. With that classic backend, the best cnr-2000 results are
+CS 2.304 and BG 2.326 (Leiden+LLP) and CG K=2 2.329 (LAW order), against BV 2.898 and
+BV-HC 2.448.
+
+A dual cost model is available for the greedy encoders: the full model (`cost_model=0`)
+explores all encoding options and candidates for the best ratio, while the fast model
+(`cost_model=1`) trades a few tenths of a BPE for a large reduction in encoding work.
 
 ### References
 
 - [WebGraph: A Framework for Graph Compression](http://webgraph.di.unimi.it/) — Paolo Boldi and Sebastiano Vigna
 - [The WebGraph Framework](https://dl.acm.org/doi/10.1145/988672.988752) — WWW 2004
+- [Zuckerli: A New Compressed Representation for Graphs](https://arxiv.org/abs/2009.01353) — Versari et al., IEEE Access 2020
+- *Community-Aware Vertex Ordering for Reference-Based Graph Compression: A Cross-Encoder Empirical Study* — the companion paper behind the tables above and the `bench/graph_compression` drivers
 
 ## MGS File Format
 
