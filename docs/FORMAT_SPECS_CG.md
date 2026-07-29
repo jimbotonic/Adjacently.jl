@@ -825,6 +825,10 @@ Ref used (CG original): 3,526,081 / 4,203,325 (83.9%). Ref used (CG LLP): 3,560,
 CG parameter sweep against BV (w=64) on `random_web_digraph` graphs.
 Four strategies compared: hand-tuned baseline, GNN-predicted params, auto_select_K, and exhaustive grid search (512 combos).
 
+> Historical record: the GNN parameter predictor (`src/gnn/`, `src/param_prediction.jl`)
+> was removed from the library; the `CG GNN` column is kept for reference only and is no
+> longer reproducible from this repository.
+
 | avg_deg | BV (w=64) | CG baseline | CG GNN | CG K=auto | CG grid | Grid config |
 |---------|-----------|-------------|--------|-----------|---------|-------------|
 | 12 | 9.944 | 10.130 | 10.371 | 10.130 (K=1) | **9.318** (-0.627) | w=8, iv+lr, mil=3, zz, no-sd |

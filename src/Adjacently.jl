@@ -71,10 +71,6 @@ include("compression/utils.jl")
 using .CompressionUtils
 export CompressionUtils
 
-include("gnn/GNN.jl")
-using .GNN
-export GNN
-
 include("compression.jl")
 using .Compression
 export Compression
@@ -102,10 +98,6 @@ export MGS
 include("metrics.jl")
 using .Metrics
 export Metrics
-
-include("param_prediction.jl")
-using .ParamPrediction
-export ParamPrediction
 
 include("metabolic/Metabolic.jl")
 using .Metabolic
