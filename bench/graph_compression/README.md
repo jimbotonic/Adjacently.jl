@@ -20,7 +20,7 @@ graphs. Run each from the repo root with the project activated:
 | `tab:ablation` (encoder feature history) | `feature_ablation.jl` | cnr-2000 | blocked — uses removed encoder params; needs reconstruction |
 | cnr-2000 rows of `tab:ord-ablation` | — | cnr-2000 | blocked — see note 1 (Leiden+LLP BG/CS do reproduce: ~2.32/2.30) |
 | `tab:highlight` (whole-graph, context-range) | `sota_wholegraph.jl` | all 7 | **done** for our BG/CS/CG columns (spot-checked: arxiv/EAT native BG match the published cells); baseline columns need external tools, LAW rows need `fetch_datasets.sh` — see notes 2 & 3 |
-| `tab:ra-sota` (random access, context-range) | `sota_ra.jl` | all 7 | blocked — see notes 2 & 3 |
+| `tab:ra-sota` (random access, context-range) | `sota_ra.jl` | all 7 | **done** for our BG/CS/CG-RA columns (EAT and arxiv reproduce to ≤0.08 bpe); BV-w7 / Zuckerli-RA need external tools, LAW rows need `fetch_datasets.sh` |
 
 ### Why the remaining tables are not reproducible from this repo
 
@@ -48,11 +48,24 @@ graphs. Run each from the repo root with the project activated:
    0.04; every other cell matches or improves). A merge-threshold (τ) × seed sweep does not
    close them, confirming the residual is per-cell config, not something a driver can recover.
 
-   `sota_wholegraph.jl` now drives our three columns of that table directly, at the τ per
-   dataset and the seeded mean±std the benchmark plan specified. Its committed-encoder
-   figures land where note 3 predicts — e.g. `arxiv-hep-ph` native BG 8.9537 (published
-   8.954) and `eat` native BG 9.1019 (published 9.102), with CS/CG differing per cell in
-   both directions.
+   `sota_wholegraph.jl` and `sota_ra.jl` now drive our three columns of each table
+   directly, at the τ per dataset and the seeded mean±std the benchmark plan specified.
+   Their committed-encoder figures land where note 3 predicts, with CS/CG differing per
+   cell in both directions:
+
+   | published vs driver | native BG / CS / CG | leiden BG / CS / CG |
+   |---|---|---|
+   | `eat` whole-graph | 9.102/9.002/9.061 → 9.1019/9.0408/8.9780 | 8.462/8.546/8.407 → 8.462/8.474/8.383 |
+   | `eat` random access | 9.130/9.081/12.608 → 9.1295/9.0713/12.5918 | 8.508/8.598/10.411 → 8.5059/8.5217/10.3951 |
+   | `arxiv-hep-ph` whole-graph | 8.954/8.823/8.899 → 8.9537/8.9233/8.7947 | 6.704/6.637/6.572 → 6.7008/6.6558/6.4691 |
+   | `arxiv-hep-ph` random access | 9.149/9.102/14.545 → 9.1488/9.1206/14.5351 | 6.948/6.918/8.437 → 6.9452/6.8967/8.3604 |
+   | `web-google` whole-graph | 4.807/4.790/4.884 → 4.8018/4.8001/4.9049 | 3.188/3.142/3.349 → 3.1887/3.1566/3.3059 |
+
+   The random-access driver pins one seek granularity for all three encoders
+   (`SAMPLE_K`, default 2048 vertices): BG/CS pass it as `index_sample_k`, CG coalesces
+   its cluster ranges to at least that size. That single choice is what reproduces the
+   published RA cells; a smaller k (e.g. the 64 of the paper's index-mode discussion)
+   costs ~0.9 bpe more on EAT.
 
 4. **Watch which graph a row was measured on.** The paper's dataset table mixes reductions:
    `web-google` (434,818v), `amazon-0601` (395,234v) and `EAT` (7,754v) are largest-SCC
