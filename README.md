@@ -3,15 +3,14 @@
 Adjacently.jl is a Julia library for the analysis and compression of large complex
 directed networks. It started as a graph-compression toolkit (the **MGS** format and
 its BG/CS/CG encoders) and now also hosts the research modules built on top of it:
-neural diffusion fingerprints, metabolic pathway discovery, GNN-based vertex ordering,
-and an agent-based governance simulation.
+neural diffusion fingerprints, metabolic pathway discovery, and an agent-based
+governance simulation.
 
 | Module | Purpose |
 |--------|---------|
 | `Compression`, `MGS` | BG / CS / CG encoders and the self-describing `.mgz` container |
 | `Clustering`, `Relabeling` | Leiden / LLP partitioning and vertex-ordering pipelines |
 | `Graph`, `Algo`, `Paths`, `PageRank`, `RandomWalks`, `Metrics` | Core graph analysis |
-| `GNN` | 2-layer GNN / GAT scoring for compression-aware vertex ordering |
 | `Fingerprints` | Neural diffusion fingerprints (NDF) and graph-based text models |
 | `Metabolic` | BiGG model loading, FBA, and chemistry-aware pathway search |
 | `MycelialPolis` | Agent-based simulation of latent societies in reactive hosts |
@@ -171,7 +170,8 @@ nbrs = idx.neighbors(42)
 Bits per edge (BPE = `8 × filesize / m`) is a property of the encoded bitstream and is
 therefore machine-independent, so every figure below is reproducible on any machine.
 Encoder throughput is not — it depends on the CPU, the JIT, and the I/O path — so no
-timings are published here; see the companion paper for the speed discussion.
+timings are published here; see the [companion paper](https://arxiv.org/abs/2605.21510)
+for the speed discussion.
 
 The tables report the `:context_range` backend at K=1 against the strongest
 reference-based baselines: WebGraph **BV-HC** (high-compression) and **Zuckerli**
@@ -251,7 +251,7 @@ explores all encoding options and candidates for the best ratio, while the fast 
 - [WebGraph: A Framework for Graph Compression](http://webgraph.di.unimi.it/) — Paolo Boldi and Sebastiano Vigna
 - [The WebGraph Framework](https://dl.acm.org/doi/10.1145/988672.988752) — WWW 2004
 - [Zuckerli: A New Compressed Representation for Graphs](https://arxiv.org/abs/2009.01353) — Versari et al., IEEE Access 2020
-- *Community-Aware Vertex Ordering for Reference-Based Graph Compression: A Cross-Encoder Empirical Study* — the companion paper behind the tables above and the `bench/graph_compression` drivers
+- [Community-Aware Vertex Ordering for Reference-Based Graph Compression: A Cross-Encoder Empirical Study](https://arxiv.org/abs/2605.21510) — the companion paper behind the tables above and the `bench/graph_compression` drivers
 
 ## MGS File Format
 
@@ -341,12 +341,6 @@ and an ε-greedy `AdaptiveHost`), adoption dynamics, repression and infrastructu
 models, basin estimation, ablations, and distributed constitutional sensing. Order
 parameters include Φ, Ψ_T, Λ, Γ, hierarchy scores, and `H_informal_excess`
 (degree-preserving-null-corrected informal hierarchy).
-
-### GNN — compression-aware vertex ordering
-
-Lightweight 2-layer GNN and GAT producing per-vertex scores, with manual gradients and
-both proxy and REINFORCE training (`train_gnn_proxy!`, `train_gnn_reinforce!`), used to
-derive vertex orderings via `relabel_vertices_gnn`.
 
 ## Benchmarks
 
