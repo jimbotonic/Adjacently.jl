@@ -52,7 +52,7 @@ include("dcs.jl")              # Distributed constitutional sensing (paper 2)
 export Agent, ROLE_RANK, is_active, is_committed, is_steward,
        is_infiltrator, is_defector,
        Multiplex, World, build_world, default_params, layer,
-       build_topology, topology_summary, natural_partition,
+       build_topology, topology_summary, natural_partition, thin_to!,
        ego_partition, scoped_partition,
        HostStrategy, RandomHost, DegreeHost, BetweennessHost,
        LegibilityHost, LocalizedHost, InfiltrationFirstHost, AttritionHost,

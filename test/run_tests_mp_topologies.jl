@@ -12,6 +12,7 @@
 
 using Test
 using Statistics: mean, std
+using Random: MersenneTwister
 using LightGraphs: nv, ne, edges, src, dst, outneighbors, inneighbors,
                    outdegree, indegree
 using Adjacently
@@ -110,3 +111,33 @@ end
     end
 end
 
+
+# Regression test for thin_to! (TIER1_EXPERIMENT_PLAN.md §E1, E1b matched-3
+# low anchor): uniform edge deletion down to a target mean out-degree.
+@testset "thin_to! (E1b matched-3 anchor)" begin
+    n = 500
+    edge_set(g) = Set((Int(src(e)), Int(dst(e))) for e in edges(g))
+
+    # modular_cells native mean out-degree ≈ 5.94 → thin to 3.
+    g = build_topology(:modular_cells, n; seed=42).layers[:S]
+    es_before = edge_set(g)
+    m_before = ne(g) / nv(g)
+    @test m_before > 3.0          # thinning actually has work to do
+    thin_to!(g, 3, MersenneTwister(42 + 13))
+    @test nv(g) == n              # node count preserved
+    @test abs(ne(g) / nv(g) - 3.0) <= 0.05   # mean out-degree on target
+    @test edge_set(g) ⊆ es_before # thinning only removes edges
+
+    # No-op at or below target (federated_hubs native ≈ 2.97 < 3).
+    g2 = build_topology(:federated_hubs, n; seed=42).layers[:S]
+    ne2 = ne(g2)
+    thin_to!(g2, 3, MersenneTwister(42 + 13))
+    @test ne(g2) == ne2
+
+    # Reproducible per seed (same rng discipline as densify_to!).
+    g3 = build_topology(:modular_cells, n; seed=42).layers[:S]
+    g4 = build_topology(:modular_cells, n; seed=42).layers[:S]
+    thin_to!(g3, 3, MersenneTwister(42 + 13))
+    thin_to!(g4, 3, MersenneTwister(42 + 13))
+    @test edge_set(g3) == edge_set(g4)
+end

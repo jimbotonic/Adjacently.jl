@@ -170,6 +170,27 @@ _derive_GC(g_s, rng, keep) = _edge_thin(g_s, keep, rng)
 _derive_GE(g_s, rng, keep) = _edge_thin(g_s, keep, rng)
 _derive_GT(g_c, rng, keep) = _edge_thin(g_c, keep, rng)
 
+"""
+    thin_to!(g, target, rng)
+
+Mirror of the script-local `densify_to!` used in the matched-density reruns
+(TIER1_EXPERIMENT_PLAN.md §E1): delete uniformly random edges until the mean
+out-degree of `g` drops to `target`. No-op when `g` is already at or below
+target (thinning cannot add edges). Used for the E1b matched-3 low anchor.
+Same rng discipline as `densify_to!`: all randomness flows through the
+caller-supplied `rng`, so calls are reproducible per seed.
+"""
+function thin_to!(g::AbstractGraph, target::Real, rng::AbstractRNG)
+    n = nv(g); want = round(Int, target * n)
+    ne(g) <= want && return g
+    es = collect(edges(g))
+    @inbounds for i in randperm(rng, length(es))
+        ne(g) <= want && break
+        rem_edge!(g, es[i])
+    end
+    return g
+end
+
 # Governance: keep the `top_k` out-neighbours of each vertex by *their* total
 # degree on `g_s` (proxy for trust standing). Item 6 will replace this with
 # the real `q_i` trust scoring.
