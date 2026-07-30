@@ -22,6 +22,15 @@ affects — see the table below.
 All hooks gracefully degrade to the item-2/-4/-6/-7 behaviour when
 `get(world.params, :principles, default_principles())` returns the
 defaults (all 0.5).
+
+NAMING HAZARD (flagged Tier-1 E4, 2026-07-30): two distinct mechanisms share
+the name "adaptive_memory". (A) the `adaptive_memory` field below — the
+static AM *knob*: a global principle strength that compresses narrative
+saturation (hook in `dynamics.jl`) and, additionally, gates mechanism (B).
+(B) the DCS per-cell AM *memory layer* (`DCSState.memory` in `dcs.jl`): a
+decaying per-cell, per-principle strength floor for reactivation.
+Ablations/matrix sweeps act on (A) via `ALL_PRINCIPLE_NAMES`; (B) is
+internal to the DCS.
 """
 Base.@kwdef struct Principles
     non_domination::Float32                = 0.5f0

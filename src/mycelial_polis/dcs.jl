@@ -94,10 +94,14 @@ Base.@kwdef mutable struct DCSState
     cell_of::Vector{Int}
     sensors::Dict{Int, CellSensors}
     principles::Dict{Int, CellPrinciples}
-    # Adaptive memory (per-cell, per-principle): the highest principle
+    # Adaptive memory layer (per-cell, per-principle): the highest principle
     # strength recently achieved, decaying slowly. Reactivation reuses
     # this memory so that recurrent threats meet a pre-warmed defence.
     # Empty until `_cell_activate!` populates it on first fire.
+    # NAMING HAZARD (Tier-1 E4, 2026-07-30): this is mechanism (B), the DCS
+    # memory layer — NOT the static `Principles.adaptive_memory` knob
+    # (mechanism A, see principles.jl), though that knob gates this layer
+    # (see `_cell_activate!`).
     memory::Dict{Int, Dict{Symbol, Float32}} = Dict{Int, Dict{Symbol, Float32}}()
     communication_reliability::Float32 = 1f0
     activation_mode::Symbol = :adaptive
