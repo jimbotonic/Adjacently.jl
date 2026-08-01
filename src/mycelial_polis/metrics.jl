@@ -370,7 +370,10 @@ function hierarchy_components(world::World)
 
     # 2. infra_concentration
     ic = 0f0
-    total_replicas = sum(length(s) for (_, s) in world.infra)
+    # `init = 0` because a world with no infrastructure functions at all
+    # (e.g. an adoption-only fixture) leaves `world.infra` empty, and an
+    # empty generator has no zero for `sum` to fall back on.
+    total_replicas = sum(length(s) for (_, s) in world.infra; init = 0)
     if total_replicas > 0
         per_agent = Dict{Int, Int}()
         for (_, s) in world.infra
