@@ -439,6 +439,14 @@ function refill_infrastructure!(world::World)
     cap  = Int(get(p, :infra_max_slots_per_agent, 0))
     term = Int(get(p, :infra_term_limit, 0))
     if term > 0
+        # Register any seated replica that has no tenure record. Founding
+        # incumbents are placed at world construction and were never
+        # registered, so `get(..., id, 0) > term` was always false for them
+        # and they could never age out — exempting exactly the incumbent
+        # class term limits are meant to rotate.
+        for (k, replicas) in world.infra, id in replicas
+            get!(get!(world.infra_tenure, k, Dict{Int,Int}()), id, 0)
+        end
         for (k, latmap) in world.infra_tenure, (id, tenure) in latmap
             world.infra_tenure[k][id] = tenure + 1
         end
@@ -897,14 +905,23 @@ function _coalition_step!(world::World)
                       if is_committed(a) && a.faction !== :coalition]
         if !isempty(candidates)
             k = min(n_new, length(candidates))
-            picks_idx = randperm(world.rng, length(candidates))[1:k]
-            for i in picks_idx
+            # N-1 — faction_diversity_floor gate. The `:narrative` target and
+            # the `:host_subsidized` mode already gate each conversion; this
+            # shared growth path (used by `:proportional` and `:nm_paced`) did
+            # not, so a pre-positioned floor of fdf=1.0 was inert against the
+            # paced attacker. Walk a random permutation and convert up to `k`
+            # agents that the gate admits, rather than the first `k` outright.
+            converted = 0
+            for i in randperm(world.rng, length(candidates))
+                converted >= k && break
                 a = candidates[i]
+                _faction_change_rejected(world, a, :coalition) && continue
                 a.faction = :coalition
                 a.commitment = max(a.commitment, 0.9f0)
                 if target === :infrastructure
                     a.commitment = max(a.commitment, 0.95f0)
                 end
+                converted += 1
             end
         end
     end
