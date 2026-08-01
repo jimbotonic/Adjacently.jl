@@ -432,8 +432,33 @@ function refill_infrastructure!(world::World)
     end
 
     # 3. refill where we're short.
-    candidates = sort([a for a in world.agents if is_committed(a)];
-                      by = a -> -a.commitment)
+    # R2 staffing-rule variants (params): infra_staffing_rule ∈
+    # (:commitment [default], :lottery), infra_max_slots_per_agent (0 =
+    # uncapped), infra_term_limit in steps (0 = no limit).
+    rule = Symbol(get(p, :infra_staffing_rule, :commitment))
+    cap  = Int(get(p, :infra_max_slots_per_agent, 0))
+    term = Int(get(p, :infra_term_limit, 0))
+    if term > 0
+        for (k, latmap) in world.infra_tenure, (id, tenure) in latmap
+            world.infra_tenure[k][id] = tenure + 1
+        end
+        for (k, replicas) in world.infra, id in collect(replicas)
+            get(get(world.infra_tenure, k, Dict{Int,Int}()), id, 0) > term &&
+                (delete!(replicas, id); delete!(world.infra_tenure[k], id))
+        end
+    end
+    candidates = rule === :lottery ?
+        [world.agents[i] for i in randperm(world.rng, length(world.agents)) if
+         is_committed(world.agents[i])] :
+        sort([a for a in world.agents if is_committed(a)];
+             by = a -> -a.commitment)
+    slots_of = cap > 0 ? begin
+        cnt = zeros(Int, length(world.agents))
+        for (_, replicas) in world.infra, id in replicas
+            cnt[id] += 1
+        end
+        cnt
+    end : Int[]
     for (k, replicas) in world.infra
         target = world.infra_min[k] + redundancy_bonus
         # Count only *effective* replicas (off warm-up) for the threshold check;
@@ -447,7 +472,10 @@ function refill_infrastructure!(world::World)
         for a in candidates
             length(replicas) >= target && break
             a.id ∈ replicas && continue
+            cap > 0 && slots_of[a.id] >= cap && continue
             push!(replicas, a.id)
+            cap > 0 && (slots_of[a.id] += 1)
+            term > 0 && (get!(world.infra_tenure, k, Dict{Int,Int}())[a.id] = 0)
             # Start the warm-up timer (no-op if latency_default == 0).
             if latency_default > 0
                 latmap = get!(world.infra_latency, k, Dict{Int,Int}())

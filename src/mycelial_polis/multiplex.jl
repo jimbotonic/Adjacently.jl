@@ -44,6 +44,7 @@ mutable struct World
     t::Int                                      # current step
     recent_backfire_count::Vector{Int}          # rolling Δt_narrative window (item 6)
     infra_latency::Dict{Symbol,Dict{Int,Int}}   # function → (agent_id → remaining warm-up) (item 7)
+    infra_tenure::Dict{Symbol,Dict{Int,Int}}    # function → (agent_id → tenure steps, R2 term limits)
     dcs::Any                                    # ::Union{Nothing, DCSState}; left untyped
                                                 # so multiplex.jl doesn't need to import dcs.jl
     # H-13 — scratch counters for scaling-coalition modes. Set when the
@@ -70,7 +71,8 @@ mutable struct World
           infra_latency::Dict{Symbol,Dict{Int,Int}}=Dict{Symbol,Dict{Int,Int}}(),
           dcs::Any = nothing) =
         new(agents, multiplex, infra, infra_min, rng, params, t,
-            recent_backfire_count, infra_latency, dcs, 0, 0,
+            recent_backfire_count, infra_latency,
+            Dict{Symbol,Dict{Int,Int}}(), dcs, 0, 0,
             Dict{Int,Float32}(), 0, 0)
 end
 
