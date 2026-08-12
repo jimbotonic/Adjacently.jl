@@ -369,6 +369,123 @@ function compute_ppmi(docs::AbstractVector,
 end
 
 """
+    compute_locality_surprise(docs, vocab; window=10, min_df_both=30,
+                              shuffles=1, min_dist=0, seed=0) -> SparseMatrixCSC{Float32}
+
+Edge weight = **how much more often two words are close together than chance**,
+given that both occur in the document:
+
+    S(u,v) = P(dist(u,v) < window | both present)
+           − E[same, under a within-document token shuffle]
+
+kept only where positive and where at least `min_df_both` documents contain both
+words. `min_dist > 0` additionally ignores co-locations closer than `min_dist`
+tokens, isolating the medium-range structure that contiguous n-grams already
+capture.
+
+Motivation (measured, not assumed). PPMI weights an edge by *document-level*
+co-occurrence — precisely the statistic a bag of words already encodes — which
+is why a PPMI graph is redundant with the representation it is meant to enrich.
+It also cannot connect two frequent words at all: PMI is high only when the
+joint exceeds the product of the marginals, so frequent pairs, which co-occur
+often but no more often than chance, score ~0. This statistic conditions the
+document-level co-occurrence away and keeps only the positional residual, which
+is invisible to a bag of words by construction, and it is defined precisely for
+the frequent pairs PPMI discards.
+
+The shuffle expectation is estimated by re-drawing each document's token order
+`shuffles` times and recomputing the same indicator, so every pair is compared
+against its own document lengths and multiplicities rather than an analytic
+approximation.
+
+Cost is `O(Σ_d n_distinct(d)²)`; pass a `vocab` already filtered by document
+frequency to keep that bounded.
+"""
+function compute_locality_surprise(docs::AbstractVector,
+                                   vocab::Dict{String,Int};
+                                   window::Int=10, min_df_both::Int=30,
+                                   shuffles::Int=1, min_dist::Int=0, seed::Int=0)
+    V = length(vocab)
+    n_both  = Dict{Tuple{Int,Int},Int}()
+    n_close = Dict{Tuple{Int,Int},Int}()
+    n_shuf  = Dict{Tuple{Int,Int},Int}()
+    rng = MersenneTwister(seed)
+
+    positions = Dict{Int,Vector{Int}}()
+    for d in docs
+        ids = Int[]
+        for t in d.tokens
+            id = get(vocab, t, 0)
+            id != 0 && push!(ids, id)
+        end
+        length(ids) < 2 && continue
+
+        # observed, then `shuffles` re-orderings of the same multiset
+        for rep in 0:shuffles
+            seq = rep == 0 ? ids : shuffle(rng, ids)
+            empty!(positions)
+            for (i, id) in enumerate(seq)
+                push!(get!(positions, id, Int[]), i)
+            end
+            keys_sorted = sort!(collect(keys(positions)))
+            for a_i in 1:length(keys_sorted), b_i in (a_i + 1):length(keys_sorted)
+                u, v = keys_sorted[a_i], keys_sorted[b_i]
+                dmin = typemax(Int)
+                for p in positions[u], q in positions[v]
+                    dmin = min(dmin, abs(p - q))
+                end
+                close = (dmin >= min_dist) && (dmin < window)
+                if rep == 0
+                    n_both[(u, v)]  = get(n_both, (u, v), 0) + 1
+                    close && (n_close[(u, v)] = get(n_close, (u, v), 0) + 1)
+                elseif close
+                    n_shuf[(u, v)] = get(n_shuf, (u, v), 0) + 1
+                end
+            end
+        end
+    end
+
+    rows = Int[]; cols = Int[]; vals = Float32[]
+    for ((u, v), nb) in n_both
+        nb < min_df_both && continue
+        obs = get(n_close, (u, v), 0) / nb
+        exp = get(n_shuf,  (u, v), 0) / (nb * max(shuffles, 1))
+        s = obs - exp
+        s <= 0 && continue
+        push!(rows, u); push!(cols, v); push!(vals, Float32(s))
+        push!(rows, v); push!(cols, u); push!(vals, Float32(s))
+    end
+    return sparse(rows, cols, vals, V, V)
+end
+
+"""
+    topk_per_node(K::SparseMatrixCSC, k::Int) -> SparseMatrixCSC
+
+Keep the `k` heaviest edges of every node, then re-symmetrise by union. Unlike
+`build_domain_graph`\'s global density threshold, this bounds each word\'s
+neighbourhood, which is what a locality statistic needs: a discriminative edge
+must stand out against a *word\'s own* generic neighbour mass, and at 1% global
+density a 10⁴-word vocabulary leaves ~100 neighbours per node — far past the
+point where the signal is swamped.
+"""
+function topk_per_node(K::SparseMatrixCSC, k::Int)
+    n = size(K, 1)
+    rows = Int[]; cols = Int[]; vals = Float32[]
+    for j in 1:n
+        rng_j = K.colptr[j]:(K.colptr[j + 1] - 1)
+        isempty(rng_j) && continue
+        rv = K.rowval[rng_j]; nv = K.nzval[rng_j]
+        keep = partialsortperm(nv, 1:min(k, length(nv)); rev=true)
+        for i in keep
+            push!(rows, rv[i]); push!(cols, j); push!(vals, Float32(nv[i]))
+            push!(rows, j); push!(cols, rv[i]); push!(vals, Float32(nv[i]))
+        end
+    end
+    isempty(rows) && return spzeros(Float32, n, n)
+    return sparse(rows, cols, vals, n, n, max)
+end
+
+"""
     build_domain_graph(K::SparseMatrixCSC, density::Real; weighted::Bool=false)
         -> SparseMatrixCSC
 

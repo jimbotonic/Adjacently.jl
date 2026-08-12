@@ -29,7 +29,7 @@ using ChainRulesCore
 using Flux
 using LinearAlgebra
 using NPZ
-using SparseArrays: SparseMatrixCSC, sparse, spdiagm
+using SparseArrays: SparseMatrixCSC, sparse, spdiagm, spzeros
 using Statistics: mean
 using Random
 using Random: MersenneTwister
@@ -51,7 +51,8 @@ export NDF, NDFEncoder, propagate, prepare_adjacency,
        top_central_nodes,
        Document, TrainConfig, train!, fingerprints, load_ndf_state,
        BlogDoc, read_blog_corpus, build_vocab,
-       compute_ppmi, compute_v1_collocation,
+       compute_ppmi, compute_locality_surprise, topk_per_node,
+       compute_v1_collocation,
        build_domain_graph, blogdocs_to_documents,
        porter_stem_lite, char_ngram_tokens, to_char_ngrams,
        TextGcnDoc, read_text_gcn_corpus,
