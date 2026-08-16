@@ -369,6 +369,98 @@ function compute_ppmi(docs::AbstractVector,
 end
 
 """
+    compute_ppmi_sharded(docs, vocab; window=20, directed=false, shards=8)
+        -> SparseMatrixCSC
+
+Exact, memory-lean equivalent of `compute_ppmi`: identical pair counts, PPMI
+values and output matrix, but pair counts are accumulated in `shards`
+sequential passes over the corpus — pass `s` keeps only pairs whose FIRST
+endpoint of the normalized key (`min(u,v)` undirected, the preceding word
+when directed) satisfies `mod(u, shards) == s`. Peak pair-counter memory is
+~1/shards of `compute_ppmi`'s at ~shards× the CPU; token→id mapping is done
+once and shared across passes. Needed when the full pair dictionary does not
+fit in RAM (e.g. window-20 PPMI on authorship_50, OOM-killed twice at ~30 GB
+machine load).
+"""
+function compute_ppmi_sharded(docs::AbstractVector,
+                              vocab::Dict{String,Int};
+                              window::Int=20, directed::Bool=false, shards::Int=8)
+    V = length(vocab)
+    shards >= 1 || throw(ArgumentError("shards must be ≥ 1"))
+
+    doc_ids = Vector{Vector{Int}}(undef, length(docs))
+    for (di, d) in enumerate(docs)
+        ids = Int[]
+        for t in d.tokens
+            id = get(vocab, t, 0)
+            id != 0 && push!(ids, id)
+        end
+        doc_ids[di] = ids
+    end
+
+    token_counts = zeros(Int, V)
+    n_windows = 0
+    for ids in doc_ids
+        n = length(ids)
+        n == 0 && continue
+        for i in 1:n
+            stop = min(n, i + window - 1)
+            for u in unique(ids[i:stop])
+                token_counts[u] += 1
+            end
+            n_windows += 1
+        end
+    end
+
+    rows = Int[]; cols = Int[]; vals = Float32[]
+    pair_counts = Dict{Tuple{Int,Int},Int}()
+    for s in 0:(shards - 1)
+        empty!(pair_counts)
+        GC.gc()
+        t_s = time()
+        for ids in doc_ids
+            n = length(ids)
+            n == 0 && continue
+            for i in 1:n
+                stop = min(n, i + window - 1)
+                wv = ids[i:stop]
+                if directed
+                    # ORDERED pairs, once per window per distinct pair (as compute_ppmi).
+                    seen = Set{Tuple{Int,Int}}()
+                    for a in 1:length(wv), b in (a + 1):length(wv)
+                        u, v = wv[a], wv[b]
+                        u == v && continue
+                        mod(u, shards) == s || continue
+                        (u, v) in seen && continue
+                        push!(seen, (u, v))
+                        pair_counts[(u, v)] = get(pair_counts, (u, v), 0) + 1
+                    end
+                else
+                    in_window = unique(wv)
+                    for a in 1:length(in_window), b in (a + 1):length(in_window)
+                        u, v = in_window[a], in_window[b]
+                        u, v = min(u, v), max(u, v)
+                        mod(u, shards) == s || continue
+                        pair_counts[(u, v)] = get(pair_counts, (u, v), 0) + 1
+                    end
+                end
+            end
+        end
+        for ((u, v), c) in pair_counts
+            p_uv = c / n_windows
+            p_u  = token_counts[u] / n_windows
+            p_v  = token_counts[v] / n_windows
+            pmi = log(p_uv / (p_u * p_v + 1.0f-12))
+            pmi <= 0 && continue
+            push!(rows, u); push!(cols, v); push!(vals, Float32(pmi))
+            directed || (push!(rows, v); push!(cols, u); push!(vals, Float32(pmi)))
+        end
+        @info "ppmi shard done" s shards pairs=length(pair_counts) edges=length(vals) elapsed_min=round((time()-t_s)/60; digits=1)
+    end
+    return sparse(rows, cols, vals, V, V)
+end
+
+"""
     compute_locality_surprise(docs, vocab; window=10, min_df_both=30,
                               shuffles=1, min_dist=0, seed=0) -> SparseMatrixCSC{Float32}
 

@@ -67,7 +67,7 @@ include("run_tests_main.jl")
     @test outneighbors(g2, 88) == nv88
 
     # clean up the test directory
-    #rm("EAT.mgs", force=true)
+    rm("EAT.mgs", force=true)
 end
 
 @testset "Pajek Graph Format" begin
