@@ -1,0 +1,22 @@
+# Normalise les fins de ligne : LF dans le dépôt comme dans la copie de travail.
+# Ce dossier est un partage réseau également utilisé depuis Windows, qui
+# réécrit sinon les fichiers texte en CRLF et fait apparaître chaque fichier
+# comme modifié.
+* text=auto eol=lf
+
+# Le script doit garder des fins de ligne LF : bash refuse de l'exécuter si le
+# shebang se termine par un retour chariot.
+*.sh text eol=lf
+
+# Fichiers binaires : aucune conversion, aucune tentative de diff textuel.
+*.pdf binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.zip binary
+*.tar.gz binary
+
+# Les notebooks sont du JSON : on les normalise en LF plutôt que de les traiter
+# en binaire, pour que les diffs restent lisibles.
+*.ipynb text eol=lf
