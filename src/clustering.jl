@@ -653,15 +653,38 @@ function louvain_partition(g::AbstractGraph{T}; max_passes::Int=10, max_levels::
     return combined
 end
 
-function _louvain_undirected_optimized(g::AbstractGraph{T}; max_passes::Int=10) where {T<:Unsigned}
-    n = nv(g)
-    part = collect(1:n)
+"""
+    _seed_partition(init_part, n) -> Vector{Int}
+
+Normalise a caller-supplied initial community assignment into contiguous labels
+`1:k` over `n` vertices. Returns singletons (`1:n`, Louvain's default start) when
+`init_part` is `nothing`.
+"""
+function _seed_partition(init_part::Union{Nothing,Vector{Int}}, n::Integer)
+    n = Int(n)
+    init_part === nothing && return collect(1:n)
+    length(init_part) == n || throw(ArgumentError(
+        "init_part has $(length(init_part)) labels for $n vertices"))
+    labs = sort(unique(init_part))
+    remap = Dict{Int,Int}(l => i for (i, l) in enumerate(labs))
+    return Int[remap[l] for l in init_part]
+end
+
+function _louvain_undirected_optimized(g::AbstractGraph{T}; max_passes::Int=10,
+                                       init_part::Union{Nothing,Vector{Int}}=nothing,
+                                       resolution::Float64=1.0) where {T<:Unsigned}
+    n = Int(nv(g))
+    part = _seed_partition(init_part, n)
     # degree and total weight
     deg = [length(outneighbors(g,u)) for u in 1:n]
     two_m = sum(deg)
     two_m == 0 && return ones(Int, n) # empty graph
-    # community total degree Σ_tot (by community id)
-    ctot = copy(deg)  # initially each node is its own community
+    # community total degree Σ_tot (by community id), summed over the seed
+    # partition (with singleton seeds this reduces to `copy(deg)`).
+    ctot = zeros(Int, n)
+    @inbounds for u in 1:n
+        ctot[part[u]] += deg[u]
+    end
     # main loop
     for _ in 1:max_passes
         improved = false
@@ -680,7 +703,7 @@ function _louvain_undirected_optimized(g::AbstractGraph{T}; max_passes::Int=10) 
             best_gain = 0.0
             for (c, k_i_in_c) in neigh
                 # gain proportional (constant 1/(2m) omitted for comparison)
-                gain = k_i_in_c - (k_i * ctot[c]) / two_m
+                gain = k_i_in_c - resolution * (k_i * ctot[c]) / two_m
                 if gain > best_gain + 1e-12
                     best_gain = gain
                     best_c = c
@@ -707,17 +730,24 @@ function _louvain_undirected_optimized(g::AbstractGraph{T}; max_passes::Int=10) 
     return part
 end
 
-function _louvain_directed_optimized(g::AbstractGraph{T}; max_passes::Int=10) where {T<:Unsigned}
-    n = nv(g)
-    part = collect(1:n)
+function _louvain_directed_optimized(g::AbstractGraph{T}; max_passes::Int=10,
+                                     init_part::Union{Nothing,Vector{Int}}=nothing,
+                                     resolution::Float64=1.0) where {T<:Unsigned}
+    n = Int(nv(g))
+    part = _seed_partition(init_part, n)
     # degrees
     k_out = [length(outneighbors(g,u)) for u in 1:n]
     k_in  = [length(inneighbors(g,u)) for u in 1:n]
     m = sum(k_out)
     m == 0 && return ones(Int, n)
-    # community totals
-    K_out = copy(k_out)
-    K_in  = copy(k_in)
+    # community totals, summed over the seed partition (with singleton seeds
+    # this reduces to `copy(k_out)` / `copy(k_in)`).
+    K_out = zeros(Int, n)
+    K_in  = zeros(Int, n)
+    @inbounds for u in 1:n
+        K_out[part[u]] += k_out[u]
+        K_in[part[u]]  += k_in[u]
+    end
     for _ in 1:max_passes
         improved = false
         for u in 1:n
@@ -745,7 +775,7 @@ function _louvain_directed_optimized(g::AbstractGraph{T}; max_passes::Int=10) wh
             cand = union(keys(neigh_out), keys(neigh_in))
             for c in cand
                 s_c = get(neigh_out, c, 0) + get(neigh_in, c, 0)
-                gain = (s_c - s_current) / m - (ku_out * (K_in[c] - K_in[cu]) + ku_in * (K_out[c] - K_out[cu])) / (m*m)
+                gain = (s_c - s_current) / m - resolution * (ku_out * (K_in[c] - K_in[cu]) + ku_in * (K_out[c] - K_out[cu])) / (m*m)
                 if gain > best_gain + 1e-12
                     best_gain = gain
                     best_c = c
@@ -835,7 +865,7 @@ function aggregate_graph(G::WeightedCoarseGraph, part::Vector{Int})
     return WeightedCoarseGraph(G.directed, C2, out_w, in_w, kout, kin, m)
 end
 
-function louvain_local_move_coarse(G::WeightedCoarseGraph; max_passes::Int=10)
+function louvain_local_move_coarse(G::WeightedCoarseGraph; max_passes::Int=10, resolution::Float64=1.0)
     n = G.n
     part = collect(1:n)
     # community totals start as node degrees
@@ -867,7 +897,7 @@ function louvain_local_move_coarse(G::WeightedCoarseGraph; max_passes::Int=10)
             cand = union(keys(neigh_out), keys(neigh_in))
             for c in cand
                 s_c = get(neigh_out, c, 0.0) + get(neigh_in, c, 0.0)
-                gain = (s_c - s_current) / m - (ku_out * (K_in[c] - K_in[cu]) + ku_in * (K_out[c] - K_out[cu])) / (m*m)
+                gain = (s_c - s_current) / m - resolution * (ku_out * (K_in[c] - K_in[cu]) + ku_in * (K_out[c] - K_out[cu])) / (m*m)
                 if gain > best_gain + 1e-12
                     best_gain = gain
                     best_c = c
@@ -895,22 +925,37 @@ function louvain_local_move_coarse(G::WeightedCoarseGraph; max_passes::Int=10)
 end
 
 """
-    leiden_partition(g; max_passes=10)
+    leiden_partition(g; max_passes=10, max_levels=10, init_part=nothing)
 
-Lightweight Leiden-like refinement: run Louvain, split disconnected communities,
-then a second Louvain pass on refined labels.
+Lightweight Leiden-like refinement: run Louvain, split each community into its
+connected components, then aggregate and repeat.
+
+!!! note "This is not the Traag et al. Leiden algorithm"
+    The refinement step here splits communities into connected components only.
+    Leiden's refinement is a randomised, modularity-driven sub-partitioning that
+    guarantees gamma-well-connected communities, which is strictly stronger.
+    Describe this routine as "Louvain with connected-component refinement".
+
+`init_part` supplies an initial community assignment for the first local-moving
+pass (default: singletons, i.e. Louvain's standard start). Note that a *permutation*
+is not a usable seed: it assigns every vertex a distinct label and therefore
+reduces to the singleton default. A seed must be a genuine membership vector with
+fewer communities than vertices.
 """
-function leiden_partition(g::AbstractGraph{T}; max_passes::Int=10, max_levels::Int=10) where {T<:Unsigned}
+function leiden_partition(g::AbstractGraph{T}; max_passes::Int=10, max_levels::Int=10,
+                          init_part::Union{Nothing,Vector{Int}}=nothing,
+                          resolution::Float64=1.0) where {T<:Unsigned}
     parts = Vector{Vector{Int}}()
-    # local moving on original
-    p0 = louvain_local_move(g; max_passes=max_passes)
+    # local moving on original, optionally starting from a caller-supplied seed
+    # partition instead of singletons (see `relabel_graph_leiden_llp(; llp_seed=true)`).
+    p0 = louvain_local_move(g; max_passes=max_passes, init_part=init_part, resolution=resolution)
     p0r = refine_partition(g, p0)
     push!(parts, p0r)
     Gc = aggregate_graph(g, p0r)
     prev_n = nv(g)
     level = 1
     while level <= max_levels && Gc.n < prev_n
-        pc = louvain_local_move(Gc; max_passes=max_passes)
+        pc = louvain_local_move(Gc; max_passes=max_passes, resolution=resolution)
         pcr = refine_partition(Gc, pc)
         push!(parts, pcr)
         prev_n = Gc.n
@@ -929,16 +974,18 @@ function leiden_partition(g::AbstractGraph{T}; max_passes::Int=10, max_levels::I
     return combined
 end
 
-function louvain_local_move(g::AbstractGraph{T}; max_passes::Int=10) where {T<:Unsigned}
+function louvain_local_move(g::AbstractGraph{T}; max_passes::Int=10,
+                            init_part::Union{Nothing,Vector{Int}}=nothing,
+                            resolution::Float64=1.0) where {T<:Unsigned}
     if is_directed(g)
-        return _louvain_directed_optimized(g; max_passes=max_passes)
+        return _louvain_directed_optimized(g; max_passes=max_passes, init_part=init_part, resolution=resolution)
     else
-        return _louvain_undirected_optimized(g; max_passes=max_passes)
+        return _louvain_undirected_optimized(g; max_passes=max_passes, init_part=init_part, resolution=resolution)
     end
 end
 
-function louvain_local_move(G::WeightedCoarseGraph; max_passes::Int=10)
-    return louvain_local_move_coarse(G; max_passes=max_passes)
+function louvain_local_move(G::WeightedCoarseGraph; max_passes::Int=10, resolution::Float64=1.0)
+    return louvain_local_move_coarse(G; max_passes=max_passes, resolution=resolution)
 end
 
 function refine_partition(g::AbstractGraph{T}, part::Vector{Int}) where {T<:Unsigned}

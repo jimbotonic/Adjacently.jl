@@ -250,7 +250,8 @@ then composes the orderings to build a final vertex mapping.
 @returns Dict{T,T}: mapping old_id -> new_id
 """
 function relabel_vertices_llp(g::AbstractGraph{T}, neighbor_mode::Symbol=:sym;
-                               passes::Int=5, K::Int=10) where {T<:Unsigned}
+                               passes::Int=5, K::Int=10,
+                               return_labels::Bool=false) where {T<:Unsigned}
     n = Int(nv(g))
     vs = collect(vertices(g))
 
@@ -264,9 +265,11 @@ function relabel_vertices_llp(g::AbstractGraph{T}, neighbor_mode::Symbol=:sym;
     # Start with identity ordering
     current_order = collect(1:n)  # current_order[position] = vertex_int_id
 
+    last_labels = Int[]
     for (gi, gamma) in enumerate(gammas)
         # Run APM label propagation at this gamma
         labels = _apm_label_propagation(g, neighbor_mode, gamma, passes)
+        last_labels = labels
 
         # Group vertices by label, preserving current order
         groups = Dict{Int, Vector{Int}}()
@@ -294,7 +297,10 @@ function relabel_vertices_llp(g::AbstractGraph{T}, neighbor_mode::Symbol=:sym;
     for (new_id, old_vid) in enumerate(current_order)
         mapping[T(old_vid)] = T(new_id)
     end
-    return mapping
+    # `last_labels` is the membership from the FINEST resolution level (the last
+    # gamma). It is a genuine partition, unlike the permutation `mapping`, and is
+    # what a Leiden seed needs -- see `relabel_graph_leiden_llp(; llp_seed=true)`.
+    return return_labels ? (mapping, last_labels) : mapping
 end
 
 """
@@ -1001,6 +1007,7 @@ end
 
 """
     relabel_graph_leiden_llp(g; llp_mode=:sym, llp_passes=5, sort_clusters=:size_desc,
+                             llp_seed=false,
                              merge_clusters=nothing)
 
 `merge_clusters` controls the small-cluster merge (see [`merge_small_clusters`]):
@@ -1012,9 +1019,30 @@ per grid point — expensive on very large graphs, so prefer a fixed `Int` there
 function relabel_graph_leiden_llp(g::AbstractGraph{T}; llp_mode::Symbol=:sym, llp_passes::Int=5,
                                   sort_clusters::Symbol=:size_desc,
                                   merge_clusters::Union{Nothing,Integer,Symbol}=nothing,
-                                  return_clusters::Bool=false) where {T<:Unsigned}
-    # Step 1: Leiden partition → fine clusters (label vector)
-    part = leiden_partition(g)
+                                  return_clusters::Bool=false,
+                                  llp_seed::Bool=false,
+                                  llp_seed_passes::Int=llp_passes) where {T<:Unsigned}
+    # Step 0 (optional): a global LLP pass whose LABEL PARTITION seeds the
+    # community detector. `llp_seed=false` reproduces the two-stage pipeline that
+    # produced every published number; `llp_seed=true` is the three-stage pipeline
+    # described in the paper's Algorithm 1 and has NOT been benchmarked.
+    seed = nothing
+    if llp_seed
+        _, seed_labels = relabel_vertices_llp(g, llp_mode; passes=llp_seed_passes,
+                                              return_labels=true)
+        nseed = length(unique(seed_labels))
+        if nseed >= nv(g)
+            @warn "Leiden+LLP: LLP seed is (near-)singleton ($nseed labels for $(nv(g)) \
+                   vertices); it cannot inform modularity and the seeded run will match \
+                   the unseeded one."
+        else
+            @info "Leiden+LLP: seeding the partition with $nseed LLP communities"
+        end
+        seed = seed_labels
+    end
+
+    # Step 1: partition → fine clusters (label vector)
+    part = leiden_partition(g; init_part=seed)
 
     # Step 2 (optional): merge small clusters
     if merge_clusters === :auto
