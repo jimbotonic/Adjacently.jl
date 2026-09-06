@@ -1,0 +1,17 @@
+{
+  "_comment": "Dataset registry for paper reproduction. `source` says where the graph comes from; LAW graphs are fetched by fetch_datasets.sh and md5-verified against LAW's own .md5sums. `core` applies get_core (largest SCC) as the paper's SNAP-style rows do; the LAW crawls are used whole.",
+  "datasets": {
+    "eat":          {"loader": "pajek", "path": "datasets/EAT/EATnew.net",                 "core": true,  "source": "committed"},
+    "arxiv-hep-ph": {"loader": "mgz",   "path": "datasets/Arxiv_HEP-PH/Cit-HepPh.mgz",     "core": true,  "source": "committed"},
+    "amazon-0601":  {"loader": "mgz",   "path": "datasets/Amazon_0601/Amazon0601.mgz",     "core": true,  "source": "committed"},
+    "web-google":   {"loader": "mgz",   "path": "datasets/Web_Google/web-Google.mgz",      "core": true,  "source": "committed"},
+    "cnr-2000":     {"loader": "csv",   "path": "datasets/webgraph/cnr-2000/cnr-2000.csv", "core": false, "source": "law",
+                     "law_bitsperlink": 2.897, "nodes": 325557, "arcs": 3216152,
+                     "delivered_order": "URL-lexicographic (NOT LLP-permuted)"},
+    "in-2004":      {"loader": "csv",   "path": "datasets/webgraph/in-2004/in-2004.csv",   "core": false, "source": "law",
+                     "law_bitsperlink": 2.172, "nodes": 1382908, "arcs": 16917053,
+                     "delivered_order": "URL-lexicographic (NOT LLP-permuted)"},
+    "enwiki-2013":  {"loader": "csv",   "path": "datasets/webgraph/enwiki-2013/enwiki-2013.csv", "core": false, "source": "law",
+                     "law_bitsperlink": 13.114, "nodes": 4206785, "arcs": 101355853}
+  }
+}

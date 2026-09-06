@@ -1,0 +1,15 @@
+{
+  "_comment": "Ordering pipelines. `leiden_llp` is the published pipeline (unseeded partitioner, per-cluster LLP, clusters concatenated size-descending, no small-cluster merge). Algorithm 1 in the paper described an extra LLP-seeding stage that was never implemented and, when implemented, measures WORSE on 4/4 datasets (see research/graph_compression/seed_ablation/VERDICT.md) -- it is therefore not offered here.",
+  "orderings": {
+    "original":   {"kind": "identity"},
+    "llp":        {"kind": "llp", "llp_mode": "sym", "passes": 5},
+    "leiden_llp": {"kind": "partition_llp", "llp_mode": "sym", "llp_passes": 5,
+                   "sort_clusters": "size_desc", "merge_clusters": null},
+    "leiden_llp_merged": {"kind": "partition_llp", "llp_mode": "sym", "llp_passes": 5,
+                   "sort_clusters": "size_desc",
+                   "merge_clusters_per_dataset": {"web-google": 100, "amazon-0601": 100,
+                                                  "arxiv-hep-ph": 20, "eat": null,
+                                                  "cnr-2000": null, "in-2004": null},
+                   "_note": "cnr-2000 was published with no merge; a sweep on 2026-09-06 found tau=75 optimal there (BG 2.3216 -> 2.1771). The published null value is the worst tested. Re-select tau per dataset before regenerating tables."}
+  }
+}

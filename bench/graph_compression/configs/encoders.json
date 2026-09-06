@@ -1,0 +1,52 @@
+{
+  "_comment": "Canonical encoder configurations. Every value here was verified to reproduce a published number; provenance is recorded per entry. cost_model 0 = FULL search, 1 = FAST.",
+  "bg": {
+    "_defaults": {"integer_encoding": "fibonacci", "copy_blocks": true, "stop_deltas": true,
+                  "multi_ref": true, "cost_model": 0},
+    "per_dataset": {
+      "eat":          {"ref_window_size": 64,  "lr_split": true},
+      "arxiv-hep-ph": {"ref_window_size": 64,  "lr_split": true},
+      "amazon-0601":  {"ref_window_size": 64,  "lr_split": true},
+      "web-google":   {"ref_window_size": 64,  "lr_split": false},
+      "cnr-2000":     {"ref_window_size": 64,  "lr_split": false},
+      "in-2004":      {"ref_window_size": 64,  "lr_split": false},
+      "enwiki-2013":  {"ref_window_size": 64,  "lr_split": true}
+    }
+  },
+  "cs": {
+    "_defaults": {"integer_encoding": "fibonacci", "cost_model": 0},
+    "per_dataset": {
+      "eat":          {"ref_window_size": 256, "lr_split": true},
+      "arxiv-hep-ph": {"ref_window_size": 256, "lr_split": true},
+      "amazon-0601":  {"ref_window_size": 64,  "lr_split": true},
+      "web-google":   {"ref_window_size": 256, "lr_split": false},
+      "cnr-2000":     {"ref_window_size": 256, "lr_split": false},
+      "in-2004":      {"ref_window_size": 256, "lr_split": false},
+      "enwiki-2013":  {"ref_window_size": 128, "lr_split": true}
+    }
+  },
+  "cg_k2_paper": {
+    "_provenance": "RECOVERED 2026-09-06 from test/run_tests_index_mode.jl, which regenerates datasets/webgraph/cnr-2000/cnr2000_cg_k2_children.mgz at 936130 bytes = 2.3286 bpe, matching the paper's cnr CG cell of 2.329. Reproduced independently to 4 decimals. NOTE: these settings differ sharply from CGParams defaults; undirected_pairs, perm_strategy, membership, inter_strategy and intra_intervals are all non-default and each matters.",
+    "coding_scheme": "children",
+    "integer_encoding": "fibonacci",
+    "clusters": "k2_leiden_top",
+    "leiden": {"max_passes": 8, "max_levels": 5},
+    "params": {
+      "L": 128, "varint": "fibonacci", "count_varint": "fibonacci",
+      "gap": "fibonacci", "degree": "elias_delta",
+      "undirected_pairs": false, "perm_strategy": "blockpos",
+      "membership": "implicit_ranges", "inter_strategy": "perm",
+      "intra_ref_enabled": true, "intra_ref_window": 64,
+      "intra_ref_rle": false, "intra_block_try": false,
+      "positions_mode": "delta", "additions_mode": "delta",
+      "min_cluster_density": 0.0,
+      "intra_intervals": false, "intra_mil": 4, "intra_greedy_mil": false,
+      "intra_zigzag": true, "intra_stop_deltas": true,
+      "intra_copy_blocks": true, "intra_copy_adaptive": true,
+      "intra_ref_fixwidth": true, "intra_ref_vlc": false,
+      "intra_add_adaptive": true, "intra_raw_adaptive": true,
+      "intra_adapt_mil": 4
+    },
+    "window_sensitivity_cnr_orig": {"16": 2.4538, "32": 2.3704, "64": 2.3286, "128": 2.3348}
+  }
+}
