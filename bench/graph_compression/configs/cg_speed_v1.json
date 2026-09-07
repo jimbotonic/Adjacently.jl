@@ -1,0 +1,31 @@
+{
+  "id": "cg-k1-parallel-search-and-decoder-v1",
+  "date": "2026-09-07",
+  "hardware": "AMD Ryzen 7 PRO 4750U; 8 physical cores",
+  "affinity": "0,2,4,6,8,10,12,14",
+  "julia": "1.12.4",
+  "environment": {"ADJACENTLY_COST_MODEL":"unset (default FULL/0)"},
+  "ordering": {"eat": "native core", "cnr": "verified URL IDs"},
+  "datasets": {"eat": {"nodes":7754,"arcs":247172}, "cnr":{"nodes":325557,"arcs":3216152}},
+  "primary_clusters": 1,
+  "encoder": {
+    "cost_model":0,"intra_ref_window":64,"intra_intervals":true,"intra_mil":4,
+    "intra_greedy_mil":false,"intra_lr_split":true,"intra_tight_deltas":false,
+    "intra_zigzag":true,"intra_ref_fixwidth":true,"intra_ref_vlc":false,
+    "intra_copy_blocks":true,"intra_copy_adaptive":true,"intra_stop_deltas":true,
+    "intra_add_adaptive":true,"intra_raw_adaptive":true,"intra_adapt_mil":4,
+    "membership":"implicit_ranges","varint":"fibonacci","count_varint":"fibonacci",
+    "gap":"fibonacci","degree":"elias_delta","L":128,"undirected_pairs":false,
+    "perm_strategy":"blockpos","inter_strategy":"perm","positions_mode":"delta",
+    "additions_mode":"delta","min_cluster_density":0.0,"intra_ref_enabled":true,
+    "intra_ref_rle":false,"intra_block_try":false,"intra_mgs":false,"index_sample_k":0
+  },
+  "encoding_sweep":{"backend":"context_range","mode":"children","julia_threads":8,"workers":[0,1,2,4,8,0],"repeats":1},
+  "decoder_ablation":{"source":"phase2_sources.tar.gz","workers":1,"repeats":7,"variants":["Int/unfused","compact/unfused","Int/fused","compact/fused","Int/unfused closing"]},
+  "final_decoder":{"source_sequence":["before_sources.tar.gz","final_sources.tar.gz","before_sources.tar.gz"],"julia_threads":1,"repeats":7},
+  "cold_queries":{"seed":53,"eat":32,"cnr":16,"decoded_memo":"cleared before each query","input_bytes":"memory-resident","opening":"excluded","gc":"enabled; collect once before timed query loop"},
+  "multi_cluster":{"purpose":"secondary throughput experiment; not a K=1 speedup","partition":"contiguous ranges of width ceil(n/64)","backend":"context_range","mode":"index","julia_threads":8,"workers":[0,1,2,4,8,0],"repeats":7},
+  "protocol":"Graphs loaded and code warmed outside timings; GC enabled and collected before each full-decode/encode sample; encode includes serial emission and file writing; raw decode retains outgoing lists but excludes graph construction.",
+  "runners":["research/graph_compression/cg_speed/bench.jl","research/graph_compression/cg_speed/final_bench.jl"],
+  "limitations":["local diagnostic, no confidence intervals","no 32-core result","no retimed BVGraph/Zuckerli comparison","K=1 cold queries still decode the whole cluster","tight-gap CG uses the unfused reader"]
+}

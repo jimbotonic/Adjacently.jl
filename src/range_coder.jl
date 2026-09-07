@@ -175,21 +175,54 @@ mutable struct CtxRangeDecoder
     range::UInt32
     inp::Vector{UInt8}
     ip::Int
+    limit::Int              # inclusive end of this chunk, not the backing buffer
     freq::Matrix{UInt32}
     tot::Vector{UInt32}
     pos::Int
     prev::Int
 end
-function CtxRangeDecoder(bytes::Vector{UInt8})
-    d = CtxRangeDecoder(UInt32(0), typemax(UInt32), bytes, 1,
-        ones(UInt32, _RC_NCTX, _RC_NSYM), fill(UInt32(_RC_NSYM), _RC_NCTX),
-        0, _RC_RESET)
-    d.ip += 1                              # skip first (cache) byte
+@inline function _range_read_byte!(d)
+    # Preserve the format's zero padding at the end of EACH chunk. Reading into
+    # the following chunk in the shared backing buffer would change decoding.
+    b = d.ip <= d.limit ? (@inbounds d.inp[d.ip]) : 0x00
+    d.ip += 1
+    return UInt32(b)
+end
+
+function _range_span!(d, bytes::Vector{UInt8}, first::Int, last::Int)
+    1 <= first <= length(bytes) + 1 && first - 1 <= last <= length(bytes) ||
+        throw(ArgumentError("invalid range-decoder byte span"))
+    d.inp = bytes
+    d.ip = first + 1       # skip the first (cache) byte
+    d.limit = last
+    d.code = UInt32(0)
+    d.range = typemax(UInt32)
     for _ in 1:4
-        d.code = (d.code << 8) | UInt32(get(d.inp, d.ip, 0x00)); d.ip += 1
+        d.code = (d.code << 8) | _range_read_byte!(d)
     end
     return d
 end
+
+function CtxRangeDecoder(bytes::Vector{UInt8}, first::Int=1, last::Int=length(bytes))
+    d = CtxRangeDecoder(UInt32(0), typemax(UInt32), bytes, 1, last,
+        ones(UInt32, _RC_NCTX, _RC_NSYM), fill(UInt32(_RC_NSYM), _RC_NCTX),
+        0, _RC_RESET)
+    return _range_span!(d, bytes, first, last)
+end
+
+function reset_range_decoder!(d::CtxRangeDecoder, bytes::Vector{UInt8}, first::Int=1, last::Int=length(bytes))
+    fill!(d.freq, UInt32(1))
+    fill!(d.tot, UInt32(_RC_NSYM))
+    d.pos = 0
+    d.prev = _RC_RESET
+    return _range_span!(d, bytes, first, last)
+end
+
+# A workspace owns its model arrays, but only borrows a span of compressed bytes.
+_chunk_decoder(::Type{D}, bytes, offsets, c::Int) where D =
+    c == 0 ? D(bytes) : D(bytes, offsets[c] + 1, offsets[c + 1])
+_reset_chunk_decoder!(d, bytes, offsets, c::Int) =
+    reset_range_decoder!(d, bytes, offsets[c] + 1, offsets[c + 1])
 
 @inline function rc_reset_region!(d::CtxRangeDecoder)
     d.pos = 0; d.prev = _RC_RESET
@@ -200,7 +233,7 @@ end
     d.code -= cum * d.range
     d.range *= f
     while d.range < _RC_TOP
-        d.code = (d.code << 8) | UInt32(get(d.inp, d.ip, 0x00)); d.ip += 1
+        d.code = (d.code << 8) | _range_read_byte!(d)
         d.range <<= 8
     end
     return nothing
@@ -215,7 +248,7 @@ end
         d.code -= d.range & (t - UInt32(1))    # subtract range iff bit==1
         v = (v << 1) | b
         while d.range < _RC_TOP
-            d.code = (d.code << 8) | UInt32(get(d.inp, d.ip, 0x00)); d.ip += 1
+            d.code = (d.code << 8) | _range_read_byte!(d)
             d.range <<= 8
         end
     end
@@ -347,25 +380,29 @@ mutable struct BinRangeDecoder
     range::UInt32
     inp::Vector{UInt8}
     ip::Int
+    limit::Int
     c0::Vector{UInt32}
     c1::Vector{UInt32}
     prev::Int
 end
-function BinRangeDecoder(bytes::Vector{UInt8})
-    d = BinRangeDecoder(UInt32(0), typemax(UInt32), bytes, 1,
+function BinRangeDecoder(bytes::Vector{UInt8}, first::Int=1, last::Int=length(bytes))
+    d = BinRangeDecoder(UInt32(0), typemax(UInt32), bytes, 1, last,
         ones(UInt32, 2), ones(UInt32, 2), 1)
-    d.ip += 1
-    for _ in 1:4
-        d.code = (d.code << 8) | UInt32(get(d.inp, d.ip, 0x00)); d.ip += 1
-    end
-    return d
+    return _range_span!(d, bytes, first, last)
+end
+
+function reset_range_decoder!(d::BinRangeDecoder, bytes::Vector{UInt8}, first::Int=1, last::Int=length(bytes))
+    fill!(d.c0, UInt32(1))
+    fill!(d.c1, UInt32(1))
+    d.prev = 1
+    return _range_span!(d, bytes, first, last)
 end
 
 @inline function _brc_dec_update!(d::BinRangeDecoder, cum::UInt32, f::UInt32)
     d.code -= cum * d.range
     d.range *= f
     while d.range < _RC_TOP
-        d.code = (d.code << 8) | UInt32(get(d.inp, d.ip, 0x00)); d.ip += 1
+        d.code = (d.code << 8) | _range_read_byte!(d)
         d.range <<= 8
     end
     return nothing

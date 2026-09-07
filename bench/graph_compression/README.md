@@ -11,6 +11,14 @@ graphs. Run each from the repo root with the project activated:
 ~/.juliaup/bin/julia --project=. bench/graph_compression/<driver>.jl
 ```
 
+## Opt-in acceleration
+
+See [ACCELERATION.md](ACCELERATION.md) and
+[`codec_acceleration_v1.json`](configs/codec_acceleration_v1.json) for explicit
+default-off flags, recommended worker counts, source pins, and permanent
+exact-output tests. Parallel LLP uses a different seed policy from historical
+shared-RNG runs; re-run and re-record every ordering table it affects.
+
 ## Table → driver map
 
 | Paper table | Driver | Datasets | Status |

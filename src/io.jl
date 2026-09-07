@@ -279,7 +279,7 @@ end
 
 mutable struct BitReader
     io::Base.IO
-    buffer::Vector{Bool}
+    buffer::Vector{UInt8} # packed, MSB first; index and length remain bit positions
     index::Int
     length::Int
     bit_count::Int64 # total bits read
@@ -288,23 +288,20 @@ end
 """
     BitReader(io::Base.IO; capacity=BUFFER_SIZE*8)
 
-constructor for BitReader
+Read the remaining IO bytes into a packed buffer. `capacity` is retained for API
+compatibility. Use `BitReader(bytes)` to share an existing byte vector without a
+copy; callers must not mutate that vector while a reader is using it.
 
 @param io::Base.IO: the io to read from
 @param capacity::Int: the capacity of the buffer
 """
 function BitReader(io::Base.IO; capacity=BUFFER_SIZE*8)
     bytes = read(io)
-    bits = Vector{Bool}(undef, length(bytes) * 8)
-    k = 1
-    for byte in bytes
-        for i in 7:-1:0
-            bits[k] = (byte >> i) & 0x01 == 1
-            k += 1
-        end
-    end
-    BitReader(io, bits, 1, k - 1, 0)
+    BitReader(io, bytes, 1, length(bytes) * 8, 0)
 end
+
+BitReader(bytes::Vector{UInt8}; capacity=BUFFER_SIZE*8) =
+    BitReader(IOBuffer(bytes; read=true, write=false), bytes, 1, length(bytes) * 8, 0)
 
 """
     read_bit(reader::BitReader)::Bool
@@ -314,11 +311,12 @@ read a bit from the reader
 @param reader::BitReader: the bit reader to read from
 @return::Bool: the bit read
 """
-function read_bit(reader::BitReader)::Bool
-    if reader.index > reader.length
+@inline function read_bit(reader::BitReader)::Bool
+    if !(1 <= reader.index <= reader.length)
         error("Attempt to read past end of buffer")
     end
-    bit = reader.buffer[reader.index]
+    pos = reader.index - 1
+    bit = ((@inbounds reader.buffer[(pos >>> 3) + 1]) >> (7 - (pos & 7))) & 0x01 != 0
     reader.index += 1
     reader.bit_count += 1
     return bit
@@ -332,11 +330,12 @@ Look at the next bit without advancing the reader.
 @param reader::BitReader: the bit reader to peek from
 @return::Bool: the next bit, or error if past end
 """
-function peek_bit(reader::BitReader)::Bool
-    if reader.index > reader.length
+@inline function peek_bit(reader::BitReader)::Bool
+    if !(1 <= reader.index <= reader.length)
         error("Attempt to peek past end of buffer")
     end
-    return reader.buffer[reader.index]
+    pos = reader.index - 1
+    return ((@inbounds reader.buffer[(pos >>> 3) + 1]) >> (7 - (pos & 7))) & 0x01 != 0
 end
 
 """
@@ -368,11 +367,23 @@ as an unsigned integer of type `T`.
 @return::T: the reconstructed unsigned value
 """
 function read_value(reader::BitReader, n::Int, ::Type{T}=UInt8) where {T<:Unsigned}
+    n >= 0 || throw(ArgumentError("bit count must be nonnegative"))
+    (reader.index >= 1 && n <= reader.length - reader.index + 1) ||
+        error("Attempt to read past end of buffer")
     value = zero(T)
-    for _ in 1:n
-        value <<= 1
-        value |= T(read_bit(reader))
+    pos = reader.index - 1
+    remaining = n
+    while remaining > 0
+        take = min(remaining, 8 - (pos & 7))
+        shift = 8 - (pos & 7) - take
+        byte = @inbounds reader.buffer[(pos >>> 3) + 1]
+        part = (byte >> shift) & UInt8((1 << take) - 1)
+        value = (value << take) | convert(T, part)
+        pos += take
+        remaining -= take
     end
+    reader.index = pos + 1
+    reader.bit_count += n
     return value
 end
 

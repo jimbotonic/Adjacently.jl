@@ -1,0 +1,50 @@
+{
+  "id": "codec-acceleration-opt-in-v1",
+  "status": "core promotion; no published size or ordering tables changed",
+  "julia": "1.12.4",
+  "source_manifest": "bench/graph_compression/configs/codec_acceleration_v1.sha256",
+  "api_defaults": {
+    "parallel_search": false,
+    "parallel_decode": false,
+    "compact_lists": false,
+    "fused_lr": false,
+    "reuse_identity": false,
+    "sorted_fastpath": false,
+    "reuse_scratch": false,
+    "parallel_clusters": false,
+    "cluster_seed": null
+  },
+  "runtime": {"julia_threads": 8, "affinity": "0,2,4,6,8,10,12,14", "gc_enabled": true},
+  "encoder": {
+    "parallel_search": true,
+    "search_workers": 8,
+    "cost_model": 0,
+    "bg_cs": {"coding_scheme": "children", "integer_encoding": "context_range", "search_batch_size": 4096},
+    "cg": {"coding_scheme": "children", "integer_encoding": "context_range", "clusters": 1},
+    "parameter_provenance": ["parallel_encoding_v1.json", "cg_speed_v1.json"]
+  },
+  "cg_decode": {
+    "baseline": {"compact_lists": false, "fused_lr": false, "reuse_identity": false, "sorted_fastpath": false, "reuse_scratch": false},
+    "recommended": {"compact_lists": true, "fused_lr": true, "reuse_identity": true, "sorted_fastpath": true, "reuse_scratch": true},
+    "k1": {"parallel_decode": false, "decode_workers": 1},
+    "multi_cluster": {"parallel_decode": true, "decode_workers": 8, "requires": "indexed context-range CG"},
+    "historical_followup_baseline": {"compact_lists": true, "fused_lr": true, "reuse_identity": false, "sorted_fastpath": false, "reuse_scratch": false}
+  },
+  "llp": {
+    "parallel_clusters": true,
+    "cluster_seed": 53,
+    "caller_seed": 53,
+    "cluster_workers": {"eat": 4, "cnr": 8},
+    "llp_mode": "sym",
+    "llp_passes": 3,
+    "sort_clusters": "size_desc",
+    "rng_policy": "stable cluster-order MersenneTwister seed expansion into independent Xoshiro streams",
+    "warning": "Changes ordering versus historical shared-RNG runs. Re-run and re-record every affected table. Seeded serial and seeded parallel are identical; historical serial and seeded parallel are not guaranteed identical."
+  },
+  "measurement_provenance": {
+    "encoding": "research/graph_compression/parallel_encoding/RESULTS.md and research/graph_compression/cg_speed/RESULTS.md",
+    "decode": "research/graph_compression/cg_decode_followup/RESULTS.md",
+    "note": "Historical timings used the archived working-tree input-reader/CDF prerequisites. Do not reattribute those numbers to this commit without retiming its exact source manifest. CDF-search and RA-cache experiments are not promoted."
+  },
+  "validation": "Committed synthetic byte comparisons, frozen EAT SHA-256 fixtures, full adjacency and cursor checks, default-off guards, and frozen legacy LLP ordering/RNG tail."
+}

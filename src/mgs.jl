@@ -16,6 +16,7 @@
 module MGS
 
 using LightGraphs, DataStructures, Logging
+import ..Compression
 using ..CustomTypes: UInt24, UInt40
 using ..NodeTypes: Node, EmptyNode
 using ..CustomLightGraphs: SimpleDiGraph, SimpleGraph, SimpleEdge
@@ -870,7 +871,11 @@ function write_bg_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString;
 		multi_ref::Bool=false,
 		adaptive_header::Bool=false,
 		cost_model::Int=DEFAULT_COST_MODEL,
-		index_sample_k::Int=0) where {T<:Unsigned}
+		index_sample_k::Int=0,
+		parallel_search::Bool=false,
+		search_workers::Int=Threads.nthreads(:default),
+		search_batch_size::Int=4096) where {T<:Unsigned}
+	Compression._check_parallel_search(parallel_search, coding_scheme, exact_costing, search_workers, search_batch_size)
 	vs = vertices(g)
 	gs = convert(UInt64, length(vs))
 
@@ -914,7 +919,9 @@ function write_bg_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString;
 				tight_intervals=true, fixwidth_ref=lr_split,
 				exact_costing=exact_costing, lr_split=lr_split,
 				multi_ref=multi_ref, adaptive_header=adaptive_header,
-				cost_model=cost_model, index_sample_k=index_sample_k)
+				cost_model=cost_model, index_sample_k=index_sample_k,
+				parallel_search=parallel_search,
+				search_workers=search_workers, search_batch_size=search_batch_size)
 		flush_bitwriter(sbw; flush_last_bits=true)
 		struct_bytes = collect(get_bytes(sbw))
 		header_bytes[5] = 0x03  # v3.3: all BG ctx files use the 5-stream layout
@@ -943,7 +950,9 @@ function write_bg_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString;
 		tight_intervals=true, fixwidth_ref=lr_split,
 		exact_costing=exact_costing, lr_split=lr_split,
 		multi_ref=multi_ref, adaptive_header=adaptive_header,
-		cost_model=cost_model, index_sample_k=index_sample_k)
+		cost_model=cost_model, index_sample_k=index_sample_k,
+		parallel_search=parallel_search, search_workers=search_workers,
+		search_batch_size=search_batch_size)
 
 	flush_bitwriter(bw; flush_last_bits=true)
 	open(filename * ".mgz", "w") do f
@@ -966,7 +975,11 @@ function write_cs_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString;
 		ref_window_size::Int=64, compact_copy::Bool=true,
 		tight_intervals::Bool=true, lr_split::Bool=false,
 		cost_model::Int=DEFAULT_COST_MODEL,
-		index_sample_k::Int=0) where {T<:Unsigned}
+		index_sample_k::Int=0,
+		parallel_search::Bool=false,
+		search_workers::Int=Threads.nthreads(:default),
+		search_batch_size::Int=4096) where {T<:Unsigned}
+	Compression._check_parallel_search(parallel_search, coding_scheme, false, search_workers, search_batch_size)
 	vs = vertices(g)
 	gs = convert(UInt64, length(vs))
 
@@ -1006,7 +1019,9 @@ function write_cs_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString;
 			write_cmdstream_graph_data(sbw, nls, coding_scheme, ref_window_size;
 				integer_encoding=:context_range, compact_copy=compact_copy,
 				tight_intervals=tight_intervals, lr_split=lr_split,
-				cost_model=cost_model, index_sample_k=index_sample_k)
+				cost_model=cost_model, index_sample_k=index_sample_k,
+				parallel_search=parallel_search,
+				search_workers=search_workers, search_batch_size=search_batch_size)
 		flush_bitwriter(sbw; flush_last_bits=true)
 		struct_bytes = collect(get_bytes(sbw))
 		header_bytes[5] = 0x03  # v3.3: all CS ctx files use the 5-stream layout
@@ -1028,7 +1043,9 @@ function write_cs_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString;
 	write_cmdstream_graph_data(bw, nls, coding_scheme, ref_window_size;
 		integer_encoding=integer_encoding, compact_copy=compact_copy,
 		tight_intervals=tight_intervals, lr_split=lr_split,
-		cost_model=cost_model, index_sample_k=index_sample_k)
+		cost_model=cost_model, index_sample_k=index_sample_k,
+		parallel_search=parallel_search, search_workers=search_workers,
+		search_batch_size=search_batch_size)
 
 	flush_bitwriter(bw; flush_last_bits=true)
 	open(filename * ".mgz", "w") do f
@@ -1057,7 +1074,10 @@ function write_cg_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString,
 		coding_scheme::Symbol=:children,
 		params::CGParams=CGParams(),
 		integer_encoding::Symbol=params.varint,
-		progress::Union{Nothing,Function}=nothing) where {T<:Unsigned}
+		progress::Union{Nothing,Function}=nothing,
+		parallel_search::Bool=false,
+		search_workers::Int=Threads.nthreads(:default)) where {T<:Unsigned}
+	Compression.CG._check_parallel_search(params, parallel_search, search_workers)
 	vs = vertices(g)
 	gs = convert(UInt64, length(vs))
 
@@ -1091,7 +1111,7 @@ function write_cg_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString,
 			buf_bw = BitWriter()
 			resid_bytes, refdist_bytes, copy_bytes, rc_off, rd_off, cp_off =
 				encode_level(buf_bw, g, clusters; params=params, stats=stats, progress=progress,
-					ctx_range=true, cluster_offsets=cg_offsets)
+					ctx_range=true, cluster_offsets=cg_offsets, parallel_search=parallel_search, search_workers=search_workers)
 			flush_bitwriter(buf_bw; flush_last_bits=true)
 			max_offset = maximum(cg_offsets[1:(K + 1)])
 			if K > 0
@@ -1114,7 +1134,7 @@ function write_cg_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString,
 			write_bytes(sbw, collect(get_bytes(buf_bw)))
 		else
 			@info("writing CG compressed graph data (context_range)")
-			resid_bytes, refdist_bytes, copy_bytes = encode_level(sbw, g, clusters; params=params, stats=stats, progress=progress, ctx_range=true)
+			resid_bytes, refdist_bytes, copy_bytes = encode_level(sbw, g, clusters; params=params, stats=stats, progress=progress, ctx_range=true, parallel_search=parallel_search, search_workers=search_workers)
 		end
 		flush_bitwriter(sbw; flush_last_bits=true)
 		struct_bytes = collect(get_bytes(sbw))
@@ -1142,7 +1162,7 @@ function write_cg_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString,
 		K = length(clusters)
 		cg_offsets = zeros(Int, 2 * K + 1)  # K intra offsets + 1 inter start + K inter per-source offsets
 		encode_level(buf_bw, g, clusters; params=params, stats=stats, progress=progress,
-			cluster_offsets=cg_offsets)
+			cluster_offsets=cg_offsets, parallel_search=parallel_search, search_workers=search_workers)
 		flush_bitwriter(buf_bw; flush_last_bits=true)
 
 		# Compute entry width (must cover all offsets including inter per-source)
@@ -1166,7 +1186,7 @@ function write_cg_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString,
 		write_bytes(bw, collect(buf_data))
 	else
 		@info("writing CG compressed graph data")
-		encode_level(bw, g, clusters; params=params, stats=stats, progress=progress)
+		encode_level(bw, g, clusters; params=params, stats=stats, progress=progress, parallel_search=parallel_search, search_workers=search_workers)
 	end
 
 	flush_bitwriter(bw; flush_last_bits=true)
@@ -1217,8 +1237,19 @@ Supported compression schemes:
 - :fed
 
 Returns a graph loaded with the compression scheme specified in the header.
+
+CG-only options `compact_lists`, `fused_lr`, `reuse_identity`,
+`sorted_fastpath`, and `reuse_scratch` all default to `false`. Enable the
+recorded set together for compact local IDs, fused LR decoding, identity-vector
+transfer, sorted finalization, and scratch reuse without changing the file format.
+`parallel_decode=false` also defaults off; enabling it requires independent
+indexed context-range CG clusters and positive `decode_workers`. K=1 remains
+serial. CG options on non-CG files are rejected rather than silently ignored.
 """
-function load_compressed_mgs3_graph(filename::AbstractString)
+function load_compressed_mgs3_graph(filename::AbstractString;
+		parallel_decode::Bool=false, decode_workers::Int=Threads.nthreads(:default),
+		compact_lists::Bool=false, fused_lr::Bool=false, reuse_identity::Bool=false,
+		sorted_fastpath::Bool=false, reuse_scratch::Bool=false)
 	f = open(filename, "r")
 
 	# read header (12 bytes)
@@ -1233,6 +1264,16 @@ function load_compressed_mgs3_graph(filename::AbstractString)
 	flag_byte1 = header_bytes[6]
 	flag_byte2 = header_bytes[7]
 	graph_type, encoding, compression, byte2 = decode_header_flags(flag_byte1, flag_byte2)
+	if (compact_lists || fused_lr || reuse_identity || sorted_fastpath || reuse_scratch) &&
+			!(byte2 == ALG_CG || PARAM_CG_BASE <= byte2 <= PARAM_CG_MAX)
+		close(f)
+		throw(ArgumentError("CG decoder options require a CG file"))
+	end
+	if parallel_decode && (!(byte2 == ALG_CG || PARAM_CG_BASE <= byte2 <= PARAM_CG_MAX) ||
+			encoding != :index || compression != :context_range || decode_workers <= 0)
+		close(f)
+		throw(ArgumentError("parallel_decode requires indexed context-range CG and positive decode_workers"))
+	end
 
 	# Extract number of vertices (5 bytes, little-endian)
 	gs_bytes = header_bytes[8:12]
@@ -1259,7 +1300,10 @@ function load_compressed_mgs3_graph(filename::AbstractString)
 			compact_copy=p.compact_copy, tight_intervals=p.tight_intervals,
 			ref_window_size=p.ref_window_size, lr_split=p.lr_split)
 	elseif byte2 == ALG_CG
-		load_cg_mgs3_graph(f, graph_type, gs; params=_cg_default_params(), coding_scheme=encoding)
+		load_cg_mgs3_graph(f, graph_type, gs; params=_cg_default_params(), coding_scheme=encoding,
+			integer_encoding=compression, parallel_decode=parallel_decode, decode_workers=decode_workers,
+			compact_lists=compact_lists, fused_lr=fused_lr, reuse_identity=reuse_identity,
+			sorted_fastpath=sorted_fastpath, reuse_scratch=reuse_scratch)
 	elseif byte2 <= 0x0F
 		error("Reserved algorithm ID: 0x$(string(byte2, base=16, pad=2))")
 	# Parameter ranges (0x10–0xFF)
@@ -1280,7 +1324,10 @@ function load_compressed_mgs3_graph(filename::AbstractString)
 		# :context_range files store fibonacci-coded structural integers; the range
 		# coder handles residuals separately (signalled by compression==:context_range).
 		p = decode_cg_params(byte2; varint=(compression == :context_range ? :fibonacci : compression))
-		load_cg_mgs3_graph(f, graph_type, gs; params=p, coding_scheme=encoding, integer_encoding=compression)
+		load_cg_mgs3_graph(f, graph_type, gs; params=p, coding_scheme=encoding, integer_encoding=compression,
+			parallel_decode=parallel_decode, decode_workers=decode_workers,
+			compact_lists=compact_lists, fused_lr=fused_lr, reuse_identity=reuse_identity,
+			sorted_fastpath=sorted_fastpath, reuse_scratch=reuse_scratch)
 	else
 		error("Unknown byte2: 0x$(string(byte2, base=16, pad=2))")
 	end
@@ -1554,7 +1601,10 @@ Load graph from CG compressed MGS v3 format.
 """
 function load_cg_mgs3_graph(io::IO, graph_type::Symbol, gs::UInt64;
 		params::CGParams=CGParams(), coding_scheme::Symbol=:children,
-		integer_encoding::Symbol=:fibonacci)
+		integer_encoding::Symbol=:fibonacci, parallel_decode::Bool=false,
+		decode_workers::Int=Threads.nthreads(:default), compact_lists::Bool=false,
+		fused_lr::Bool=false, reuse_identity::Bool=false, sorted_fastpath::Bool=false,
+		reuse_scratch::Bool=false)
 	n_bits_v = convert(UInt8, ceil(log(2, gs)))
 	V = infer_uint_custom_type(n_bits_v)
 
@@ -1572,12 +1622,13 @@ function load_cg_mgs3_graph(io::IO, graph_type::Symbol, gs::UInt64;
 		refdist_bytes = read(io, Int(rdlen))
 		copy_bytes = read(io, Int(cplen))
 		resid_bytes = read(io)
-		reader = BitReader(IOBuffer(struct_bytes))
+		reader = BitReader(struct_bytes)
 	else
 		reader = BitReader(io)
 	end
 
 	chunk_offsets = nothing
+	_cg_offsets = nothing
 	if coding_scheme == :index
 		# Read cluster offset table: 6-bit entry_width + 32-bit K + (2K+1) entries
 		entry_width = Int(read_value(reader, 6, UInt64))
@@ -1599,7 +1650,10 @@ function load_cg_mgs3_graph(io::IO, graph_type::Symbol, gs::UInt64;
 	@info("reading CG-compressed graph data")
 	neighbor_lists = decode_level(reader, params; T=V, directed=directed, coding_scheme=coding_scheme,
 		ctx_range=ctx_range, resid_bytes=resid_bytes, refdist_bytes=refdist_bytes, copy_bytes=copy_bytes,
-		chunk_offsets=chunk_offsets)
+		chunk_offsets=chunk_offsets, cg_offsets=_cg_offsets, data_start_bit=reader.bit_count,
+		parallel_clusters=parallel_decode, decode_workers=decode_workers,
+		compact_lists=compact_lists, fused_lr=fused_lr, reuse_identity=reuse_identity,
+		sorted_fastpath=sorted_fastpath, reuse_scratch=reuse_scratch)
 
 	# Build graph from decoded neighbor lists
 	g = directed ? SimpleDiGraph{V}() : SimpleGraph{V}()
@@ -1782,7 +1836,8 @@ end
 # its per-source inter section) on fresh per-cluster range decoders. Intra
 # references never cross clusters, so no cross-chunk resolver is needed.
 function _load_cg_ctxrange_random_access(filename::AbstractString, graph_type::Symbol,
-		gs::UInt64, params::CGParams)
+		gs::UInt64, params::CGParams; compact_lists::Bool=false, fused_lr::Bool=false,
+		reuse_identity::Bool=false, sorted_fastpath::Bool=false, reuse_scratch::Bool=false)
 	local struct_bytes, refdist_bytes, copy_bytes, resid_bytes
 	open(filename, "r") do io
 		read(io, 12)  # skip header
@@ -1800,7 +1855,7 @@ function _load_cg_ctxrange_random_access(filename::AbstractString, graph_type::S
 	directed = graph_type == :directed
 
 	# Parse offset tables + membership once.
-	r = BitReader(IOBuffer(struct_bytes))
+	r = BitReader(struct_bytes)
 	entry_width = Int(read_value(r, 6, UInt64))
 	K = Int(read_value(r, 32, UInt32))
 	cg_offsets = [Int(read_value(r, entry_width, UInt64)) for _ in 1:(2 * K + 1)]
@@ -1821,12 +1876,13 @@ function _load_cg_ctxrange_random_access(filename::AbstractString, graph_type::S
 	clusters_decoded = Ref(0)
 	function materialize_cluster(ci::Int)
 		haskey(memo, ci) && return memo[ci]
-		rr = BitReader(IOBuffer(struct_bytes))
+		rr = BitReader(struct_bytes)
 		nls = decode_level(rr, params; T=T, directed=directed, coding_scheme=:index,
 			ctx_range=true, resid_bytes=resid_bytes, refdist_bytes=refdist_bytes,
 			copy_bytes=copy_bytes, cg_offsets=cg_offsets, data_start_bit=data_start_bit,
 			chunk_offsets=(rc_off, rd_off, cp_off), only_cluster=ci,
-			preparsed_clusters=clusters)
+			preparsed_clusters=clusters, local_type=(compact_lists ? T : Int), fused_lr=fused_lr,
+			reuse_identity=reuse_identity, sorted_fastpath=sorted_fastpath, reuse_scratch=reuse_scratch)
 		memo[ci] = nls
 		clusters_decoded[] += 1
 		return nls
@@ -1837,6 +1893,7 @@ function _load_cg_ctxrange_random_access(filename::AbstractString, graph_type::S
 		ci = Int(cluster_of[Int(v)])
 		ci == 0 && return T[]
 		nls = materialize_cluster(ci)
+		# Returned storage stays caller-owned; the decoded cluster remains memoized.
 		return sort(get(nls, T(v), T[]))
 	end
 
@@ -1845,7 +1902,9 @@ function _load_cg_ctxrange_random_access(filename::AbstractString, graph_type::S
 		reset_fn=() -> (empty!(memo); clusters_decoded[] = 0))
 end
 
-function load_indexed_mgs3_graph(filename::AbstractString)
+function load_indexed_mgs3_graph(filename::AbstractString; compact_lists::Bool=false,
+        fused_lr::Bool=false, reuse_identity::Bool=false, sorted_fastpath::Bool=false,
+        reuse_scratch::Bool=false)
 	# Fast path: BG + :context_range + sampled index supports true O(k) random
 	# access via chunked range streams — no upfront full decode.
 	open(filename, "r") do f
@@ -1853,6 +1912,10 @@ function load_indexed_mgs3_graph(filename::AbstractString)
 		if header[1:3] == [0x4d, 0x47, 0x53]
 			flag_byte1 = header[6]; flag_byte2 = header[7]
 			graph_type, encoding, compression, byte2 = decode_header_flags(flag_byte1, flag_byte2)
+            if (compact_lists || fused_lr || reuse_identity || sorted_fastpath || reuse_scratch) &&
+                    !(byte2 == ALG_CG || PARAM_CG_BASE <= byte2 <= PARAM_CG_MAX)
+                throw(ArgumentError("CG decoder options require a CG file"))
+            end
 			gs_bytes = header[8:12]
 			gs = UInt64(gs_bytes[1]) | (UInt64(gs_bytes[2]) << 8) | (UInt64(gs_bytes[3]) << 16) |
 				(UInt64(gs_bytes[4]) << 24) | (UInt64(gs_bytes[5]) << 32)
@@ -1869,16 +1932,20 @@ function load_indexed_mgs3_graph(filename::AbstractString)
 			is_cg = byte2 == ALG_CG || (PARAM_CG_BASE <= byte2 <= PARAM_CG_MAX)
 			if is_cg && encoding == :index && compression == :context_range
 				p = byte2 == ALG_CG ? CGParams() : decode_cg_params(byte2)
-				return _load_cg_ctxrange_random_access(filename, graph_type, gs, p)
+				return _load_cg_ctxrange_random_access(filename, graph_type, gs, p;
+                    compact_lists=compact_lists, fused_lr=fused_lr, reuse_identity=reuse_identity,
+                    sorted_fastpath=sorted_fastpath, reuse_scratch=reuse_scratch)
 			end
 		end
 		return nothing
-	end |> ra -> ra === nothing ? _load_indexed_mgs3_graph_fulldecode(filename) : ra
+	end |> ra -> ra === nothing ? _load_indexed_mgs3_graph_fulldecode(filename;
+        compact_lists=compact_lists, fused_lr=fused_lr, reuse_identity=reuse_identity,
+        sorted_fastpath=sorted_fastpath, reuse_scratch=reuse_scratch) : ra
 end
 
-function _load_indexed_mgs3_graph_fulldecode(filename::AbstractString)
+function _load_indexed_mgs3_graph_fulldecode(filename::AbstractString; kw...)
 	# Load full graph (uses sequential decode internally)
-	g = load_compressed_mgs3_graph(filename)
+	g = load_compressed_mgs3_graph(filename; kw...)
 	n = Int(nv(g))
 	m = Int(ne(g))
 

@@ -167,7 +167,8 @@ of neighbors with label l, and size[l] is the total number of vertices with labe
 Returns a label vector (Int array indexed by vertex Int id).
 """
 function _apm_label_propagation(g::AbstractGraph{T}, neighbor_mode::Symbol,
-                                  gamma::Float64, passes::Int) where {T<:Unsigned}
+                                  gamma::Float64, passes::Int;
+                                  rng::AbstractRNG=Random.default_rng()) where {T<:Unsigned}
     n = Int(nv(g))
     vs = collect(vertices(g))
 
@@ -186,7 +187,7 @@ function _apm_label_propagation(g::AbstractGraph{T}, neighbor_mode::Symbol,
     perm = collect(1:n)
     for pass in 1:max(passes, 1)
         # Process vertices in random order
-        Random.shuffle!(perm)
+        Random.shuffle!(rng, perm)
         changed = false
         for idx in perm
             v = vs[idx]
@@ -251,7 +252,8 @@ then composes the orderings to build a final vertex mapping.
 """
 function relabel_vertices_llp(g::AbstractGraph{T}, neighbor_mode::Symbol=:sym;
                                passes::Int=5, K::Int=10,
-                               return_labels::Bool=false) where {T<:Unsigned}
+                               return_labels::Bool=false,
+                               rng::AbstractRNG=Random.default_rng()) where {T<:Unsigned}
     n = Int(nv(g))
     vs = collect(vertices(g))
 
@@ -268,7 +270,7 @@ function relabel_vertices_llp(g::AbstractGraph{T}, neighbor_mode::Symbol=:sym;
     last_labels = Int[]
     for (gi, gamma) in enumerate(gammas)
         # Run APM label propagation at this gamma
-        labels = _apm_label_propagation(g, neighbor_mode, gamma, passes)
+        labels = _apm_label_propagation(g, neighbor_mode, gamma, passes; rng=rng)
         last_labels = labels
 
         # Group vertices by label, preserving current order
@@ -959,7 +961,13 @@ function merge_small_clusters(g::AbstractGraph{T}, part::Vector{Int}, min_size::
 end
 
 # Build the concatenated per-cluster-LLP vertex order for a partition.
-function _leiden_llp_order(g::AbstractGraph{T}, part; llp_mode, llp_passes, sort_clusters) where {T<:Unsigned}
+function _leiden_llp_order(g::AbstractGraph{T}, part; llp_mode, llp_passes, sort_clusters,
+                           parallel_clusters::Bool=false,
+                           cluster_seed::Union{Nothing,Integer}=nothing,
+                           cluster_workers::Int=Threads.nthreads(:default)) where {T<:Unsigned}
+    cluster_workers > 0 || throw(ArgumentError("cluster_workers must be positive"))
+    parallel_clusters && cluster_seed === nothing && throw(ArgumentError(
+        "parallel_clusters requires cluster_seed; use the same seed in serial mode for identical results"))
     label_to_idx = Dict{Int,Int}()
     fine_clusters = Vector{Vector{T}}()
     for v in vertices(g)
@@ -973,18 +981,38 @@ function _leiden_llp_order(g::AbstractGraph{T}, part; llp_mode, llp_passes, sort
     if sort_clusters == :size_desc
         sort!(fine_clusters, by=length, rev=true)
     end
-    new_order = T[]
-    sizehint!(new_order, nv(g))
-    for C in fine_clusters
+    # Seeds depend on the stable cluster order, never thread IDs or scheduling.
+    # Legacy mode consumes the calling task's RNG exactly as before.
+    seeds = cluster_seed === nothing ? nothing : rand(MersenneTwister(cluster_seed), UInt64, length(fine_clusters))
+    function order_cluster!(i)
+        C = fine_clusters[i]
         if length(C) <= 2
-            append!(new_order, sort(C))
+            sort!(C)
         else
             sg, oni, _ = subgraph(g, C)
-            mapping = relabel_vertices_llp(sg, llp_mode; passes=llp_passes)
+            rng = seeds === nothing ? Random.default_rng() : Xoshiro(seeds[i])
+            mapping = relabel_vertices_llp(sg, llp_mode; passes=llp_passes, rng=rng)
             sort!(C, by = v -> Int(mapping[oni[v]]))
-            append!(new_order, C)
         end
+        return nothing
     end
+    if parallel_clusters && Threads.nthreads(:default) > 1 && length(fine_clusters) > 1
+        next = Threads.Atomic{Int}(1)
+        @sync for _ in 1:min(cluster_workers, Threads.nthreads(:default), length(fine_clusters))
+            Threads.@spawn begin
+                while true
+                    i = Threads.atomic_add!(next, 1)
+                    i > length(fine_clusters) && break
+                    order_cluster!(i)
+                end
+            end
+        end
+    else
+        foreach(order_cluster!, eachindex(fine_clusters))
+    end
+    new_order = T[]
+    sizehint!(new_order, nv(g))
+    for C in fine_clusters; append!(new_order, C); end
     return new_order, length(fine_clusters)
 end
 
@@ -993,11 +1021,14 @@ end
 # BPE minimum (validated on Web-Google/Amazon), and the optimum is
 # dataset-dependent, so a single fixed threshold will not do.
 function _auto_merge_threshold(g::AbstractGraph{T}, part; llp_mode, llp_passes, sort_clusters,
+                               parallel_clusters::Bool=false, cluster_seed=nothing,
+                               cluster_workers::Int=Threads.nthreads(:default),
                                grid=[0, 10, 20, 50, 100, 200, 400, 800]) where {T<:Unsigned}
     best_ms, best_de = 0, Inf
     for ms in grid
         p = ms <= 1 ? part : merge_small_clusters(g, part, ms)
-        order, _ = _leiden_llp_order(g, p; llp_mode, llp_passes, sort_clusters)
+        order, _ = _leiden_llp_order(g, p; llp_mode, llp_passes, sort_clusters,
+            parallel_clusters, cluster_seed, cluster_workers)
         vmap = Dict{T,T}(old => T(i) for (i, old) in enumerate(order))
         de = get_graph_entropy(relabel_graph(g, vmap), :bits_per_edge, :delta)
         de < best_de && (best_de = de; best_ms = ms)
@@ -1015,13 +1046,33 @@ end
 fixed min-size threshold; `:auto` sweeps a threshold grid and picks the one that
 minimises the delta-entropy proxy (dataset-adaptive, but orders the graph once
 per grid point — expensive on very large graphs, so prefer a fixed `Int` there).
+
+`parallel_clusters=true` distributes independent induced-subgraph LLP jobs over
+up to `cluster_workers` default-pool threads; Leiden and final concatenation stay
+serial. It requires an explicit `cluster_seed`. With that seed, serial and
+parallel execution use identical per-cluster Xoshiro streams (seeds drawn in
+stable cluster order from MersenneTwister), independent of worker count/schedule.
+This explicit seeded mode is a new RNG policy, not the legacy shared RNG stream.
+Omitting both options preserves legacy orders and RNG consumption. Use a fixed
+caller seed as well to reproduce the preceding Leiden partition.
+
+Enabling parallel cluster LLP changes the ordering relative to historical
+shared-RNG runs (seed-to-seed variation); it is not a byte-identical optimization.
+Re-run and re-record every compression/ordering table affected by this policy.
+It is disabled by default; `cluster_seed` also defaults to `nothing`.
 """
 function relabel_graph_leiden_llp(g::AbstractGraph{T}; llp_mode::Symbol=:sym, llp_passes::Int=5,
                                   sort_clusters::Symbol=:size_desc,
                                   merge_clusters::Union{Nothing,Integer,Symbol}=nothing,
                                   return_clusters::Bool=false,
                                   llp_seed::Bool=false,
-                                  llp_seed_passes::Int=llp_passes) where {T<:Unsigned}
+                                  llp_seed_passes::Int=llp_passes,
+                                  parallel_clusters::Bool=false,
+                                  cluster_seed::Union{Nothing,Integer}=nothing,
+                                  cluster_workers::Int=Threads.nthreads(:default)) where {T<:Unsigned}
+    cluster_workers > 0 || throw(ArgumentError("cluster_workers must be positive"))
+    parallel_clusters && cluster_seed === nothing && throw(ArgumentError(
+        "parallel_clusters requires an explicit cluster_seed"))
     # Step 0 (optional): a global LLP pass whose LABEL PARTITION seeds the
     # community detector. `llp_seed=false` reproduces the two-stage pipeline that
     # produced every published number; `llp_seed=true` is the three-stage pipeline
@@ -1046,7 +1097,8 @@ function relabel_graph_leiden_llp(g::AbstractGraph{T}; llp_mode::Symbol=:sym, ll
 
     # Step 2 (optional): merge small clusters
     if merge_clusters === :auto
-        ms = _auto_merge_threshold(g, part; llp_mode, llp_passes, sort_clusters)
+        ms = _auto_merge_threshold(g, part; llp_mode, llp_passes, sort_clusters,
+            parallel_clusters, cluster_seed, cluster_workers)
         @info "Leiden+LLP: auto-selected merge min_size=$ms"
         part = merge_small_clusters(g, part, ms)
     elseif merge_clusters isa Integer && merge_clusters > 1
@@ -1054,7 +1106,8 @@ function relabel_graph_leiden_llp(g::AbstractGraph{T}; llp_mode::Symbol=:sym, ll
     end
 
     # Step 3: per-cluster LLP ordering
-    new_order, n_clusters = _leiden_llp_order(g, part; llp_mode, llp_passes, sort_clusters)
+    new_order, n_clusters = _leiden_llp_order(g, part; llp_mode, llp_passes, sort_clusters,
+        parallel_clusters, cluster_seed, cluster_workers)
     szc = Dict{Int,Int}(); for l in part; szc[l] = get(szc, l, 0) + 1; end
     top_sizes = sort(collect(values(szc)), rev=true)[1:min(5, n_clusters)]
     @info "Leiden+LLP: $n_clusters clusters, largest: $top_sizes"

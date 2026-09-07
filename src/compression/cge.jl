@@ -225,17 +225,17 @@ end
 
 Read a STOP-terminated delta list written by `_write_stop_delta_zigzag`.
 """
-function _read_stop_delta_zigzag(r::BitReader, encoding::Symbol, ::Type{T}, vertex_id) where {T<:Unsigned}
+function _read_stop_delta_zigzag(r::BitReader, encoding::Symbol, ::Type{T}, vertex_id; source=nothing) where {T<:Unsigned}
     result = T[]
     first = true
     prev = zero(T)
     while read_bit(r)  # '1' = more values, '0' = STOP
         if first && vertex_id !== nothing
-            raw64 = read_encoded_value(r, encoding, UInt64)
+            raw64 = _cg_read_value(r, encoding, UInt64; source=source)
             val = T(Int64(vertex_id) + Compression._zigzag_decode(raw64 - 1))
             first = false
         else
-            raw = read_encoded_value(r, encoding, T)
+            raw = _cg_read_value(r, encoding, T; source=source)
             val = prev + raw
             first = false
         end
@@ -328,27 +328,35 @@ end
 Read neighbor list written by `_write_ir_lr`.
 """
 function _read_ir_lr(r::BitReader, encoding::Symbol, mil::Int,
-                      ::Type{T}, vertex_id; tight_deltas::Bool=false) where {T<:Unsigned}
+                      ::Type{T}, vertex_id; tight_deltas::Bool=false, fused::Bool=false, source=nothing,
+                      buffer=nothing, merge_scratch=nothing) where {T<:Unsigned}
+    if fused && !tight_deltas && source isa Compression.CtxRangeDecoder && vertex_id !== nothing
+        # The shared BG/CS kernel expects shifted gaps. CG's optional tight-gap
+        # mode stores unshifted gaps even in the range stream: retain its reader.
+        # CG interval starts are relative to starts, not interval ends.
+        return Compression._read_intervals_lr_source(r, encoding, mil, T,
+            T(vertex_id), false, source, buffer, merge_scratch)
+    end
     if vertex_id === nothing
-        return read_intervals_and_residuals(r, encoding, mil, T; vertex_id=vertex_id)
+        return _cg_read_intervals(r, encoding, mil, T; vertex_id=vertex_id, source=source)
     end
     vid = T(vertex_id)
 
     # Read intervals (same format as standard)
-    num_intervals = Int(read_encoded_value(r, encoding, T)) - 1
+    num_intervals = Int(_cg_read_value(r, encoding, T; source=source)) - 1
     neighbors = T[]
 
     if num_intervals > 0
         prev_ref = T(0)
         for idx in 1:num_intervals
             if idx == 1
-                raw_start = read_encoded_value(r, encoding, UInt64)
+                raw_start = _cg_read_value(r, encoding, UInt64; source=source)
                 start = T(Int64(vid) + Compression._zigzag_decode(raw_start - 1))
             else
-                start_delta = read_encoded_value(r, encoding, T)
+                start_delta = _cg_read_value(r, encoding, T; source=source)
                 start = prev_ref + start_delta
             end
-            len = Int(read_encoded_value(r, encoding, T)) - 1 + mil
+            len = Int(_cg_read_value(r, encoding, T; source=source)) - 1 + mil
             for j in 0:(len-1)
                 push!(neighbors, start + T(j))
             end
@@ -357,15 +365,15 @@ function _read_ir_lr(r::BitReader, encoding::Symbol, mil::Int,
     end
 
     # Read total residual count
-    num_residuals = Int(read_encoded_value(r, encoding, T)) - 1
+    num_residuals = Int(_cg_read_value(r, encoding, T; source=source)) - 1
     if num_residuals > 0
         # Read left count
-        n_left = Int(read_encoded_value(r, encoding, T)) - 1
+        n_left = Int(_cg_read_value(r, encoding, T; source=source)) - 1
         n_right = num_residuals - n_left
 
         # Read left distances → reconstruct left values
         if n_left > 0
-            left_dists = read_delta(r, encoding, T; max_elements=n_left, positive_gaps=tight_deltas)
+            left_dists = _cg_read_delta(r, encoding, T; max_elements=n_left, positive_gaps=tight_deltas, source=source)
             # Reverse distances back to ascending original values
             for i in n_left:-1:1
                 push!(neighbors, vid - left_dists[i])
@@ -374,7 +382,7 @@ function _read_ir_lr(r::BitReader, encoding::Symbol, mil::Int,
 
         # Read right distances → reconstruct right values
         if n_right > 0
-            right_dists = read_delta(r, encoding, T; max_elements=n_right, positive_gaps=tight_deltas)
+            right_dists = _cg_read_delta(r, encoding, T; max_elements=n_right, positive_gaps=tight_deltas, source=source)
             for d in right_dists
                 push!(neighbors, vid + d - T(1))
             end
@@ -434,23 +442,23 @@ end
 Read copy-blocks written by `_write_copy_blocks`. Returns sorted position indices.
 """
 function _read_copy_blocks(r::BitReader, encoding::Symbol, ::Type{T}) where {T<:Unsigned}
-    ncb = Int(Compression.read_small_count(r, encoding, T))
+    ncb = Int(_cg_read_small_count(r, encoding, T))
     if ncb == 0
         return Int[]
     end
     positions = Int[]
     # First block
-    start = Int(read_encoded_value(r, encoding, T))
-    len = Int(read_encoded_value(r, encoding, T))
+    start = Int(_cg_read_value(r, encoding, T))
+    len = Int(_cg_read_value(r, encoding, T))
     for j in 0:(len-1)
         push!(positions, start + j)
     end
     prev_end = start + len
     # Subsequent blocks
     for i in 2:ncb
-        gap = Int(read_encoded_value(r, encoding, T))
+        gap = Int(_cg_read_value(r, encoding, T))
         start = prev_end + gap
-        len = Int(read_encoded_value(r, encoding, T))
+        len = Int(_cg_read_value(r, encoding, T))
         for j in 0:(len-1)
             push!(positions, start + j)
         end
@@ -526,7 +534,7 @@ function _read_fixwidth_ref_deltas(r::BitReader, s::Int, window::Int; vlc::Bool=
             has_ref = read_bit(r)
             use_ref_vec[idx] = has_ref
             if has_ref
-                ref_delta_vec[idx] = read_encoded_value(r, :fibonacci, UInt32)
+                ref_delta_vec[idx] = _cg_read_value(r, :fibonacci, UInt32)
             end
         end
     else
@@ -1364,7 +1372,11 @@ function _write_cluster_copy!(copy_sink, use_ref_vec::Vector{Bool}, ref_position
     return nothing
 end
 
-function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; params::CGParams=CGParams(), stats::Union{Nothing,CGStats}=nothing, progress::Union{Nothing,Function}=nothing, cluster_offsets::Union{Nothing,Vector{Int}}=nothing, ctx_range::Bool=false) where {T<:Unsigned}
+include("cg_search.jl")
+
+function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; params::CGParams=CGParams(), stats::Union{Nothing,CGStats}=nothing, progress::Union{Nothing,Function}=nothing, cluster_offsets::Union{Nothing,Vector{Int}}=nothing, ctx_range::Bool=false,
+        parallel_search::Bool=false, search_workers::Int=Threads.nthreads(:default)) where {T<:Unsigned}
+    _check_parallel_search(params, parallel_search, search_workers)
     # :context_range — residual (additions/raw) integers route to a streaming range
     # coder; structural integers stay fibonacci in the bitstream. Requires the clean
     # per-vertex path (directed + no bitset/mgs/block alternatives).
@@ -1400,14 +1412,14 @@ function encode_level(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}; p
                 append!(copy_blob,    Compression.brc_finish_and_reset!(copy_sink));   push!(copy_coff,    length(copy_blob))
                 nothing
             end
-            _encode_level_body!(w, g, P, params, stats, progress, cluster_offsets, resid_sink, refdist_sink, copy_sink, chunk_cb)
+            _encode_level_body!(w, g, P, params, stats, progress, cluster_offsets, resid_sink, refdist_sink, copy_sink, chunk_cb, parallel_search, search_workers)
             return (resid_blob, refdist_blob, copy_blob, resid_coff, refdist_coff, copy_coff)
         end
-        _encode_level_body!(w, g, P, params, stats, progress, cluster_offsets, resid_sink, refdist_sink, copy_sink, nothing)
+        _encode_level_body!(w, g, P, params, stats, progress, cluster_offsets, resid_sink, refdist_sink, copy_sink, nothing, parallel_search, search_workers)
         # finalize + return (residual, refdist, copy) range streams
         return (Compression.rc_finish!(resid_sink), Compression.rc_finish!(refdist_sink), Compression.brc_finish!(copy_sink))
     else
-        _encode_level_body!(w, g, P, params, stats, progress, cluster_offsets, nothing, nothing, nothing, nothing)
+        _encode_level_body!(w, g, P, params, stats, progress, cluster_offsets, nothing, nothing, nothing, nothing, parallel_search, search_workers)
         return nothing
     end
 end
@@ -1415,7 +1427,7 @@ end
 # @noinline preserves the function barrier — inlining the worker back into the thin
 # wrapper would reintroduce the union-typed sink locals into a single huge method and
 # risk resurfacing the Julia-1.12 codegen miscompilation (see encode_level comment).
-@noinline function _encode_level_body!(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}, params::CGParams, stats::Union{Nothing,CGStats}, progress::Union{Nothing,Function}, cluster_offsets::Union{Nothing,Vector{Int}}, resid_sink, refdist_sink, copy_sink, chunk_cb) where {T<:Unsigned}
+@noinline function _encode_level_body!(w::BitWriter, g::AbstractGraph{T}, P::Vector{Vector{T}}, params::CGParams, stats::Union{Nothing,CGStats}, progress::Union{Nothing,Function}, cluster_offsets::Union{Nothing,Vector{Int}}, resid_sink, refdist_sink, copy_sink, chunk_cb, parallel_search, search_workers) where {T<:Unsigned}
     n = nv(g)
     directed = is_directed(g)
 
@@ -1570,195 +1582,12 @@ end
                 all_nl[i] = nl
             end
 
-            # First pass: decide refs and compute ref data
-            use_ref_vec = Vector{Bool}(undef, s)
-            ref_delta_vec = Vector{UInt32}(undef, s)
-            ref_positions_list = Vector{Vector{T}}(undef, s)
-            additions_list = Vector{Vector{T}}(undef, s)
-            ref_len_list = Vector{Int}(undef, s)
-            # Decisions for encoding modes (stored during search, replayed in write phase)
-            copy_mode_vec = Vector{UInt8}(undef, s)    # 0=bitmap, 1=copy-blocks, 2=complement
-            add_mode_vec = Vector{Bool}(undef, s)      # true=intervals, false=stop-delta (ref adds)
-            raw_mode_vec = Vector{Bool}(undef, s)      # true=intervals, false=stop-delta (raw)
-            # Per-vertex mil (greedy search populates this; otherwise fixed)
-            mil_vec = fill(params.intra_mil, s)
+            # Decide independently, then replay in the original stream order.
+            use_ref_vec, ref_delta_vec, ref_positions_list, additions_list, ref_len_list,
+                copy_mode_vec, add_mode_vec, raw_mode_vec, mil_vec =
+                _search_cluster(all_nl, params; parallel_search=parallel_search,
+                    search_workers=search_workers, progress=progress, ci=ci, n_clusters=n_clusters)
             _mil_options = [2, 3, 4, 5]
-
-            # Double-buffer swap: two position/adds vector pairs (optimization #5)
-            _pos_a = T[]; _adds_a = T[]
-            _pos_b = T[]; _adds_b = T[]
-
-            for idx_local in 1:s
-                progress !== nothing && progress(idx_local, s, ci, n_clusters)
-                nl = all_nl[idx_local]
-                # decide reference and mil
-                use_ref = false; ref_delta_val = UInt32(0)
-                best_copy_mode = 0x00; best_add_mode = false; best_raw_mode = false
-                if params.intra_greedy_mil
-                    # Greedy per-vertex mil search: try all mil values for raw and ref (analytical)
-                    best_bits = typemax(Int)
-                    best_mil_val = params.intra_mil
-                    best_is_ref = false
-                    best_ref_idx = 0
-
-                    _zz_vid = params.intra_zigzag ? T(idx_local) : nothing
-                    if params.cost_model == Compression.COST_MODEL_FAST
-                        # Fast model: single MIL, compare interval vs stop-delta
-                        fast_mil = params.intra_adapt_mil > 0 ? params.intra_adapt_mil : params.intra_mil
-                        iv_raw = estimate_interval_runlength_encoding_cost(nl, :fibonacci, fast_mil, 3; vertex_id=_zz_vid)
-                        sd_raw = if params.intra_stop_deltas
-                            _estimate_stop_delta_zigzag_cost(nl, :fibonacci, _zz_vid)
-                        else
-                            ab = _estimate_small_count_cost(length(nl), params.count_varint)
-                            if !isempty(nl)
-                                ab += _estimate_delta_list_cost(nl, :fibonacci; vertex_id=_zz_vid)
-                            end
-                            ab
-                        end
-                        raw_bits = min(iv_raw, sd_raw)
-                        if raw_bits < best_bits
-                            best_bits = raw_bits
-                            best_mil_val = fast_mil
-                            best_is_ref = false
-                        end
-                    else
-                    for mil in _mil_options
-                        if params.intra_lr_split
-                            raw_bits = _estimate_ir_lr_cost(nl, :fibonacci, mil, _zz_vid; tight_deltas=params.intra_tight_deltas)
-                        else
-                            raw_bits = estimate_interval_runlength_encoding_cost(nl, :fibonacci, mil, 3; vertex_id=_zz_vid)
-                        end
-                        if raw_bits < best_bits
-                            best_bits = raw_bits
-                            best_mil_val = mil
-                            best_is_ref = false
-                        end
-                    end
-                    end
-
-                    # Try ref encoding with 2-phase pruning + analytical cost
-                    if params.intra_ref_enabled && idx_local > 1
-                        wstart = max(1, idx_local - params.intra_ref_window)
-                        wend = idx_local - 1
-                        n_candidates = wend - wstart + 1
-
-                        # Phase 1: overlap screening (cheap O(|nl|+|ref|) per candidate)
-                        _max_k_greedy = params.cost_model == Compression.COST_MODEL_FAST ? MAX_REF_CANDIDATES_PHASE2_FAST : MAX_REF_CANDIDATES_PHASE2
-                        if n_candidates > _max_k_greedy
-                            overlap_scores = Vector{Tuple{Int,Int}}(undef, n_candidates)
-                            for (ci2, rix) in enumerate(wstart:wend)
-                                ov = _sorted_overlap_count(nl, all_nl[rix])
-                                overlap_scores[ci2] = (ov, rix)
-                            end
-                            sort!(overlap_scores; by = x -> -x[1])
-                            phase2_indices = [overlap_scores[k][2] for k in 1:min(_max_k_greedy, n_candidates)]
-                        else
-                            phase2_indices = collect(wstart:wend)
-                        end
-
-                        # Phase 2: full analytical evaluation on top candidates
-                        for rix in phase2_indices
-                            _merge_positions_adds!(nl, all_nl[rix], _pos_a, _adds_a)
-                            bits, mil_val = _evaluate_candidate_greedy_analytical(_pos_a, _adds_a, params, T, _zz_vid, _mil_options)
-                            if bits < best_bits
-                                best_bits = bits
-                                best_mil_val = mil_val
-                                best_is_ref = true
-                                best_ref_idx = rix
-                            end
-                        end
-                    end
-
-                    if best_is_ref
-                        use_ref = true
-                        ref_delta_val = UInt32(idx_local - best_ref_idx)
-                        # Final merge for the winner — swap into storage
-                        _merge_positions_adds!(nl, all_nl[best_ref_idx], _pos_a, _adds_a)
-                        ref_positions_list[idx_local] = copy(_pos_a)
-                        additions_list[idx_local] = copy(_adds_a)
-                    else
-                        ref_positions_list[idx_local] = T[]
-                        additions_list[idx_local] = T[]
-                    end
-                    mil_vec[idx_local] = best_mil_val
-                elseif params.intra_ref_enabled && idx_local > 1
-                    # Analytical reference decision with 2-phase pruning + early termination
-                    _zz_vid = params.intra_zigzag ? T(idx_local) : nothing
-
-                    # Raw estimation (analytical)
-                    raw_bits, raw_use_iv = _estimate_raw_cost_analytical(nl, params, T, _zz_vid)
-                    best_raw_mode = raw_use_iv
-
-                    # Ref delta header overhead
-                    ref_overhead = 0
-                    if params.intra_ref_fixwidth
-                        ref_overhead = max(1, ceil(Int, log2(params.intra_ref_window)))
-                    end
-
-                    wstart = max(1, idx_local - params.intra_ref_window)
-                    wend = idx_local - 1
-                    n_candidates = wend - wstart + 1
-
-                    # Phase 1: overlap screening
-                    _max_k_ref = params.cost_model == Compression.COST_MODEL_FAST ? MAX_REF_CANDIDATES_PHASE2_FAST : MAX_REF_CANDIDATES_PHASE2
-                    if n_candidates > _max_k_ref
-                        overlap_scores = Vector{Tuple{Int,Int}}(undef, n_candidates)
-                        for (ci2, rix) in enumerate(wstart:wend)
-                            ov = _sorted_overlap_count(nl, all_nl[rix])
-                            overlap_scores[ci2] = (ov, rix)
-                        end
-                        sort!(overlap_scores; by = x -> -x[1])
-                        phase2_indices = [overlap_scores[k][2] for k in 1:min(_max_k_ref, n_candidates)]
-                    else
-                        phase2_indices = collect(wstart:wend)
-                    end
-
-                    # Phase 2: analytical evaluation with early termination
-                    best_bits = raw_bits
-                    best_idx = 0
-                    # Use double-buffer swap: _pos_a/_adds_a for current, _pos_b/_adds_b for best
-                    for rix in phase2_indices
-                        _merge_positions_adds!(nl, all_nl[rix], _pos_a, _adds_a)
-                        ref_len = length(all_nl[rix])
-                        bits, cm, aim = _evaluate_candidate_analytical(_pos_a, _adds_a, ref_len, params, T, _zz_vid; best_so_far=best_bits - ref_overhead)
-                        total = bits + ref_overhead
-                        if total < best_bits
-                            best_bits = total
-                            best_idx = rix
-                            best_copy_mode = cm
-                            best_add_mode = aim
-                            # Swap buffers: _pos_b/_adds_b now hold the best result
-                            _pos_a, _pos_b = _pos_b, _pos_a
-                            _adds_a, _adds_b = _adds_b, _adds_a
-                        end
-                    end
-                    if best_idx > 0
-                        use_ref = true
-                        ref_delta_val = UInt32(idx_local - best_idx)
-                        # Best result is in _pos_b/_adds_b (after last swap)
-                        ref_positions_list[idx_local] = copy(_pos_b)
-                        additions_list[idx_local] = copy(_adds_b)
-                    end
-                    if !use_ref
-                        ref_positions_list[idx_local] = T[]
-                        additions_list[idx_local] = T[]
-                    end
-                else
-                    ref_positions_list[idx_local] = T[]
-                    additions_list[idx_local] = T[]
-                end
-                use_ref_vec[idx_local] = use_ref
-                ref_delta_vec[idx_local] = ref_delta_val
-                copy_mode_vec[idx_local] = best_copy_mode
-                add_mode_vec[idx_local] = best_add_mode
-                raw_mode_vec[idx_local] = best_raw_mode
-                if use_ref
-                    ref_index = idx_local - Int(ref_delta_val)
-                    ref_len_list[idx_local] = ref_index >= 1 ? length(all_nl[ref_index]) : 0
-                else
-                    ref_len_list[idx_local] = 0
-                end
-            end
 
             # Write per-cluster ref bitmap and ref deltas
             if params.intra_ref_enabled
@@ -2197,7 +2026,7 @@ function read_stop_delta_list(r::BitReader; encoding::Symbol=:fibonacci, T::Type
     vals = T[]
     prev = zero(T)
     while read_bit(r)  # 1 = more values, 0 = STOP
-        delta = read_encoded_value(r, encoding, T)
+        delta = _cg_read_value(r, encoding, T)
         prev += delta
         push!(vals, prev)
     end
@@ -2213,13 +2042,13 @@ Returns a `Dict{T, Vector{T}}` mapping global vertex ID → sorted outneighbors.
 # Section 1 (cluster membership) parser, shared by decode_level and the CG
 # random-access loader. Reads from r's current position.
 function _read_membership(r::BitReader, params::CGParams, ::Type{T}) where {T<:Unsigned}
-    K = Int(read_encoded_value(r, params.varint, T))
+    K = Int(_cg_read_value(r, params.varint, T))
     clusters = Vector{Vector{T}}(undef, K)
     if params.membership == :implicit_ranges
         # Clusters are contiguous ID ranges: cluster i = offset+1..offset+size_i
         offset = T(0)
         for ci in 1:K
-            sz = Int(read_encoded_value(r, params.varint, T))
+            sz = Int(_cg_read_value(r, params.varint, T))
             clusters[ci] = collect(offset + T(1) : offset + T(sz))
             offset += T(sz)
         end
@@ -2228,8 +2057,8 @@ function _read_membership(r::BitReader, params::CGParams, ::Type{T}) where {T<:U
             if params.membership == :elias_fano
                 clusters[ci] = read_elias_fano(r, T)
             elseif params.membership == :delta
-                len = Int(read_encoded_value(r, params.varint, T))
-                clusters[ci] = read_delta(r, params.gap, T; max_elements=len)
+                len = Int(_cg_read_value(r, params.varint, T))
+                clusters[ci] = _cg_read_delta(r, params.gap, T; max_elements=len)
             else  # :stop
                 clusters[ci] = read_stop_delta_list(r; encoding=params.gap, T=T)
             end
@@ -2244,24 +2073,72 @@ end
     return nothing
 end
 
-function decode_level(r::BitReader, params::CGParams; T::Type{<:Unsigned}=UInt32, directed::Bool=true, coding_scheme::Symbol=:children, ctx_range::Bool=false, resid_bytes::Vector{UInt8}=UInt8[], refdist_bytes::Vector{UInt8}=UInt8[], copy_bytes::Vector{UInt8}=UInt8[],
+include("cg_decode.jl")
+
+_local_values(::Type{I}, values::Vector{I}) where {I<:Integer} = values
+_local_values(::Type{I}, values) where {I<:Integer} = I.(values)
+
+"""
+    decode_level(r, params; T=UInt32, ...)
+
+Decode CG outgoing lists. All acceleration policies are opt-in:
+`compact_lists=false, fused_lr=false, reuse_identity=false,
+sorted_fastpath=false, reuse_scratch=false`. Compact lists use `T` instead of
+Int local IDs. Identity transfer requires matching local/output types; scratch
+reuse applies to the fused LR reader. Enable all five for the validated fast
+path. Tight-gap/non-range formats retain compatible readers. Files and decoded
+neighbors are unchanged; no reference or returned list aliases reusable scratch.
+Entropy sources are call-owned, never installed in process-global selectors.
+
+`parallel_clusters=true` requires independent indexed context-range clusters and
+their structural/entropy offsets. Workers own and reuse their entropy models;
+only completed dictionaries are combined by the caller. K=1 and single-worker
+execution remain serial. This improves multi-cluster throughput, not cold K=1
+query granularity. A shared random-access reader's mutable memo is not thread-safe.
+"""
+function decode_level(r::BitReader, params::CGParams; reuse_identity::Bool=false,
+        sorted_fastpath::Bool=false, reuse_scratch::Bool=false, kw...)
+    _decode_level(r, params, Val((reuse_identity,sorted_fastpath,reuse_scratch)); kw...)
+end
+
+function _decode_level(r::BitReader, params::CGParams, ::Val{Options}; T::Type{<:Unsigned}=UInt32, directed::Bool=true, coding_scheme::Symbol=:children, ctx_range::Bool=false, resid_bytes::Vector{UInt8}=UInt8[], refdist_bytes::Vector{UInt8}=UInt8[], copy_bytes::Vector{UInt8}=UInt8[],
         cg_offsets::Union{Nothing,Vector{Int}}=nothing,
         data_start_bit::Int=0,
         chunk_offsets::Union{Nothing,NTuple{3,Vector{Int}}}=nothing,
         only_cluster::Union{Nothing,Int}=nothing,
-        preparsed_clusters=nothing)
-    Compression._RESID_SOURCE[] = nothing   # clear any leaked global state from a prior call
-    # Chunked (CG-RA) streams: per-cluster decoders are (re)built on byte slices in
-    # the intra loop; whole-blob decoders otherwise.
+        preparsed_clusters=nothing,
+        compact_lists::Bool=false, local_type::Type{I}=(compact_lists ? T : Int), fused_lr::Bool=false,
+        parallel_clusters::Bool=false, decode_workers::Int=Threads.nthreads(:default),
+        decoder_workspace=nothing) where {I<:Integer,Options}
+    reuse_identity, sorted_fastpath, reuse_scratch = Options
+    if parallel_clusters
+        decode_workers > 0 || throw(ArgumentError("decode_workers must be positive"))
+        (directed && ctx_range && coding_scheme == :index && cg_offsets !== nothing &&
+         chunk_offsets !== nothing && !params.intra_mgs && !params.intra_block_try &&
+         (!params.intra_ref_enabled || params.intra_ref_fixwidth)) || throw(ArgumentError(
+            "CG parallel decoding requires indexed, independent context-range cluster streams"))
+    end
+    # Each call owns reusable model arrays and borrows bounded compressed spans.
     ctx_chunked = ctx_range && chunk_offsets !== nothing
-    resid_source   = (ctx_range && !ctx_chunked) ? Compression.CtxRangeDecoder(resid_bytes) : nothing
-    refdist_source = (ctx_range && !ctx_chunked) ? Compression.CtxRangeDecoder(refdist_bytes) : nothing
-    copy_source    = (ctx_range && !ctx_chunked) ? Compression.BinRangeDecoder(copy_bytes) : nothing
+    rc_off, rd_off, cp_off = ctx_chunked ? chunk_offsets : (Int[], Int[], Int[])
+    initial_chunk = ctx_chunked && length(rc_off) > 1 ? (only_cluster === nothing ? 1 : only_cluster) : 0
+    # Bind once before the reset closure captures these values. Assigning them
+    # separately in both branches makes Julia box the captured bindings.
+    resid_source, refdist_source, copy_source = if decoder_workspace === nothing
+        (ctx_range ? Compression._chunk_decoder(Compression.CtxRangeDecoder, resid_bytes, rc_off, initial_chunk) : nothing,
+         ctx_range ? Compression._chunk_decoder(Compression.CtxRangeDecoder, refdist_bytes, rd_off, initial_chunk) : nothing,
+         ctx_range ? Compression._chunk_decoder(Compression.BinRangeDecoder, copy_bytes, cp_off, initial_chunk) : nothing)
+    else
+        ctx_chunked || throw(ArgumentError("decoder_workspace requires chunked range streams"))
+        Compression._reset_chunk_decoder!(decoder_workspace[1], resid_bytes, rc_off, initial_chunk)
+        Compression._reset_chunk_decoder!(decoder_workspace[2], refdist_bytes, rd_off, initial_chunk)
+        Compression._reset_chunk_decoder!(decoder_workspace[3], copy_bytes, cp_off, initial_chunk)
+        decoder_workspace
+    end
     function _setup_cluster_chunk!(ci::Int)
-        rc_off, rd_off, cp_off = chunk_offsets
-        resid_source   = Compression.CtxRangeDecoder(resid_bytes[rc_off[ci] + 1 : rc_off[ci + 1]])
-        refdist_source = Compression.CtxRangeDecoder(refdist_bytes[rd_off[ci] + 1 : rd_off[ci + 1]])
-        copy_source    = Compression.BinRangeDecoder(copy_bytes[cp_off[ci] + 1 : cp_off[ci + 1]])
+        Compression._reset_chunk_decoder!(resid_source, resid_bytes, rc_off, ci)
+        Compression._reset_chunk_decoder!(refdist_source, refdist_bytes, rd_off, ci)
+        Compression._reset_chunk_decoder!(copy_source, copy_bytes, cp_off, ci)
         return nothing
     end
     # ----------------------------------------------------------------
@@ -2269,6 +2146,18 @@ function decode_level(r::BitReader, params::CGParams; T::Type{<:Unsigned}=UInt32
     # ----------------------------------------------------------------
     clusters = preparsed_clusters === nothing ? _read_membership(r, params, T) : preparsed_clusters
     K = length(clusters)
+    # Specialize on the opt-in policies; inactive branches leave the inner loop.
+    identity_output = reuse_identity && K == 1 && I === T &&
+        all(i -> clusters[1][i] == i, eachindex(clusters[1]))
+    lr_lists = (params.intra_intervals || params.intra_greedy_mil) && params.intra_lr_split
+    additions_scratch = reuse_scratch ? T[] : nothing
+    merge_scratch = reuse_scratch ? T[] : nothing
+    if parallel_clusters && only_cluster === nothing && K > 1 &&
+            decode_workers > 1 && Threads.nthreads(:default) > 1
+        return _decode_clusters_parallel(r, params, clusters, T, I, resid_bytes,
+            refdist_bytes, copy_bytes, cg_offsets, data_start_bit,
+            chunk_offsets, fused_lr, decode_workers, Options)
+    end
 
     # Build global neighbor dict
     neighbor_lists = Dict{T, Vector{T}}()
@@ -2286,7 +2175,7 @@ function decode_level(r::BitReader, params::CGParams; T::Type{<:Unsigned}=UInt32
         end
         # Chunked streams: fresh per-cluster decoders (fresh adaptive models),
         # mirroring the encoder's per-cluster finalize+reset.
-        ctx_chunked && _setup_cluster_chunk!(ci)
+        ctx_chunked && ci != initial_chunk && _setup_cluster_chunk!(ci)
         C = clusters[ci]
         s = length(C)
 
@@ -2297,8 +2186,8 @@ function decode_level(r::BitReader, params::CGParams; T::Type{<:Unsigned}=UInt32
                     if read_bit(r)
                         u_global = C[i]
                         v_global = C[j]
-                        push!(get!(neighbor_lists, u_global, T[]), v_global)
-                        push!(get!(neighbor_lists, v_global, T[]), u_global)
+                        push!(get!(() -> T[], neighbor_lists, u_global), v_global)
+                        push!(get!(() -> T[], neighbor_lists, v_global), u_global)
                     end
                 end
             end
@@ -2307,8 +2196,10 @@ function decode_level(r::BitReader, params::CGParams; T::Type{<:Unsigned}=UInt32
             local_neighbors = read_compressed_graph_data(r, T(s), :children, :fibonacci, T)
             for (local_v, nbs) in local_neighbors
                 u_global = C[Int(local_v)]
+                isempty(nbs) && continue
+                dst = get!(() -> T[], neighbor_lists, u_global)
                 for nb in nbs
-                    push!(get!(neighbor_lists, u_global, T[]), C[Int(nb)])
+                    push!(dst, C[Int(nb)])
                 end
             end
         else
@@ -2317,7 +2208,7 @@ function decode_level(r::BitReader, params::CGParams; T::Type{<:Unsigned}=UInt32
             if params.intra_block_try
                 use_block = read_bit(r)
                 if use_block
-                    block_len = Int(read_encoded_value(r, params.varint, T))
+                    block_len = Int(_cg_read_value(r, params.varint, T))
                     # Read block_len bytes and decode as MGS compressed graph
                     block_bytes = Vector{UInt8}(undef, block_len)
                     for bi in 1:block_len
@@ -2328,8 +2219,10 @@ function decode_level(r::BitReader, params::CGParams; T::Type{<:Unsigned}=UInt32
                     local_neighbors = read_compressed_graph_data(block_r, T(s), :children, :fibonacci, T)
                     for (local_v, nbs) in local_neighbors
                         u_global = C[Int(local_v)]
+                        isempty(nbs) && continue
+                        dst = get!(() -> T[], neighbor_lists, u_global)
                         for nb in nbs
-                            push!(get!(neighbor_lists, u_global, T[]), C[Int(nb)])
+                            push!(dst, C[Int(nb)])
                         end
                     end
                     continue  # skip per-vertex path for this cluster
@@ -2355,10 +2248,10 @@ function decode_level(r::BitReader, params::CGParams; T::Type{<:Unsigned}=UInt32
                         if params.intra_ref_rle
                             ref_deltas = read_rle_ones_deltas(r, params.varint, UInt32)
                         else
-                            ndelt = Int(read_encoded_value(r, params.varint, T))
+                            ndelt = Int(_cg_read_value(r, params.varint, T))
                             ref_deltas = UInt32[]
                             for _ in 1:ndelt
-                                push!(ref_deltas, read_encoded_value(r, params.varint, UInt32))
+                                push!(ref_deltas, _cg_read_value(r, params.varint, UInt32))
                             end
                         end
                         di = 1
@@ -2411,35 +2304,35 @@ function decode_level(r::BitReader, params::CGParams; T::Type{<:Unsigned}=UInt32
             end
 
             # Read per-vertex payloads
-            prev_lists = Vector{Vector{Int}}()  # local neighbor lists for reference lookups
+            prev_lists = Vector{Vector{I}}()  # local neighbor lists for reference lookups
             for idx_local in 1:s
-                local nl_local::Vector{Int}
+                local nl_local::Vector{I}
                 _zz_vid = params.intra_zigzag ? T(idx_local) : nothing
 
                 if use_ref_vec[idx_local]
                     # Reference mode: read positions bitmap then additions
                     ref_index = idx_local - Int(ref_delta_vec[idx_local])
-                    ref_list = ref_index >= 1 ? prev_lists[ref_index] : Int[]
+                    ref_list = ref_index >= 1 ? prev_lists[ref_index] : I[]
                     ref_len = length(ref_list)
 
                     # Read copied positions from reference
                     if copy_source !== nothing
                         # CG-2: read ref_len raw bits from the binary range decoder
-                        copied_vals = Int[]
+                        copied_vals = I[]
                         for p in 1:ref_len
                             if Compression.brc_decode_bit!(copy_source); push!(copied_vals, ref_list[p]); end
                         end
                     elseif params.intra_copy_adaptive && params.intra_copy_blocks
                         # Nested mode bits: outer=1 → bitmap; outer=0,inner=0 → copy-blocks;
                         #                   outer=0,inner=1 → complement (skipped positions)
-                        copied_vals = Int[]
+                        copied_vals = I[]
                         if read_bit(r)  # outer=1: bitmap
                             for p in 1:ref_len
                                 if read_bit(r); push!(copied_vals, ref_list[p]); end
                             end
                         else            # outer=0: copy-blocks or complement
                             if read_bit(r)  # inner=1: complement — read skipped positions
-                                local _skip_set = Set{Int}(Int.(collect(_read_copy_blocks(r, params.varint, T))))
+                                local _skip_set = Set{Int}(_local_values(I,collect(_read_copy_blocks(r, params.varint, T))))
                                 for p in 1:ref_len
                                     if p ∉ _skip_set; push!(copied_vals, ref_list[p]); end
                                 end
@@ -2451,7 +2344,7 @@ function decode_level(r::BitReader, params::CGParams; T::Type{<:Unsigned}=UInt32
                         end
                     elseif params.intra_copy_blocks
                         copied_positions = _read_copy_blocks(r, params.varint, T)
-                        copied_vals = Int[]
+                        copied_vals = I[]
                         for p in copied_positions
                             if 1 <= p <= ref_len
                                 push!(copied_vals, ref_list[p])
@@ -2460,7 +2353,7 @@ function decode_level(r::BitReader, params::CGParams; T::Type{<:Unsigned}=UInt32
                     elseif ref_len > 0
                         copied_bitmap = read_bitmap_rle_ones_deltas(r, params.varint, UInt32)
                         # Extract copied positions from ref
-                        copied_vals = Int[]
+                        copied_vals = I[]
                         for (pi, flag) in enumerate(copied_bitmap)
                             if flag && pi <= ref_len
                                 push!(copied_vals, ref_list[pi])
@@ -2468,101 +2361,107 @@ function decode_level(r::BitReader, params::CGParams; T::Type{<:Unsigned}=UInt32
                         end
                     else
                         # Empty ref — read small count of 0
-                        read_small_count(r, params.count_varint, T)
-                        copied_vals = Int[]
+                        _cg_read_small_count(r, params.count_varint, T)
+                        copied_vals = I[]
                     end
 
                     # Copy-aware rank gaps: C = copied ids (cluster-local). Map the
                     # zigzag vertex id into rank space for the read, invert Q -> R after.
+                    # LR raw lists and reference merges are sorted; range-copy
+                    # selection visits the reference in ascending position.
+                    if !(sorted_fastpath && lr_lists && copy_source !== nothing)
+                        sort!(copied_vals)
+                    end
                     _rg_active = resid_source !== nothing && !isempty(copied_vals)
-                    _rg_C = _rg_active ? sort(copied_vals) : Int[]
+                    _rg_C = copied_vals
                     if _rg_active && _zz_vid !== nothing
-                        _zz_vid = T(Compression._rank_of(Int(_zz_vid), _rg_C))
+                        _zz_vid = T(Compression._rank_of(I(_zz_vid), _rg_C))
                     end
 
-                    # Read additions (residual region — gate the range decoder)
+                    # Read additions using this call's explicit range decoder.
                     if resid_source !== nothing
                         Compression.rc_reset_region!(resid_source)
-                        Compression._RESID_SOURCE[] = resid_source
                     end
-                    local additions::Vector{Int}
+                    local additions::Vector{I}
                     if (params.intra_intervals || params.intra_greedy_mil) && params.intra_lr_split
-                        additions = Int.(_read_ir_lr(r, :fibonacci, mil_vec[idx_local], T, _zz_vid; tight_deltas=params.intra_tight_deltas))
+                        additions = _local_values(I,_read_ir_lr(r, :fibonacci, mil_vec[idx_local], T, _zz_vid; tight_deltas=params.intra_tight_deltas, fused=fused_lr, source=resid_source,
+                            buffer=additions_scratch, merge_scratch=merge_scratch))
                     elseif params.intra_intervals || params.intra_greedy_mil
-                        additions = Int.(read_intervals_and_residuals(r, :fibonacci, mil_vec[idx_local], T; vertex_id=_zz_vid))
+                        additions = _local_values(I,_cg_read_intervals(r, :fibonacci, mil_vec[idx_local], T; vertex_id=_zz_vid, source=resid_source))
                     elseif params.additions_mode == :intervals
                         # intervals: runs + singles
-                        n_runs = Int(read_small_count(r, params.count_varint, T))
-                        add_vals = Int[]
+                        n_runs = Int(_cg_read_small_count(r, params.count_varint, T; source=resid_source))
+                        add_vals = I[]
                         for _ in 1:n_runs
-                            st = Int(read_encoded_value(r, params.varint, T))
-                            ln = Int(read_encoded_value(r, params.varint, T))
+                            st = Int(_cg_read_value(r, params.varint, T; source=resid_source))
+                            ln = Int(_cg_read_value(r, params.varint, T; source=resid_source))
                             for k in 0:(ln-1)
                                 push!(add_vals, st + k)
                             end
                         end
-                        n_singles = Int(read_small_count(r, params.count_varint, T))
+                        n_singles = Int(_cg_read_small_count(r, params.count_varint, T; source=resid_source))
                         if n_singles > 0
-                            singles = Int.(read_delta(r, :fibonacci, T; max_elements=n_singles, vertex_id=_zz_vid))
+                            singles = _local_values(I,_cg_read_delta(r, :fibonacci, T; max_elements=n_singles, vertex_id=_zz_vid, source=resid_source))
                             append!(add_vals, singles)
                         end
                         additions = add_vals
                     elseif params.intra_add_adaptive && params.intra_stop_deltas
                         # Adaptive: read mode bit then decode accordingly
                         if read_bit(r)  # true = intervals
-                            additions = Int.(read_intervals_and_residuals(r, :fibonacci, params.intra_adapt_mil, T; vertex_id=_zz_vid))
+                            additions = _local_values(I,_cg_read_intervals(r, :fibonacci, params.intra_adapt_mil, T; vertex_id=_zz_vid, source=resid_source))
                         else            # false = stop-delta
-                            additions = Int.(_read_stop_delta_zigzag(r, :fibonacci, T, _zz_vid))
+                            additions = _local_values(I,_read_stop_delta_zigzag(r, :fibonacci, T, _zz_vid; source=resid_source))
                         end
                     elseif params.intra_stop_deltas
-                        additions = Int.(_read_stop_delta_zigzag(r, :fibonacci, T, _zz_vid))
+                        additions = _local_values(I,_read_stop_delta_zigzag(r, :fibonacci, T, _zz_vid; source=resid_source))
                     else
-                        n_add = Int(read_small_count(r, params.count_varint, T))
+                        n_add = Int(_cg_read_small_count(r, params.count_varint, T; source=resid_source))
                         if n_add > 0
-                            additions = Int.(read_delta(r, :fibonacci, T; max_elements=n_add, vertex_id=_zz_vid))
+                            additions = _local_values(I,_cg_read_delta(r, :fibonacci, T; max_elements=n_add, vertex_id=_zz_vid, source=resid_source))
                         else
-                            additions = Int[]
+                            additions = I[]
                         end
-                    end
-                    if resid_source !== nothing
-                        Compression._RESID_SOURCE[] = nothing
                     end
 
                     # Copy-aware rank gaps: invert Q -> R using C = copied ids.
                     if _rg_active
-                        additions = Compression._rankgap_inverse(additions, _rg_C)
+                        Compression._rankgap_inverse!(additions, _rg_C)
                     end
                     # Combine copied + additions
-                    nl_local = sort(vcat(copied_vals, additions))
+                    # Some legacy addition modes append singles after intervals.
+                    # Every LR reader returns sorted values and rank inversion
+                    # preserves their order. Keep sorting legacy runs+singles.
+                    if !(sorted_fastpath && lr_lists)
+                        sort!(additions)
+                    end
+                    nl_local = Compression._merge_sorted_owned!(copied_vals, additions)
                 else
-                    # Raw mode (residual region — gate the range decoder)
+                    # Raw mode uses the same explicit, call-owned range decoder.
                     if resid_source !== nothing
                         Compression.rc_reset_region!(resid_source)
-                        Compression._RESID_SOURCE[] = resid_source
                     end
                     if (params.intra_intervals || params.intra_greedy_mil) && params.intra_lr_split
-                        nl_local = Int.(_read_ir_lr(r, :fibonacci, mil_vec[idx_local], T, _zz_vid; tight_deltas=params.intra_tight_deltas))
+                        # Raw output is retained: only merge scratch may be reused.
+                        nl_local = _local_values(I,_read_ir_lr(r, :fibonacci, mil_vec[idx_local], T, _zz_vid; tight_deltas=params.intra_tight_deltas, fused=fused_lr, source=resid_source,
+                            merge_scratch=merge_scratch))
                     elseif params.intra_intervals || params.intra_greedy_mil
-                        nl_local = Int.(read_intervals_and_residuals(r, :fibonacci, mil_vec[idx_local], T; vertex_id=_zz_vid))
+                        nl_local = _local_values(I,_cg_read_intervals(r, :fibonacci, mil_vec[idx_local], T; vertex_id=_zz_vid, source=resid_source))
                     elseif params.intra_raw_adaptive && params.intra_stop_deltas
                         # Adaptive: read mode bit then decode accordingly
                         if read_bit(r)  # true = intervals
-                            nl_local = Int.(read_intervals_and_residuals(r, :fibonacci, params.intra_adapt_mil, T; vertex_id=_zz_vid))
+                            nl_local = _local_values(I,_cg_read_intervals(r, :fibonacci, params.intra_adapt_mil, T; vertex_id=_zz_vid, source=resid_source))
                         else            # false = stop-delta
-                            nl_local = Int.(_read_stop_delta_zigzag(r, :fibonacci, T, _zz_vid))
+                            nl_local = _local_values(I,_read_stop_delta_zigzag(r, :fibonacci, T, _zz_vid; source=resid_source))
                         end
                     elseif params.intra_stop_deltas
-                        nl_local = Int.(_read_stop_delta_zigzag(r, :fibonacci, T, _zz_vid))
+                        nl_local = _local_values(I,_read_stop_delta_zigzag(r, :fibonacci, T, _zz_vid; source=resid_source))
                     else
-                        cnt = Int(read_small_count(r, params.count_varint, T))
+                        cnt = Int(_cg_read_small_count(r, params.count_varint, T; source=resid_source))
                         if cnt > 0
-                            nl_local = Int.(read_delta(r, :fibonacci, T; max_elements=cnt, vertex_id=_zz_vid))
+                            nl_local = _local_values(I,_cg_read_delta(r, :fibonacci, T; max_elements=cnt, vertex_id=_zz_vid, source=resid_source))
                         else
-                            nl_local = Int[]
+                            nl_local = I[]
                         end
-                    end
-                    if resid_source !== nothing
-                        Compression._RESID_SOURCE[] = nothing
                     end
                 end
 
@@ -2570,9 +2469,17 @@ function decode_level(r::BitReader, params::CGParams; T::Type{<:Unsigned}=UInt32
 
                 # Map local indices to global vertex IDs
                 u_global = C[idx_local]
+                if identity_output && all(nb -> 1 <= nb <= s, nl_local)
+                    # Ownership belongs to this decode call, not its input. Do
+                    # not mutate until all references have consumed the lists.
+                    isempty(nl_local) || (neighbor_lists[u_global] = nl_local)
+                    continue
+                end
+                dst = nothing
                 for nb_local in nl_local
                     if 1 <= nb_local <= s
-                        push!(get!(neighbor_lists, u_global, T[]), C[nb_local])
+                        dst === nothing && (dst = get!(() -> T[], neighbor_lists, u_global))
+                        push!(dst, C[nb_local])
                     end
                 end
             end
@@ -2599,14 +2506,16 @@ function decode_level(r::BitReader, params::CGParams; T::Type{<:Unsigned}=UInt32
 
             # Read AB group: STOP-terminated list of (u_local, neighbor_list) records
             while read_bit(r)  # 1 = more records, 0 = end of group
-                idxA = Int(read_encoded_value(r, params.varint, T))
+                idxA = Int(_cg_read_value(r, params.varint, T))
                 u_global = A[idxA]
                 # Read STOP-terminated delta list of B-local neighbor indices
                 Ns_local = read_stop_delta_list(r; encoding=params.gap, T=T)
+                dst = nothing
                 for nb_local_T in Ns_local
                     nb_local = Int(nb_local_T)
                     if 1 <= nb_local <= sB
-                        push!(get!(neighbor_lists, u_global, T[]), B[nb_local])
+                        dst === nothing && (dst = get!(() -> T[], neighbor_lists, u_global))
+                        push!(dst, B[nb_local])
                     end
                 end
             end
@@ -2615,8 +2524,12 @@ function decode_level(r::BitReader, params::CGParams; T::Type{<:Unsigned}=UInt32
 
     # Sort and deduplicate all neighbor lists
     for (v, nbs) in neighbor_lists
-        sort!(nbs)
-        unique!(nbs)
+        if sorted_fastpath
+            _cg_sorted_unique!(nbs)
+        else
+            sort!(nbs)
+            unique!(nbs)
+        end
     end
 
     return neighbor_lists

@@ -1,0 +1,43 @@
+{
+  "id": "parallel-full-search-and-cluster-llp-v1",
+  "scope": "BG/CS children-mode core encoding; independent cluster LLP stage",
+  "julia": "1.12.4",
+  "hardware": "AMD Ryzen 7 PRO 4750U, 8 physical cores; one logical CPU per core",
+  "affinity": "0,2,4,6,8,10,12,14",
+  "julia_threads": 8,
+  "worker_sequence": [0, 1, 2, 4, 8, 0],
+  "zero_workers_means": "legacy serial entry path; final serial run checks drift",
+  "encoding": {
+    "coding_scheme": "children",
+    "integer_encoding": "context_range",
+    "cost_model": 0,
+    "exact_costing": false,
+    "search_batch_size": 4096,
+    "lr_split": true,
+    "bg": {"ref_window_size": 64, "multi_ref": true, "copy_blocks": true, "stop_deltas": true, "adaptive_header": false},
+    "cs": {"ref_window_size": 256, "compact_copy": true, "tight_intervals": true},
+    "timing_includes": "sorted-neighbor preparation, FULL cost search, serial emission and file writing",
+    "timing_excludes": "input loading and vertex-width-matched JIT warmup",
+    "validation": "SHA-256 equality across every worker setting, then full adjacency equality"
+  },
+  "llp": {
+    "partition": "fixed Leiden partition, caller seed 53",
+    "llp_mode": "sym",
+    "llp_passes": 3,
+    "sort_clusters": "size_desc",
+    "cluster_seed": 53,
+    "rng_policy": "per-cluster Xoshiro; UInt64 seeds drawn in stable cluster order from MersenneTwister(53)",
+    "legacy_rng_policy_changed_by_default": false,
+    "timing_includes": "cluster construction, induced subgraphs, cluster LLP, concatenation",
+    "timing_excludes": "Leiden partitioning and final graph relabeling",
+    "validation": "order SHA-256 equality across worker settings"
+  },
+  "datasets": {
+    "eat": {"nodes": 7754, "arcs": 247172, "input": "datasets/EAT/EATnew.net", "core": true, "ordering": "native core"},
+    "cnr": {"nodes": 325557, "arcs": 3216152, "input": "research/graph_compression/decode_review/cnr_restarts/inputs/graph.jls", "sha256": "7298f8b397de4a8077540d8ecdb6ef25c3caee563385e019866cc3e580c781bc", "ordering": "verified URL IDs", "core": false}
+  },
+  "runner": "research/graph_compression/parallel_encoding/benchmark.jl",
+  "results": "research/graph_compression/parallel_encoding/results",
+  "protocol": "one warmed run per worker setting; serial brackets; GC enabled and collected before each run; encoding/LLP timings separate",
+  "limitations": ["no 32-core measurement", "no BVGraph/Zuckerli encoding-parity claim", "no CG parallelization", "parallel children search excludes exact-cost trial writers and indexed mode"]
+}

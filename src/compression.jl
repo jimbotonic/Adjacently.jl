@@ -136,6 +136,8 @@ function VertexSearchWorkspace{T}() where {T<:Unsigned}
     )
 end
 
+include("compression/parallel_search.jl")
+
 # Resize dst to match src length and copy contents.
 @inline function _copyto_resize!(dst::Vector{T}, src::Vector{T}) where T
     resize!(dst, length(src))
@@ -3211,7 +3213,12 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         multi_ref::Bool=false,
         adaptive_header::Bool=false,
         cost_model::Int=DEFAULT_COST_MODEL,
-        index_sample_k::Int=0) where {T<:Unsigned}
+        index_sample_k::Int=0,
+        parallel_search::Bool=false,
+        search_workers::Int=Threads.nthreads(:default),
+        search_batch_size::Int=4096) where {T<:Unsigned}
+
+    _check_parallel_search(parallel_search, coding_scheme, exact_costing, search_workers, search_batch_size)
 
     vs = length(keys(neighbor_lists))
     # :context_range routes residual-region integers to a streaming range coder;
@@ -3271,7 +3278,10 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
     _write_encoding_tag(w, get(ENCODING_TAGS, ie, ENC_TAG_FIBONACCI))
 
     # --- Helper: encode one vertex's data into a BitWriter ---
-    function _encode_vertex!(wr, v::T, current_neighbors::Vector{T})
+    function _search_vertex(v, current_neighbors, window, ws)
+        return _greedy_vertex_search(current_neighbors, neighbor_lists, window, ie; vertex_id=v, copy_blocks=copy_blocks, adaptive_copy=adaptive_copy, fixwidth_ref=fixwidth_ref, ref_dist_bits=ref_dist_bits, stop_deltas=stop_deltas, adaptive_deltas=adaptive_deltas, split_residual=split_residual, bv_blocks=bv_blocks, compact_copy=compact_copy, tight_intervals=tight_intervals, buf=gcb, lr_split=lr_split, multi_ref=multi_ref, adaptive_header=adaptive_header, ws=ws, cost_model=cost_model)
+    end
+    function _encode_vertex!(wr, v::T, current_neighbors::Vector{T}, choice=nothing)
         # Empty vertex handling
         if isempty(current_neighbors)
             if !idx_mode || sampled_idx
@@ -3308,7 +3318,8 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         enc_type = :interval
 
         # Greedy search
-        _, actual_ref_mode, mil, ref_result, enc_type, use_stop, res_enc_type, res_mil = _greedy_vertex_search(current_neighbors, neighbor_lists, reference_window, ie; vertex_id=v, copy_blocks=copy_blocks, adaptive_copy=adaptive_copy, fixwidth_ref=fixwidth_ref, ref_dist_bits=ref_dist_bits, stop_deltas=stop_deltas, adaptive_deltas=adaptive_deltas, split_residual=split_residual, bv_blocks=bv_blocks, compact_copy=compact_copy, tight_intervals=tight_intervals, buf=gcb, lr_split=lr_split, multi_ref=multi_ref, adaptive_header=adaptive_header, ws=_ws, cost_model=cost_model)
+        _, actual_ref_mode, mil, ref_result, enc_type, use_stop, res_enc_type, res_mil = choice === nothing ?
+            _search_vertex(v, current_neighbors, reference_window, _ws) : choice
 
         # Write vertex header
         _hb0 = _STREAM_BITS[] === nothing ? 0 : _total_bits(wr)
@@ -3575,10 +3586,17 @@ function write_greedy_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         # Unified Data section. Gate the flag sink for the whole loop (2b).
         flag_sink === nothing || (_FLAG_SINK[] = flag_sink)
         try
-            for v_idx in 1:vs
-                v = T(v_idx)
-                current_neighbors = sort(get(neighbor_lists, v, T[]))
-                _encode_vertex!(w, v, current_neighbors)
+            if parallel_search
+                _parallel_vertex_batches!(_search_vertex,
+                    (v, neighbors, choice) -> _encode_vertex!(w, v, neighbors, choice),
+                    neighbor_lists, vs, ref_window_size;
+                    workers=search_workers, batch_size=search_batch_size)
+            else
+                for v_idx in 1:vs
+                    v = T(v_idx)
+                    current_neighbors = sort(get(neighbor_lists, v, T[]))
+                    _encode_vertex!(w, v, current_neighbors)
+                end
             end
         finally
             _FLAG_SINK[] = nothing
@@ -5152,7 +5170,12 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         tight_intervals::Bool=true,
         lr_split::Bool=false,
         cost_model::Int=DEFAULT_COST_MODEL,
-        index_sample_k::Int=0) where {T<:Unsigned}
+        index_sample_k::Int=0,
+        parallel_search::Bool=false,
+        search_workers::Int=Threads.nthreads(:default),
+        search_batch_size::Int=4096) where {T<:Unsigned}
+
+    _check_parallel_search(parallel_search, coding_scheme, false, search_workers, search_batch_size)
 
     vs = length(keys(neighbor_lists))
     use_ctx_range = integer_encoding == :context_range
@@ -5196,7 +5219,13 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
     _write_encoding_tag(w, get(ENCODING_TAGS, ie, ENC_TAG_FIBONACCI))
 
     # --- Helper: encode one vertex's data into a BitWriter ---
-    function _encode_cs_vertex!(wr, v::T, current_neighbors::Vector{T})
+    function _search_cs_vertex(v, current_neighbors, window, ws)
+        return _cs_vertex_search(current_neighbors, neighbor_lists, window, ie;
+            vertex_id=v, compact_copy=compact_copy, tight_intervals=tight_intervals,
+            lr_split=lr_split, fixwidth_ref=fixwidth_ref, ref_dist_bits=ref_dist_bits,
+            ws=ws, cost_model=cost_model)
+    end
+    function _encode_cs_vertex!(wr, v::T, current_neighbors::Vector{T}, choice=nothing)
         # Empty vertex handling
         if isempty(current_neighbors)
             if !idx_mode || sampled_idx
@@ -5213,11 +5242,8 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         end
 
         # Greedy search with CS headers
-        _, ref_mode, mil, ref_result, enc_type, use_stop = _cs_vertex_search(
-            current_neighbors, neighbor_lists, reference_window, ie;
-            vertex_id=v, compact_copy=compact_copy, tight_intervals=tight_intervals,
-            lr_split=lr_split, fixwidth_ref=fixwidth_ref, ref_dist_bits=ref_dist_bits,
-            ws=_ws, cost_model=cost_model)
+        _, ref_mode, mil, ref_result, enc_type, use_stop = choice === nothing ?
+            _search_cs_vertex(v, current_neighbors, reference_window, _ws) : choice
 
         # Write CS header
         if cmd_sink !== nothing
@@ -5385,10 +5411,17 @@ function write_cmdstream_graph_data(w, neighbor_lists::Dict{T,Vector{T}},
         # loop (stop-delta / RLE flags divert to the binary coder in ctx mode).
         flag_sink === nothing || (_FLAG_SINK[] = flag_sink)
         try
-            for v_idx in 1:vs
-                v = T(v_idx)
-                current_neighbors = sort(get(neighbor_lists, v, T[]))
-                _encode_cs_vertex!(w, v, current_neighbors)
+            if parallel_search
+                _parallel_vertex_batches!(_search_cs_vertex,
+                    (v, neighbors, choice) -> _encode_cs_vertex!(w, v, neighbors, choice),
+                    neighbor_lists, vs, ref_window_size;
+                    workers=search_workers, batch_size=search_batch_size)
+            else
+                for v_idx in 1:vs
+                    v = T(v_idx)
+                    current_neighbors = sort(get(neighbor_lists, v, T[]))
+                    _encode_cs_vertex!(w, v, current_neighbors)
+                end
             end
         finally
             _FLAG_SINK[] = nothing
@@ -6713,6 +6746,7 @@ end
 # -----------------------------------------------------------------------------
 
 # CG (Clustered Greedy)
+include("compression/cg_primitives.jl")
 include("compression/cge.jl")
 using .CG
 export CG
