@@ -156,7 +156,7 @@ function load_graph(spec)
         error("dataset not found (committed?): $path")
     end
     full = spec.loader == :pajek ? load_graph_from_pajek(path) :
-           spec.loader == :csv   ? load_adjacency_list_from_csv(path, ',', true) :
+           spec.loader == :csv   ? load_adjacency_list_from_csv(path, ',', true; preserve_ids=true) :
                                    load_compressed_mgs3_graph(path)
     g = spec.core ? get_core(full)[1] : full
     @info @sprintf("  %s: %dv/%de%s", spec.name, nv(g), ne(g), spec.core ? " (largest SCC)" : "")

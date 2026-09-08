@@ -450,17 +450,18 @@ end
 
 load graph from CSV adjacency list
 """
-function load_adjacency_list_from_csv(filename::AbstractString, separator::AbstractChar=',', use_header::Bool=false)
+function load_adjacency_list_from_csv(filename::AbstractString, separator::AbstractChar=',', use_header::Bool=false; preserve_ids::Bool=false)
 	f = open(filename,"r")
 	oni = Dict{UInt64,UInt64}()
 	edges = Array{Tuple{UInt64,UInt64},1}()
 	counter = convert(UInt64,1)
-	
+	maxid = UInt64(0)
+
 	# Skip header line if use_header is true
 	if use_header
 		readline(f)  # Skip first line (header)
 	end
-	
+
 	while !eof(f)
 		line = strip(readline(f))
 		if !startswith(line, "#") && !isempty(line)
@@ -469,21 +470,29 @@ function load_adjacency_list_from_csv(filename::AbstractString, separator::Abstr
 				v1 = parse(UInt64,edge[1])
 				v2 = parse(UInt64,edge[2])
 
-				if !haskey(oni, v1)
-					oni[v1] = counter
-					counter += convert(UInt64,1)
+				if preserve_ids
+					# Keep the source ids: 0-based id k maps to vertex k+1, so the
+					# vertex numbering (and thus the ordering seen by order-sensitive
+					# encoders) matches the file's ids, e.g. LAW URL-lexicographic order.
+					maxid = max(maxid, v1, v2)
+					push!(edges, (v1 + 1, v2 + 1))
+				else
+					if !haskey(oni, v1)
+						oni[v1] = counter
+						counter += convert(UInt64,1)
+					end
+					if !haskey(oni, v2)
+						oni[v2] = counter
+						counter += convert(UInt64,1)
+					end
+					push!(edges, (oni[v1], oni[v2]))
 				end
-				if !haskey(oni, v2)
-					oni[v2] = counter
-					counter += convert(UInt64,1)
-				end
-				push!(edges, (oni[v1], oni[v2]))
 			end
 		end
 	end
 	close(f)
 
-	gs = length(keys(oni))
+	gs = preserve_ids ? Int(maxid + 1) : length(keys(oni))
 	nbits = convert(UInt8, ceil(log(2, gs)))
 	V = infer_uint_custom_type(nbits)
 
