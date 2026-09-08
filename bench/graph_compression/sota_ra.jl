@@ -107,8 +107,8 @@ const DATASETS = [
         cs=(window=256, lr=false),
         cg=(window=128, intervals=true, lr=true, mil=5, tdd=true)),
     (name="in-2004",      loader=:csv,   file="webgraph/in-2004/in-2004.csv",      core=false, merge=nothing,
-        bg=(window=64,  lr=true, mr=true),
-        cs=(window=256, lr=true),
+        bg=(window=64,  lr=false, mr=true),   # URL-crawl order: lr_split hurts (BG 1.282 vs 1.409 with lr)
+        cs=(window=256, lr=false),
         cg=(window=8,   intervals=true, lr=true, mil=4)),
     (name="enwiki-2013",  loader=:csv,   file="webgraph/enwiki-2013/enwiki-2013.csv", core=false, merge=nothing,
         bg=(window=64,  lr=true, mr=true),
