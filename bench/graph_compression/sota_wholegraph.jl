@@ -252,12 +252,16 @@ end
 # compression (w=16, unbounded reference chains, no practical random access).
 function bv_bpe(g, variant::AbstractString, tmpdir, m)
     isempty(WEBGRAPH_CP) && return NaN
-    txt = joinpath(tmpdir, "bv.graph-txt")
-    isfile(txt) || write_graph_txt(g, txt)
+    # ASCIIGraph.loadOffline reads <srcbase>.graph-txt, so the source arg is the
+    # basename WITHOUT the extension (srcbase), not the destination basename (bp).
+    srcbase = joinpath(tmpdir, "bv")
+    isfile(srcbase * ".graph-txt") || write_graph_txt(g, srcbase * ".graph-txt")
     bp = joinpath(tmpdir, "bv_" * variant)
-    w, maxref = variant == "bv-hc" ? ("16", "-1") : ("7", "3")
+    # BV-HC = unbounded reference chains: WebGraph's CLI takes a large max-ref-count,
+    # not -1 (which it rejects). Integer.MAX_VALUE gives effectively unbounded chains.
+    w, maxref = variant == "bv-hc" ? ("16", "2147483647") : ("7", "3")
     cmd = `java -Xmx8G -cp $WEBGRAPH_CP it.unimi.dsi.webgraph.BVGraph
-           -g it.unimi.dsi.webgraph.ASCIIGraph -w $w -m $maxref $bp $bp`
+           -g it.unimi.dsi.webgraph.ASCIIGraph -w $w -m $maxref $srcbase $bp`
     try
         run(pipeline(cmd, stdout=devnull, stderr=devnull))
     catch e
@@ -301,11 +305,12 @@ function baseline_hint(spec, ordering, seed, g, m)
         println("    (set EXPORT_DIR to have this driver write the <...> input files)")
     if isempty(WEBGRAPH_CP)
         txt = exported(".graph-txt", write_graph_txt)
+        base = replace(txt, r"\.graph-txt$" => "")  # ASCIIGraph source arg is the basename
         println("    # BV-w7 / BV-HC  (bpe = 8 * filesize(.graph) / $m, offsets excluded)")
         println("    java -cp '<webgraph-3.6.12 + deps>' it.unimi.dsi.webgraph.BVGraph \\")
-        println("         -g it.unimi.dsi.webgraph.ASCIIGraph -w 7  -m 3  $txt <out>")
+        println("         -g it.unimi.dsi.webgraph.ASCIIGraph -w 7  -m 3          $base <out>")
         println("    java -cp '<webgraph-3.6.12 + deps>' it.unimi.dsi.webgraph.BVGraph \\")
-        println("         -g it.unimi.dsi.webgraph.ASCIIGraph -w 16 -m -1 $txt <out>")
+        println("         -g it.unimi.dsi.webgraph.ASCIIGraph -w 16 -m 2147483647 $base <out>")
     end
     if isempty(ZUCKERLI_ENCODER)
         csr = exported(".csr", write_zuckerli_csr)

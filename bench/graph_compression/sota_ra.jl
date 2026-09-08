@@ -268,11 +268,13 @@ end
 # BV at w=7, m=3: the random-access-capable variant. .offsets not counted.
 function bv_ra_bpe(g, tmpdir, m)
     isempty(WEBGRAPH_CP) && return NaN
-    txt = joinpath(tmpdir, "bv.graph-txt")
-    isfile(txt) || write_graph_txt(g, txt)
+    # ASCIIGraph.loadOffline reads <srcbase>.graph-txt, so the source arg is the
+    # basename (srcbase), not the destination basename (bp).
+    srcbase = joinpath(tmpdir, "bv")
+    isfile(srcbase * ".graph-txt") || write_graph_txt(g, srcbase * ".graph-txt")
     bp = joinpath(tmpdir, "bv_w7")
     cmd = `java -Xmx8G -cp $WEBGRAPH_CP it.unimi.dsi.webgraph.BVGraph
-           -g it.unimi.dsi.webgraph.ASCIIGraph -w 7 -m 3 $bp $bp`
+           -g it.unimi.dsi.webgraph.ASCIIGraph -w 7 -m 3 $srcbase $bp`
     try
         run(pipeline(cmd, stdout=devnull, stderr=devnull))
     catch e
@@ -311,9 +313,10 @@ function baseline_hint(spec, ordering, seed, g, m)
         println("    (set EXPORT_DIR to have this driver write the <...> input files)")
     if isempty(WEBGRAPH_CP)
         txt = exported(".graph-txt", write_graph_txt)
+        base = replace(txt, r"\.graph-txt$" => "")  # ASCIIGraph source arg is the basename
         println("    # BV-w7, the RA-capable variant (bpe = 8 * filesize(.graph) / $m)")
         println("    java -cp '<webgraph-3.6.12 + deps>' it.unimi.dsi.webgraph.BVGraph \\")
-        println("         -g it.unimi.dsi.webgraph.ASCIIGraph -w 7 -m 3 $txt <out>")
+        println("         -g it.unimi.dsi.webgraph.ASCIIGraph -w 7 -m 3 $base <out>")
     end
     if isempty(ZUCKERLI_ENCODER)
         csr = exported(".csr", write_zuckerli_csr)
