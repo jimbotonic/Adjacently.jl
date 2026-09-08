@@ -1,0 +1,41 @@
+{
+  "id": "nonra-adjacency-loader-v1",
+  "date": "2026-09-08",
+  "api": "Adjacently.MGS.load_adjacency_mgs3_graph",
+  "api_defaults": {
+    "compact_output": false,
+    "compact_lists": false,
+    "fused_lr": false,
+    "reuse_identity": false,
+    "sorted_fastpath": false,
+    "reuse_scratch": false
+  },
+  "recommended": {
+    "bg_cs": {"compact_output": false},
+    "cg": {"compact_output": false, "compact_lists": true, "fused_lr": true,
+      "reuse_identity": true, "sorted_fastpath": true, "reuse_scratch": true},
+    "lower_retained_memory": {"compact_output": true}
+  },
+  "decode_workers": 1,
+  "source_baseline": "d3edc5fb74932b40deccf9c6295a27067a2664bf",
+  "encoding": {"coding_scheme": "children", "backend": "context_range", "cost_model": 0,
+    "parallel_search": false, "search_workers": 1, "search_batch_size": 4096,
+    "bg": {"ref_window_size": 64, "lr_split": true, "multi_ref": true},
+    "cs": {"ref_window_size": 256, "lr_split": true},
+    "cg": {"clusters": 1, "params_file": "cg_speed_v1.json", "params_key": "encoder"}},
+  "parallel_encoding_profile": {"parallel_search": true, "search_workers": 8, "julia_threads": 8},
+  "ordering": {"eat": "native core", "cnr": "verified URL IDs, not first-encounter CSV renumbering"},
+  "cnr_input_sha256": "7298f8b397de4a8077540d8ecdb6ef25c3caee563385e019866cc3e580c781bc",
+  "files_sha256": {
+    "eat_bg": "0c43a76132657aa2a60a7ab54ec7c8332061d7621dd3b1e08065e658cc3ec66c",
+    "eat_cs": "6800c1eabf2d8b2111986ced05485d4a5d23275bf57f0706fe5a240120d96fe2",
+    "eat_cg": "bd4c5fe687f60bff97262527480a73504957795a90c1ad0408611eb44cf35f64",
+    "cnr_bg": "b46c7897e2fb54b5711a3f9bc9af548c32e431a0f199b0f49ceccb3c285feb87",
+    "cnr_cs": "6cc0735d01c23ca9e582a190db31a305a8286e54e81c5628527a8e8f3aaded3c",
+    "cnr_cg": "e4e162518701678a386d0c9c29d8e410461917917f9d78ece9340181ea3279fd"
+  },
+  "measurement": "Warm JIT/page cache, cold decoded state; file opening, full decoding and owned outgoing-list materialization included; GC enabled and collected before each timed operation.",
+  "limitations": ["Preload is not compressed random access", "No streaming or indexed API change",
+    "No encoder or file-format change", "Runtime retained RAM must be reported separately from disk BPE",
+    "Output compaction costs extra loading time; compare within paired runs"]
+}

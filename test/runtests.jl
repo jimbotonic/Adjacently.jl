@@ -18,3 +18,6 @@ end
 module LLPOptionsTests
 include("run_tests_parallel_llp.jl")
 end
+module AdjacencyLoaderTests
+include("run_tests_adjacency_loader.jl")
+end

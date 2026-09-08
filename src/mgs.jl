@@ -373,6 +373,7 @@ export write_mgs3_graph,
        write_compressed_mgs3_graph,
        load_mgs3_graph,
        load_compressed_mgs3_graph,
+       load_adjacency_mgs3_graph,
        write_huffman_compressed_mgs3_graph,
 	   load_huffman_compressed_mgs3_graph,
 	   load_greedy_mgs3_graph,
@@ -1979,5 +1980,7 @@ function _load_indexed_mgs3_graph_fulldecode(filename::AbstractString; kw...)
 
 	return (n=n, m=m, neighbors=_neighbors, algorithm=alg)
 end
+
+include("mgs_adjacency.jl")
 
 end # module MGS

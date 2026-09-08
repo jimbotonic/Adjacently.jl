@@ -19,6 +19,10 @@ default-off flags, recommended worker counts, source pins, and permanent
 exact-output tests. Parallel LLP uses a different seed policy from historical
 shared-RNG runs; re-run and re-record every ordering table it affects.
 
+For non-indexed files, see [NONRA_ADJACENCY.md](NONRA_ADJACENCY.md) for the
+opt-in outgoing-adjacency loader, optional output compaction, and the distinction
+between full-file preprocessing and subsequent decompressed-RAM queries.
+
 ## Table → driver map
 
 | Paper table | Driver | Datasets | Status |
