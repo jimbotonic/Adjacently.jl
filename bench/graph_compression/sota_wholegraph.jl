@@ -116,7 +116,7 @@ const DATASETS = [
     (name="cnr-2000",     loader=:csv,   file="webgraph/cnr-2000/cnr-2000.csv",    core=false, merge=nothing,
         bg=(window=64,  lr=false, mr=true),
         cs=(window=256, lr=false),
-        cg=(window=64,  intervals=true, lr=true, mil=4)),
+        cg=(window=128, intervals=true, lr=true, mil=5, tdd=true)),  # w128/mil5+tight_deltas: 1.910 (CSV order), 1.894 in verified URL order
     (name="in-2004",      loader=:csv,   file="webgraph/in-2004/in-2004.csv",      core=false, merge=nothing,
         bg=(window=64,  lr=true, mr=true),
         cs=(window=256, lr=true),
