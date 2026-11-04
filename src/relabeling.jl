@@ -1062,9 +1062,20 @@ function _auto_merge_threshold(g::AbstractGraph{T}, part; llp_mode, llp_passes, 
 end
 
 """
-    relabel_graph_leiden_llp(g; llp_mode=:sym, llp_passes=5, sort_clusters=:size_desc,
+Default `sort_clusters` for `relabel_graph_leiden_llp`. `:none` keeps clusters in
+order of their first vertex id; set to `:size_desc` to reproduce orderings
+computed before November 2026.
+"""
+const LEIDEN_SORT_CLUSTERS = Ref(:none)
+
+"""
+    relabel_graph_leiden_llp(g; llp_mode=:sym, llp_passes=5, sort_clusters=LEIDEN_SORT_CLUSTERS[],
                              llp_seed=false,
                              merge_clusters=nothing)
+
+`sort_clusters` places the clusters: `:none` (default) in order of their first
+vertex id, `:size_desc` by decreasing size (the pre-2026-11 rule, kept to
+reproduce earlier results).
 
 `merge_clusters` controls the small-cluster merge (see [`merge_small_clusters`]):
 `nothing` (default) keeps the legacy behaviour with no merge; an `Int` uses that
@@ -1087,7 +1098,7 @@ Re-run and re-record every compression/ordering table affected by this policy.
 It is disabled by default; `cluster_seed` also defaults to `nothing`.
 """
 function relabel_graph_leiden_llp(g::AbstractGraph{T}; llp_mode::Symbol=:sym, llp_passes::Int=5,
-                                  sort_clusters::Symbol=:size_desc,
+                                  sort_clusters::Symbol=LEIDEN_SORT_CLUSTERS[],
                                   merge_clusters::Union{Nothing,Integer,Symbol}=nothing,
                                   return_clusters::Bool=false,
                                   llp_seed::Bool=false,
@@ -1095,6 +1106,8 @@ function relabel_graph_leiden_llp(g::AbstractGraph{T}; llp_mode::Symbol=:sym, ll
                                   parallel_clusters::Bool=false,
                                   cluster_seed::Union{Nothing,Integer}=nothing,
                                   cluster_workers::Int=Threads.nthreads(:default)) where {T<:Unsigned}
+    sort_clusters in (:none, :size_desc) ||
+        throw(ArgumentError("sort_clusters must be :none or :size_desc"))
     cluster_workers > 0 || throw(ArgumentError("cluster_workers must be positive"))
     parallel_clusters && cluster_seed === nothing && throw(ArgumentError(
         "parallel_clusters requires an explicit cluster_seed"))

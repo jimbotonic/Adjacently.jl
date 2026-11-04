@@ -79,3 +79,16 @@ end
     @test sort([Int(fa[UInt16(v)]) for v in 1:3])==[1,2,3]
     @test sort([Int(sl[UInt16(v)]) for v in 1:3])==[10,11,12]
 end
+
+@testset "Leiden+LLP cluster order" begin
+    @test R.LEIDEN_SORT_CLUSTERS[]===:none
+    g=fixture_graph()
+    @test_throws ArgumentError R.relabel_graph_leiden_llp(g;sort_clusters=:size)
+    Random.seed!(5); a=R.relabel_graph_leiden_llp(g;llp_passes=2)
+    Random.seed!(5); b=R.relabel_graph_leiden_llp(g;llp_passes=2,sort_clusters=:none)
+    @test a[2]==b[2]
+    # Under :none the cluster holding vertex 1 starts the order.
+    part=[(v-1)÷12+1 for v in 1:120]; part[1:12].=99   # cluster of vertex 1 has the largest label
+    order,_=R._leiden_llp_order(g,part;llp_mode=:sym,llp_passes=2,sort_clusters=:none,cluster_seed=3)
+    @test Set(Int.(order[1:12]))==Set(1:12)
+end
