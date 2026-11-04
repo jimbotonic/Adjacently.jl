@@ -92,3 +92,22 @@ end
     order,_=R._leiden_llp_order(g,part;llp_mode=:sym,llp_passes=2,sort_clusters=:none,cluster_seed=3)
     @test Set(Int.(order[1:12]))==Set(1:12)
 end
+
+@testset "Guarded LLP" begin
+    # BVGraph R=0 row cost: γ(5)+γ(0)+γ(1 interval)+[γ(0)+γ(nat 1)]+ζ₃(nat 10) = 5+1+3+4+8
+    @test R._r0_row_bits(0,[1,2,3,4,10])==21
+    @test R._r0_row_bits(3,Int[])==1
+    g=fixture_graph(); n=Int(nv(g)); ctx=R._R0Ctx(g)
+    b0=R._r0_bytes(ctx,collect(1:n))
+    @test_throws ArgumentError R.relabel_vertices_llp(g;guard=:all)
+    @test_throws ArgumentError R.relabel_vertices_llp(g;group_order=:size_label,guard=:block)
+    Random.seed!(2); a=R.relabel_vertices_llp(g;passes=2)
+    Random.seed!(2); b=R.relabel_vertices_llp(g;passes=2,guard=:none)
+    @test a==b
+    for guard in (:stage,:block), seed in 1:3
+        Random.seed!(seed); m=R.relabel_vertices_llp(g;passes=2,guard=guard)
+        order=zeros(Int,n); for (o,nw) in m; order[Int(nw)]=Int(o); end
+        @test sort(order)==collect(1:n)
+        @test R._r0_bytes(ctx,order)<=b0
+    end
+end

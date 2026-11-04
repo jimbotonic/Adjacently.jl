@@ -260,15 +260,26 @@ then composes the orderings to build a final vertex mapping.
        member in the current order, so each stage is a stable grouping.
        `:size_label` is the pre-2026-11 rule (decreasing size, then label id),
        kept to reproduce earlier results.
+@param guard: `:none` (default), `:stage` or `:block`. A guarded run accepts a
+       stage only if it does not increase the exact BVGraph direct-coding size
+       (W=7, minimum interval 4, ζ₃ residuals, γ offsets, no references) of the
+       out-adjacency, so the result never codes larger than the input order under
+       that coder. `:block` also tries a subset of the stage's classes (the rest
+       become singletons). Requires `group_order=:first_appearance`.
 @returns Dict{T,T}: mapping old_id -> new_id
 """
 function relabel_vertices_llp(g::AbstractGraph{T}, neighbor_mode::Symbol=:sym;
                                passes::Int=5, K::Int=10,
                                return_labels::Bool=false,
                                rng::AbstractRNG=Random.default_rng(),
-                               group_order::Symbol=LLP_GROUP_ORDER[]) where {T<:Unsigned}
+                               group_order::Symbol=LLP_GROUP_ORDER[],
+                               guard::Symbol=:none) where {T<:Unsigned}
     group_order in (:first_appearance, :size_label) ||
         throw(ArgumentError("group_order must be :first_appearance or :size_label"))
+    guard in (:none, :stage, :block) ||
+        throw(ArgumentError("guard must be :none, :stage or :block"))
+    guard !== :none && group_order !== :first_appearance &&
+        throw(ArgumentError("guard requires group_order=:first_appearance"))
     n = Int(nv(g))
     vs = collect(vertices(g))
 
@@ -283,10 +294,16 @@ function relabel_vertices_llp(g::AbstractGraph{T}, neighbor_mode::Symbol=:sym;
     current_order = collect(1:n)  # current_order[position] = vertex_int_id
 
     last_labels = Int[]
+    gctx = guard === :none ? nothing : _R0Ctx(g)
+    gbytes = guard === :none ? 0 : _r0_bytes(gctx, current_order)
     for (gi, gamma) in enumerate(gammas)
         # Run APM label propagation at this gamma
         labels = _apm_label_propagation(g, neighbor_mode, gamma, passes; rng=rng)
         last_labels = labels
+        if guard !== :none
+            current_order, gbytes = _guarded_stage(gctx, current_order, labels, gbytes, guard)
+            continue
+        end
 
         # Group vertices by label, preserving current order; record the order in
         # which labels are first met.
@@ -328,6 +345,119 @@ function relabel_vertices_llp(g::AbstractGraph{T}, neighbor_mode::Symbol=:sym;
     # gamma). It is a genuine partition, unlike the permutation `mapping`, and is
     # what a Leiden seed needs -- see `relabel_graph_leiden_llp(; llp_seed=true)`.
     return return_labels ? (mapping, last_labels) : mapping
+end
+
+# ---- Guarded LLP: exact BVGraph direct (R=0) cost -------------------------
+# Mirrors WebGraph BVGraph.store with window 7, maxRefCount 0, minIntervalLength 4,
+# ζ₃ residuals: per row γ(outdeg) + γ(ref=0) + γ(#intervals) + intervals + residuals.
+
+struct _R0Ctx
+    off::Vector{Int}    # CSR offsets over vertex ids 1..n
+    tgt::Vector{Int}
+end
+function _R0Ctx(g)
+    n = Int(nv(g)); off = zeros(Int, n + 1)
+    for v in 1:n; off[v+1] = off[v] + length(outneighbors(g, v)); end
+    tgt = Vector{Int}(undef, off[end])
+    for v in 1:n; tgt[off[v]+1:off[v+1]] .= Int.(outneighbors(g, v)); end
+    _R0Ctx(off, tgt)
+end
+@inline _bl(x::Int) = 64 - leading_zeros(x)
+@inline _gam(x::Int) = 2 * _bl(x + 1) - 1
+@inline function _zeta3(x::Int)
+    y = x + 1; h = (_bl(y) - 1) ÷ 3
+    4h + 3 + (y >= (2 << (3h)) ? 1 : 0)
+end
+@inline _nat(x::Int) = x >= 0 ? 2x : -2x - 1
+
+function _r0_row_bits(s::Int, t::Vector{Int})
+    d = length(t); d == 0 && return 1
+    bits = _gam(d) + 1
+    nint = 0; ib = 0; rb = 0; prev_end = 0; prev_res = -1; i = 1
+    while i <= d
+        j = i
+        while j < d && t[j+1] == t[j] + 1; j += 1; end
+        len = j - i + 1
+        if len >= 4
+            ib += _gam(len - 4) + (nint == 0 ? _gam(_nat(t[i] - s)) : _gam(t[i] - prev_end - 1))
+            nint += 1; prev_end = t[i] + len
+        else
+            for q in i:j
+                rb += prev_res < 0 ? _zeta3(_nat(t[q] - s)) : _zeta3(t[q] - prev_res - 1)
+                prev_res = t[q]
+            end
+        end
+        i = j + 1
+    end
+    bits + _gam(nint) + ib + rb
+end
+
+"Exact .graph + .offsets bytes of `order` (order[pos] = vertex) under the R=0 coder."
+function _r0_bytes(c::_R0Ctx, order::Vector{Int})
+    n = length(order); pos = Vector{Int}(undef, n)
+    for (p, v) in enumerate(order); pos[v] = p - 1; end
+    gbits = 0; obits = 1; buf = Int[]
+    for (p, v) in enumerate(order)
+        empty!(buf)
+        for k in c.off[v]+1:c.off[v+1]; push!(buf, pos[c.tgt[k]]); end
+        sort!(buf); b = _r0_row_bits(p - 1, buf)
+        gbits += b; obits += _gam(b)
+    end
+    cld(gbits, 8) + cld(obits, 8)
+end
+
+"First-appearance stable grouping of `order` by `lab` (lab indexed by vertex)."
+function _stable_group(order::Vector{Int}, lab::AbstractVector{Int})
+    groups = Dict{Int,Vector{Int}}(); keys_ = Int[]
+    for v in order
+        l = lab[v]; g = get(groups, l, nothing)
+        if g === nothing; groups[l] = [v]; push!(keys_, l) else push!(g, v) end
+    end
+    out = Vector{Int}(undef, length(order)); i = 0
+    for l in keys_, v in groups[l]; i += 1; out[i] = v; end
+    out
+end
+
+# Residual-only gap terms of every row, split by target class: the anchor goes to
+# its target's class, each gap half to each endpoint's class. Summed over classes
+# this is exactly Σ_u f(u), so differences between two orders split Δf exactly.
+function _class_terms!(w::Dict{Int,Float64}, c::_R0Ctx, order::Vector{Int}, lab, sgn)
+    n = length(order); pos = Vector{Int}(undef, n)
+    for (p, v) in enumerate(order); pos[v] = p - 1; end
+    buf = Int[]
+    for v in 1:n
+        c.off[v] == c.off[v+1] && continue
+        empty!(buf)
+        for k in c.off[v]+1:c.off[v+1]; push!(buf, c.tgt[k]); end
+        sort!(buf, by = x -> pos[x])
+        x = buf[1]; w[lab[x]] = get(w, lab[x], 0.0) + sgn * _zeta3(_nat(pos[x] - pos[v]))
+        for q in 2:length(buf)
+            a = buf[q-1]; b = buf[q]; h = sgn * _zeta3(pos[b] - pos[a] - 1) / 2
+            w[lab[a]] = get(w, lab[a], 0.0) + h; w[lab[b]] = get(w, lab[b], 0.0) + h
+        end
+    end
+    w
+end
+
+function _guarded_stage(c::_R0Ctx, cur::Vector{Int}, labels::Vector{Int}, b0::Int, guard::Symbol)
+    sg = _stable_group(cur, labels); b1 = _r0_bytes(c, sg)
+    b1 <= b0 && return sg, b1
+    guard === :stage && return cur, b0
+    n = length(cur); labk = copy(labels)
+    for _ in 1:6
+        sz = Dict{Int,Int}(); for v in 1:n; sz[labk[v]] = get(sz, labk[v], 0) + 1; end
+        w = Dict{Int,Float64}()
+        _class_terms!(w, c, sg, labk, 1.0); _class_terms!(w, c, cur, labk, -1.0)
+        keep = Set(l for (l, k) in sz if k > 1 && get(w, l, 0.0) <= 0)
+        length(keep) == count(>(1), values(sz)) && break
+        fresh = maximum(labk) + 1
+        for v in 1:n
+            if !(labk[v] in keep); labk[v] = fresh; fresh += 1; end
+        end
+        sg = _stable_group(cur, labk); b1 = _r0_bytes(c, sg)
+        b1 < b0 && return sg, b1
+    end
+    cur, b0
 end
 
 """
@@ -937,7 +1067,7 @@ function relabel_vertices_bfs(g::AbstractGraph{T}, start_vertex::Union{Nothing,T
 end
 
 """
-    relabel_graph_llp(g::AbstractGraph{T}; llp_mode::Symbol=:sym, passes::Int=5) where {T<:Unsigned}
+    relabel_graph_llp(g::AbstractGraph{T}; llp_mode::Symbol=:sym, passes::Int=5, guard::Symbol=:none) where {T<:Unsigned}
 
 Apply global LLP reordering to graph `g` and return the relabeled graph and vertex mapping.
 
@@ -946,8 +1076,9 @@ Apply global LLP reordering to graph `g` and return the relabeled graph and vert
 @param passes: number of LLP passes
 @returns (relabeled_graph, vertex_mapping::Dict{T,T})
 """
-function relabel_graph_llp(g::AbstractGraph{T}; llp_mode::Symbol=:sym, passes::Int=5) where {T<:Unsigned}
-    mapping = relabel_vertices_llp(g, llp_mode; passes=passes)
+function relabel_graph_llp(g::AbstractGraph{T}; llp_mode::Symbol=:sym, passes::Int=5,
+                           guard::Symbol=:none) where {T<:Unsigned}
+    mapping = relabel_vertices_llp(g, llp_mode; passes=passes, guard=guard)
     return relabel_graph(g, mapping), mapping
 end
 
