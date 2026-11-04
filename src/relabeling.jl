@@ -238,7 +238,13 @@ function _apm_label_propagation(g::AbstractGraph{T}, neighbor_mode::Symbol,
 end
 
 """
-    relabel_vertices_llp(g::AbstractGraph{T}, neighbor_mode::Symbol=:sym; passes::Int=5, K::Int=10) where {T<:Unsigned}
+Default `group_order` for `relabel_vertices_llp`. Set to `:size_label` to
+reproduce orderings computed before November 2026.
+"""
+const LLP_GROUP_ORDER = Ref(:first_appearance)
+
+"""
+    relabel_vertices_llp(g::AbstractGraph{T}, neighbor_mode::Symbol=:sym; passes::Int=5, K::Int=10, group_order=LLP_GROUP_ORDER[]) where {T<:Unsigned}
 
 Multi-resolution Layered Label Propagation (Boldi et al.). Runs Absolute Potts Model
 label propagation at multiple resolution parameters gamma in {0} ∪ {2^(-i) : i=0,...,K},
@@ -248,12 +254,21 @@ then composes the orderings to build a final vertex mapping.
 @param neighbor_mode: :out (directed out-neighbors) or :sym (union of in/out)
 @param passes: number of label-propagation passes per resolution
 @param K: number of resolution levels (gamma = 2^(-i) for i=0,...,K)
+@param group_order: how label classes are placed at each stage. Within a class
+       vertices always keep their previous relative order.
+       `:first_appearance` (default) places classes in the order of their first
+       member in the current order, so each stage is a stable grouping.
+       `:size_label` is the pre-2026-11 rule (decreasing size, then label id),
+       kept to reproduce earlier results.
 @returns Dict{T,T}: mapping old_id -> new_id
 """
 function relabel_vertices_llp(g::AbstractGraph{T}, neighbor_mode::Symbol=:sym;
                                passes::Int=5, K::Int=10,
                                return_labels::Bool=false,
-                               rng::AbstractRNG=Random.default_rng()) where {T<:Unsigned}
+                               rng::AbstractRNG=Random.default_rng(),
+                               group_order::Symbol=LLP_GROUP_ORDER[]) where {T<:Unsigned}
+    group_order in (:first_appearance, :size_label) ||
+        throw(ArgumentError("group_order must be :first_appearance or :size_label"))
     n = Int(nv(g))
     vs = collect(vertices(g))
 
@@ -273,17 +288,27 @@ function relabel_vertices_llp(g::AbstractGraph{T}, neighbor_mode::Symbol=:sym;
         labels = _apm_label_propagation(g, neighbor_mode, gamma, passes; rng=rng)
         last_labels = labels
 
-        # Group vertices by label, preserving current order
+        # Group vertices by label, preserving current order; record the order in
+        # which labels are first met.
         groups = Dict{Int, Vector{Int}}()
+        group_keys = Int[]
         for pos in 1:n
             vid = current_order[pos]
             lab = labels[vid]
-            push!(get!(groups, lab, Int[]), vid)
+            grp = get(groups, lab, nothing)
+            if grp === nothing
+                groups[lab] = [vid]
+                push!(group_keys, lab)
+            else
+                push!(grp, vid)
+            end
         end
 
-        # Sort group keys by size descending, tie-break by smallest member position
-        group_keys = collect(keys(groups))
-        sort!(group_keys, by = k -> (-length(groups[k]), k))
+        # :first_appearance keeps group_keys as met; :size_label is the legacy
+        # rule (decreasing size, tie-break by label id).
+        if group_order === :size_label
+            sort!(group_keys, by = k -> (-length(groups[k]), k))
+        end
 
         # Compose: within each group, vertices keep their prior relative order
         new_order = Int[]

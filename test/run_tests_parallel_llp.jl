@@ -13,7 +13,10 @@ end
 @testset "Legacy cluster order and RNG consumption preserved" begin
     g=fixture_graph();part=[(v-1)÷12+1 for v in 1:120]
     Random.seed!(391)
-    order,_=R._leiden_llp_order(g,part;llp_mode=:sym,llp_passes=3,sort_clusters=:size_desc)
+    # The frozen fixture predates the first-appearance default.
+    prev=R.LLP_GROUP_ORDER[];R.LLP_GROUP_ORDER[]=:size_label
+    order,_=try R._leiden_llp_order(g,part;llp_mode=:sym,llp_passes=3,sort_clusters=:size_desc)
+    finally R.LLP_GROUP_ORDER[]=prev end
     tail=string.(rand(UInt64,4))
     path=joinpath(@__DIR__,"fixtures/codec_legacy_v1.json")
     @test isfile(path)
@@ -52,4 +55,27 @@ end
         a=R._leiden_llp_order(h,p;llp_mode=:sym,llp_passes=2,sort_clusters=:size_desc,cluster_seed=53)
         @test a==R._leiden_llp_order(h,p;llp_mode=:sym,llp_passes=2,sort_clusters=:size_desc,cluster_seed=53,parallel_clusters=true)
     end
+end
+
+@testset "LLP group order" begin
+    @test R.LLP_GROUP_ORDER[]===:first_appearance
+    g=fixture_graph()
+    for mode in (:sym,:out)
+        a,la=R.relabel_vertices_llp(g,mode;passes=3,return_labels=true,rng=MersenneTwister(7))
+        b,lb=R.relabel_vertices_llp(g,mode;passes=3,return_labels=true,rng=MersenneTwister(7),group_order=:size_label)
+        @test la==lb                      # labels do not depend on the composition rule
+        @test sort(collect(values(a)))==collect(UInt16(1):UInt16(nv(g)))
+        @test sort(collect(values(b)))==collect(UInt16(1):UInt16(nv(g)))
+    end
+    @test_throws ArgumentError R.relabel_vertices_llp(g;group_order=:size)
+    # Two components, the smaller one holding vertex 1: first appearance keeps it
+    # first and contiguous; the legacy rule moves the larger component ahead.
+    h=SimpleDiGraph{UInt16}(12)
+    for (lo,hi) in ((1,3),(4,12)),u in lo:hi,v in lo:hi
+        u!=v && add_edge!(h,UInt16(u),UInt16(v))
+    end
+    fa=R.relabel_vertices_llp(h;passes=3,rng=MersenneTwister(1))
+    sl=R.relabel_vertices_llp(h;passes=3,rng=MersenneTwister(1),group_order=:size_label)
+    @test sort([Int(fa[UInt16(v)]) for v in 1:3])==[1,2,3]
+    @test sort([Int(sl[UInt16(v)]) for v in 1:3])==[10,11,12]
 end
