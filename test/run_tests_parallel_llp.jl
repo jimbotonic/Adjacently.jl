@@ -111,3 +111,53 @@ end
         @test R._r0_bytes(ctx,order)<=b0
     end
 end
+
+@testset "Guarded Leiden+LLP" begin
+    g=fixture_graph(); n=Int(nv(g)); ctx=R._R0Ctx(g)
+    part=[(v-1)÷12+1 for v in 1:n]; part[[3,50,77]].=1
+    # the unguarded composite chain reproduces the per-cluster order, both RNG policies
+    for cs in (nothing,7)
+        Random.seed!(4); a,_=R._leiden_llp_order(g,part;llp_mode=:sym,llp_passes=2,sort_clusters=:none,cluster_seed=cs)
+        Random.seed!(4); b,_=R._leiden_llp_order(g,part;llp_mode=:sym,llp_passes=2,sort_clusters=:none,cluster_seed=cs,guard=:chain)
+        @test a==b
+    end
+    @test_throws ArgumentError R.relabel_graph_leiden_llp(g;guard=:chain)
+    @test_throws ArgumentError R._leiden_llp_order(g,part;llp_mode=:sym,llp_passes=2,sort_clusters=:size_desc,guard=:block)
+    b0=R._r0_bytes(ctx,collect(1:n))
+    for guard in (:stage,:block), seed in 1:3
+        Random.seed!(seed); h,m=R.relabel_graph_leiden_llp(g;llp_passes=2,guard=guard)
+        order=zeros(Int,n); for (o,nw) in m; order[Int(nw)]=Int(o); end
+        @test sort(order)==collect(1:n)
+        @test R._r0_bytes(ctx,order)<=b0
+    end
+end
+
+@testset "Median group order" begin
+    g=fixture_graph(); n=Int(nv(g)); ctx=R._R0Ctx(g)
+    # lab by vertex: class 1 = {5,1,4} at positions 1,2,5 (median 2); class 2 = {2,3} at 3,4 (median 3)
+    @test R._stable_group([5,1,2,3,4],[1,2,2,1,1],:median)==[5,1,4,2,3]
+    # an early outlier leader does not pull its class forward
+    @test R._stable_group([1,2,3,4,5,6],[1,2,2,1,1,1],:median)==[2,3,1,4,5,6]
+    @test_throws ArgumentError R.relabel_vertices_llp(g;group_order=:mean)
+    part=[(v-1)÷12+1 for v in 1:n]; part[[3,50,77]].=1
+    old=R.LLP_GROUP_ORDER[]
+    try
+        R.LLP_GROUP_ORDER[]=:median
+        for cs in (nothing,7)
+            Random.seed!(4); a,_=R._leiden_llp_order(g,part;llp_mode=:sym,llp_passes=2,sort_clusters=:median,cluster_seed=cs)
+            Random.seed!(4); b,_=R._leiden_llp_order(g,part;llp_mode=:sym,llp_passes=2,sort_clusters=:median,cluster_seed=cs,guard=:chain)
+            @test a==b
+        end
+        b0=R._r0_bytes(ctx,collect(1:n))
+        for seed in 1:3
+            Random.seed!(seed); m=R.relabel_vertices_llp(g;passes=2,guard=:block)
+            order=zeros(Int,n); for (o,nw) in m; order[Int(nw)]=Int(o); end
+            @test R._r0_bytes(ctx,order)<=b0
+            Random.seed!(seed); _,m2=R.relabel_graph_leiden_llp(g;llp_passes=2,sort_clusters=:median,guard=:block)
+            order=zeros(Int,n); for (o,nw) in m2; order[Int(nw)]=Int(o); end
+            @test sort(order)==collect(1:n) && R._r0_bytes(ctx,order)<=b0
+        end
+    finally
+        R.LLP_GROUP_ORDER[]=old
+    end
+end

@@ -259,13 +259,14 @@ then composes the orderings to build a final vertex mapping.
        `:first_appearance` (default) places classes in the order of their first
        member in the current order, so each stage is a stable grouping.
        `:size_label` is the pre-2026-11 rule (decreasing size, then label id),
-       kept to reproduce earlier results.
+       kept to reproduce earlier results. `:median` places classes by the
+       position of their lower-median member (ties by first appearance).
 @param guard: `:none` (default), `:stage` or `:block`. A guarded run accepts a
        stage only if it does not increase the exact BVGraph direct-coding size
        (W=7, minimum interval 4, ζ₃ residuals, γ offsets, no references) of the
        out-adjacency, so the result never codes larger than the input order under
        that coder. `:block` also tries a subset of the stage's classes (the rest
-       become singletons). Requires `group_order=:first_appearance`.
+       become singletons). Uses the same `group_order`, which must not be `:size_label`.
 @returns Dict{T,T}: mapping old_id -> new_id
 """
 function relabel_vertices_llp(g::AbstractGraph{T}, neighbor_mode::Symbol=:sym;
@@ -274,12 +275,12 @@ function relabel_vertices_llp(g::AbstractGraph{T}, neighbor_mode::Symbol=:sym;
                                rng::AbstractRNG=Random.default_rng(),
                                group_order::Symbol=LLP_GROUP_ORDER[],
                                guard::Symbol=:none) where {T<:Unsigned}
-    group_order in (:first_appearance, :size_label) ||
-        throw(ArgumentError("group_order must be :first_appearance or :size_label"))
+    group_order in (:first_appearance, :size_label, :median) ||
+        throw(ArgumentError("group_order must be :first_appearance, :size_label or :median"))
     guard in (:none, :stage, :block) ||
         throw(ArgumentError("guard must be :none, :stage or :block"))
-    guard !== :none && group_order !== :first_appearance &&
-        throw(ArgumentError("guard requires group_order=:first_appearance"))
+    guard !== :none && group_order === :size_label &&
+        throw(ArgumentError("guard requires group_order=:first_appearance or :median"))
     n = Int(nv(g))
     vs = collect(vertices(g))
 
@@ -301,7 +302,11 @@ function relabel_vertices_llp(g::AbstractGraph{T}, neighbor_mode::Symbol=:sym;
         labels = _apm_label_propagation(g, neighbor_mode, gamma, passes; rng=rng)
         last_labels = labels
         if guard !== :none
-            current_order, gbytes = _guarded_stage(gctx, current_order, labels, gbytes, guard)
+            current_order, gbytes = _guarded_stage(gctx, current_order, labels, gbytes, guard, group_order)
+            continue
+        end
+        if group_order === :median
+            current_order = _stable_group(current_order, labels, :median)
             continue
         end
 
@@ -406,12 +411,19 @@ function _r0_bytes(c::_R0Ctx, order::Vector{Int})
     cld(gbits, 8) + cld(obits, 8)
 end
 
-"First-appearance stable grouping of `order` by `lab` (lab indexed by vertex)."
-function _stable_group(order::Vector{Int}, lab::AbstractVector{Int})
+"""Stable grouping of `order` by `lab` (lab indexed by vertex). Classes are placed by
+the position of their first member (`:first_appearance`) or of their lower-median
+member (`:median`, ties by first appearance)."""
+function _stable_group(order::Vector{Int}, lab::AbstractVector{Int}, rule::Symbol=:first_appearance)
     groups = Dict{Int,Vector{Int}}(); keys_ = Int[]
     for v in order
         l = lab[v]; g = get(groups, l, nothing)
         if g === nothing; groups[l] = [v]; push!(keys_, l) else push!(g, v) end
+    end
+    if rule === :median
+        pos = Dict{Int,Int}(); for (p, v) in enumerate(order); pos[v] = p; end
+        med = Dict(l => pos[groups[l][(length(groups[l]) - 1) ÷ 2 + 1]] for l in keys_)
+        sort!(keys_, by = l -> med[l])   # stable: ties keep first-appearance order
     end
     out = Vector{Int}(undef, length(order)); i = 0
     for l in keys_, v in groups[l]; i += 1; out[i] = v; end
@@ -439,8 +451,18 @@ function _class_terms!(w::Dict{Int,Float64}, c::_R0Ctx, order::Vector{Int}, lab,
     w
 end
 
-function _guarded_stage(c::_R0Ctx, cur::Vector{Int}, labels::Vector{Int}, b0::Int, guard::Symbol)
-    sg = _stable_group(cur, labels); b1 = _r0_bytes(c, sg)
+"APM labels of every LLP stage (same RNG use as `relabel_vertices_llp`)."
+function _llp_stage_labels(g, mode::Symbol; passes::Int, K::Int=10, rng::AbstractRNG)
+    gammas = [0.0; [2.0^(-i) for i in 0:K]]
+    [_apm_label_propagation(g, mode, gm, passes; rng=rng) for gm in gammas]
+end
+
+# `guard=:chain` (internal) accepts every stage: the unguarded composite chain,
+# which reproduces the per-cluster Leiden+LLP order exactly.
+function _guarded_stage(c::Union{Nothing,_R0Ctx}, cur::Vector{Int}, labels::Vector{Int}, b0::Int,
+                        guard::Symbol, rule::Symbol=:first_appearance)
+    guard === :chain && return _stable_group(cur, labels, rule), 0
+    sg = _stable_group(cur, labels, rule); b1 = _r0_bytes(c, sg)
     b1 <= b0 && return sg, b1
     guard === :stage && return cur, b0
     n = length(cur); labk = copy(labels)
@@ -454,7 +476,7 @@ function _guarded_stage(c::_R0Ctx, cur::Vector{Int}, labels::Vector{Int}, b0::In
         for v in 1:n
             if !(labk[v] in keep); labk[v] = fresh; fresh += 1; end
         end
-        sg = _stable_group(cur, labk); b1 = _r0_bytes(c, sg)
+        sg = _stable_group(cur, labk, rule); b1 = _r0_bytes(c, sg)
         b1 < b0 && return sg, b1
     end
     cur, b0
@@ -1120,10 +1142,13 @@ end
 function _leiden_llp_order(g::AbstractGraph{T}, part; llp_mode, llp_passes, sort_clusters,
                            parallel_clusters::Bool=false,
                            cluster_seed::Union{Nothing,Integer}=nothing,
-                           cluster_workers::Int=Threads.nthreads(:default)) where {T<:Unsigned}
+                           cluster_workers::Int=Threads.nthreads(:default),
+                           guard::Symbol=:none) where {T<:Unsigned}
     cluster_workers > 0 || throw(ArgumentError("cluster_workers must be positive"))
     parallel_clusters && cluster_seed === nothing && throw(ArgumentError(
         "parallel_clusters requires cluster_seed; use the same seed in serial mode for identical results"))
+    guard !== :none && sort_clusters === :size_desc &&
+        throw(ArgumentError("guard requires sort_clusters=:none or :median"))
     label_to_idx = Dict{Int,Int}()
     fine_clusters = Vector{Vector{T}}()
     for v in vertices(g)
@@ -1136,10 +1161,18 @@ function _leiden_llp_order(g::AbstractGraph{T}, part; llp_mode, llp_passes, sort
     end
     if sort_clusters == :size_desc
         sort!(fine_clusters, by=length, rev=true)
+    elseif sort_clusters == :median   # members are in increasing vertex id
+        sort!(fine_clusters, by = C -> C[(length(C) - 1) ÷ 2 + 1])
     end
     # Seeds depend on the stable cluster order, never thread IDs or scheduling.
     # Legacy mode consumes the calling task's RNG exactly as before.
     seeds = cluster_seed === nothing ? nothing : rand(MersenneTwister(cluster_seed), UInt64, length(fine_clusters))
+    if guard !== :none
+        return _leiden_llp_guarded(g, fine_clusters, seeds; llp_mode, llp_passes, guard,
+                                   parallel_clusters, cluster_workers,
+                                   cluster_rule = sort_clusters === :median ? :median : :first_appearance,
+                                   stage_rule = LLP_GROUP_ORDER[])
+    end
     function order_cluster!(i)
         C = fine_clusters[i]
         if length(C) <= 2
@@ -1170,6 +1203,47 @@ function _leiden_llp_order(g::AbstractGraph{T}, part; llp_mode, llp_passes, sort
     sizehint!(new_order, nv(g))
     for C in fine_clusters; append!(new_order, C); end
     return new_order, length(fine_clusters)
+end
+
+# Guarded Leiden+LLP as one global chain of stable groupings: stage 0 groups the
+# input order by cluster (first appearance), stage k by the composite label
+# (cluster, APM label of LLP stage k on the cluster subgraph). Accepting every
+# stage reproduces the per-cluster order; the guard accepts a stage, or a subset
+# of its classes, only if the exact BVGraph R=0 size does not increase.
+function _leiden_llp_guarded(g::AbstractGraph{T}, fine_clusters, seeds; llp_mode, llp_passes,
+                             guard, parallel_clusters, cluster_workers,
+                             cluster_rule::Symbol=:first_appearance,
+                             stage_rule::Symbol=:first_appearance) where {T<:Unsigned}
+    stage_rule === :size_label && throw(ArgumentError("guard requires LLP_GROUP_ORDER[] ≠ :size_label"))
+    n = Int(nv(g)); S = 12; base = n + 1
+    cl = zeros(Int, n); for (i, C) in enumerate(fine_clusters), v in C; cl[Int(v)] = i * base; end
+    gl = [copy(cl) for _ in 1:S]
+    function labels_cluster!(i)
+        C = fine_clusters[i]; length(C) <= 2 && return nothing
+        sg, oni, _ = subgraph(g, C)
+        rng = seeds === nothing ? Random.default_rng() : Xoshiro(seeds[i])
+        labs = _llp_stage_labels(sg, llp_mode; passes=llp_passes, rng=rng)
+        for k in 1:S, v in C; gl[k][Int(v)] = i * base + labs[k][Int(oni[v])]; end
+        return nothing
+    end
+    if parallel_clusters && Threads.nthreads(:default) > 1 && length(fine_clusters) > 1
+        next = Threads.Atomic{Int}(1)
+        @sync for _ in 1:min(cluster_workers, Threads.nthreads(:default), length(fine_clusters))
+            Threads.@spawn while true
+                i = Threads.atomic_add!(next, 1); i > length(fine_clusters) && break
+                labels_cluster!(i)
+            end
+        end
+    else
+        foreach(labels_cluster!, eachindex(fine_clusters))
+    end
+    ctx = guard === :chain ? nothing : _R0Ctx(g)
+    cur = collect(1:n); b = guard === :chain ? 0 : _r0_bytes(ctx, cur)
+    cur, b = _guarded_stage(ctx, cur, cl, b, guard, cluster_rule)
+    for labs in gl
+        cur, b = _guarded_stage(ctx, cur, labs, b, guard, stage_rule)
+    end
+    return T.(cur), length(fine_clusters)
 end
 
 # Pick the small-cluster-merge threshold that minimises the cheap delta-encoding
@@ -1205,8 +1279,14 @@ const LEIDEN_SORT_CLUSTERS = Ref(:none)
                              merge_clusters=nothing)
 
 `sort_clusters` places the clusters: `:none` (default) in order of their first
-vertex id, `:size_desc` by decreasing size (the pre-2026-11 rule, kept to
-reproduce earlier results).
+vertex id, `:median` by their lower-median vertex id, `:size_desc` by decreasing
+size (the pre-2026-11 rule, kept to reproduce earlier results).
+
+`guard=:stage` or `:block` runs the ordering as one chain of stable groupings
+(cluster grouping, then each LLP stage refined within clusters) and accepts a stage,
+or a subset of its classes, only if the exact BVGraph direct-coding size does not
+increase (see `relabel_vertices_llp`). Clusters may then end up non-contiguous.
+Requires `sort_clusters` other than `:size_desc`. Default `:none` leaves the order unchanged.
 
 `merge_clusters` controls the small-cluster merge (see [`merge_small_clusters`]):
 `nothing` (default) keeps the legacy behaviour with no merge; an `Int` uses that
@@ -1236,9 +1316,12 @@ function relabel_graph_leiden_llp(g::AbstractGraph{T}; llp_mode::Symbol=:sym, ll
                                   llp_seed_passes::Int=llp_passes,
                                   parallel_clusters::Bool=false,
                                   cluster_seed::Union{Nothing,Integer}=nothing,
-                                  cluster_workers::Int=Threads.nthreads(:default)) where {T<:Unsigned}
-    sort_clusters in (:none, :size_desc) ||
-        throw(ArgumentError("sort_clusters must be :none or :size_desc"))
+                                  cluster_workers::Int=Threads.nthreads(:default),
+                                  guard::Symbol=:none) where {T<:Unsigned}
+    sort_clusters in (:none, :size_desc, :median) ||
+        throw(ArgumentError("sort_clusters must be :none, :size_desc or :median"))
+    guard in (:none, :stage, :block) ||
+        throw(ArgumentError("guard must be :none, :stage or :block"))
     cluster_workers > 0 || throw(ArgumentError("cluster_workers must be positive"))
     parallel_clusters && cluster_seed === nothing && throw(ArgumentError(
         "parallel_clusters requires an explicit cluster_seed"))
@@ -1276,7 +1359,7 @@ function relabel_graph_leiden_llp(g::AbstractGraph{T}; llp_mode::Symbol=:sym, ll
 
     # Step 3: per-cluster LLP ordering
     new_order, n_clusters = _leiden_llp_order(g, part; llp_mode, llp_passes, sort_clusters,
-        parallel_clusters, cluster_seed, cluster_workers)
+        parallel_clusters, cluster_seed, cluster_workers, guard)
     szc = Dict{Int,Int}(); for l in part; szc[l] = get(szc, l, 0) + 1; end
     top_sizes = sort(collect(values(szc)), rev=true)[1:min(5, n_clusters)]
     @info "Leiden+LLP: $n_clusters clusters, largest: $top_sizes"
