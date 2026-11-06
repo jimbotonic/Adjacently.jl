@@ -1239,7 +1239,11 @@ function _leiden_llp_guarded(g::AbstractGraph{T}, fine_clusters, seeds; llp_mode
     end
     ctx = guard === :chain ? nothing : _R0Ctx(g)
     cur = collect(1:n); b = guard === :chain ? 0 : _r0_bytes(ctx, cur)
-    cur, b = _guarded_stage(ctx, cur, cl, b, guard, cluster_rule)
+    if LEIDEN_LLP_KEEP_CLUSTERS[]   # always accept the cluster grouping: clusters stay contiguous
+        cur = _stable_group(cur, cl, cluster_rule); guard === :chain || (b = _r0_bytes(ctx, cur))
+    else
+        cur, b = _guarded_stage(ctx, cur, cl, b, guard, cluster_rule)
+    end
     for labs in gl
         cur, b = _guarded_stage(ctx, cur, labs, b, guard, stage_rule)
     end
@@ -1274,6 +1278,18 @@ computed before November 2026.
 const LEIDEN_SORT_CLUSTERS = Ref(:none)
 
 """
+Default `guard` for `relabel_graph_leiden_llp` (`:none`, `:stage` or `:block`).
+"""
+const LEIDEN_LLP_GUARD = Ref(:none)
+
+"""
+If `true`, guarded Leiden+LLP always accepts the cluster grouping and guards only the LLP
+stages. LLP stages refine within clusters, so every cluster then stays one contiguous
+range, as cluster-chunked encoders (CG with `return_clusters=true`) need.
+"""
+const LEIDEN_LLP_KEEP_CLUSTERS = Ref(false)
+
+"""
     relabel_graph_leiden_llp(g; llp_mode=:sym, llp_passes=5, sort_clusters=LEIDEN_SORT_CLUSTERS[],
                              llp_seed=false,
                              merge_clusters=nothing)
@@ -1286,7 +1302,8 @@ size (the pre-2026-11 rule, kept to reproduce earlier results).
 (cluster grouping, then each LLP stage refined within clusters) and accepts a stage,
 or a subset of its classes, only if the exact BVGraph direct-coding size does not
 increase (see `relabel_vertices_llp`). Clusters may then end up non-contiguous.
-Requires `sort_clusters` other than `:size_desc`. Default `:none` leaves the order unchanged.
+Requires `sort_clusters` other than `:size_desc`. Default `LEIDEN_LLP_GUARD[]` (`:none`)
+leaves the order unchanged.
 
 `merge_clusters` controls the small-cluster merge (see [`merge_small_clusters`]):
 `nothing` (default) keeps the legacy behaviour with no merge; an `Int` uses that
@@ -1317,7 +1334,7 @@ function relabel_graph_leiden_llp(g::AbstractGraph{T}; llp_mode::Symbol=:sym, ll
                                   parallel_clusters::Bool=false,
                                   cluster_seed::Union{Nothing,Integer}=nothing,
                                   cluster_workers::Int=Threads.nthreads(:default),
-                                  guard::Symbol=:none) where {T<:Unsigned}
+                                  guard::Symbol=LEIDEN_LLP_GUARD[]) where {T<:Unsigned}
     sort_clusters in (:none, :size_desc, :median) ||
         throw(ArgumentError("sort_clusters must be :none, :size_desc or :median"))
     guard in (:none, :stage, :block) ||
