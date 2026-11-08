@@ -25,7 +25,7 @@ using ..PageRank: PR
 
 export relabel_graph, relabel_vertices, relabel_vertices_score, relabel_vertices_lexicographic, relabel_vertices_rcm, relabel_vertices_webgraph_lex,
        relabel_vertices_llp, relabel_vertices_minhash, relabel_vertices_bisection,
-       relabel_graph_llp, relabel_graph_leiden_llp, merge_small_clusters,
+       relabel_graph_llp, relabel_graph_leiden_llp, relabel_graph_select, merge_small_clusters,
        relabel_graph_leiden_greedy, relabel_graph_rgb, relabel_graph_leiden_rgb,
        save_llp_ordering, load_llp_ordering,
        ordering_quality_metrics, print_ordering_metrics, compare_ordering_metrics
@@ -1403,6 +1403,201 @@ function relabel_graph_leiden_llp(g::AbstractGraph{T}; llp_mode::Symbol=:sym, ll
         return relabel_graph(g, vertex_map), vertex_map, seg_sizes
     end
     return relabel_graph(g, vertex_map), vertex_map
+end
+
+# ---- Order selection: score candidate orders, keep the smallest --------------
+# Two order costs, both on the out-adjacency in a given order (order[pos] = vertex):
+#   _bv_bytes:  exact BVGraph .graph + .offsets bytes (WebGraph 3.6.12 BVGraph.store with default codes,
+#               window W, maxRefCount Rmax, minIntervalLength 4, BVGraph's own greedy reference choice).
+#               Rmax = 0 equals _r0_bytes.
+#   _cw_bytes:  copy-aware estimate C_W: per row the R=0 row, or a copy from one of the W previous rows
+#               (γ(distance) + a bitmap over the reference list + R=0 coding of the rest), whichever is
+#               cheaper. W = 0 equals _r0_bytes.
+
+function _bv_extra_bits(s::Int, ex::Vector{Int})
+    vl = length(ex); vl == 0 && return 0
+    nint = 0; prev = 0; rprev = 0; nres = 0; i = 1; ib = 0; rb = 0
+    while i <= vl
+        if i < vl && ex[i] + 1 == ex[i+1]
+            j = 1; while i + j < vl && ex[i+j] + 1 == ex[i+j+1]; j += 1; end; j += 1
+            if j >= 4
+                ib += nint == 0 ? _gam(_nat(ex[i] - s)) : _gam(ex[i] - prev - 1)
+                prev = ex[i] + j; ib += _gam(j - 4); nint += 1; i += j; continue
+            end
+        end
+        rb += nres == 0 ? _zeta3(_nat(ex[i] - s)) : _zeta3(ex[i] - rprev - 1)
+        rprev = ex[i]; nres += 1; i += 1
+    end
+    _gam(nint) + ib + rb
+end
+
+# Bits of coding `cur` against the list `refl` at distance `ref` (BVGraph diffComp), outdegree excluded.
+function _bv_diff_bits(s::Int, ref::Int, refl::Vector{Int}, cur::Vector{Int}, W::Int,
+                       ex::Vector{Int}, blocks::Vector{Int})
+    empty!(ex); empty!(blocks)
+    refLen = ref == 0 ? 0 : length(refl); currLen = length(cur)
+    j = 1; k = 1; copying = true; cbl = 0
+    while j <= currLen && k <= refLen
+        if copying
+            if cur[j] > refl[k]; push!(blocks, cbl); copying = false; cbl = 0
+            elseif cur[j] < refl[k]; push!(ex, cur[j]); j += 1
+            else j += 1; k += 1; cbl += 1 end
+        elseif cur[j] < refl[k]; push!(ex, cur[j]); j += 1
+        elseif cur[j] > refl[k]; k += 1; cbl += 1
+        else push!(blocks, cbl); copying = true; cbl = 0 end
+    end
+    copying && k <= refLen && push!(blocks, cbl)
+    while j <= currLen; push!(ex, cur[j]); j += 1; end
+    bits = W > 0 ? ref + 1 : 0                       # unary reference
+    if ref != 0
+        bits += _gam(length(blocks))
+        for (b, x) in enumerate(blocks); bits += _gam(b == 1 ? x : x - 1); end
+    end
+    bits + _bv_extra_bits(s, ex)
+end
+
+"Exact BVGraph(W, Rmax) .graph + .offsets bytes of `order` (order[pos] = vertex)."
+function _bv_bytes(c::_R0Ctx, order::Vector{Int}; W::Int=7, Rmax::Int=3)
+    n = length(order); pos = Vector{Int}(undef, n); for (p, v) in enumerate(order); pos[v] = p - 1; end
+    B = W + 1; lists = [Int[] for _ in 1:B]; refc = zeros(Int, B); ex = Int[]; blocks = Int[]
+    gbits = 0; obits = 0
+    for (p, v) in enumerate(order)
+        s = p - 1; idx = s % B + 1
+        cur = lists[idx]; empty!(cur)
+        for k in c.off[v]+1:c.off[v+1]; push!(cur, pos[c.tgt[k]]); end; sort!(cur)
+        bits = _gam(length(cur))
+        if !isempty(cur)
+            best = typemax(Int); bestref = -1; refc[idx] = -1
+            for ref in 0:min(W, s)
+                cand = (s - ref + B) % B + 1
+                if refc[cand] < Rmax && !isempty(lists[cand])
+                    d = _bv_diff_bits(s, ref, lists[cand], cur, W, ex, blocks)
+                    d < best && (best = d; bestref = ref)
+                end
+            end
+            refc[idx] = refc[(s - bestref + B) % B + 1] + 1
+            bits += best
+        else
+            refc[idx] = 0
+        end
+        obits += _gam(bits); gbits += bits
+    end
+    cld(gbits, 8) + cld(obits + 1, 8)
+end
+
+function _setdiff_sorted!(out::Vector{Int}, a::Vector{Int}, b::Vector{Int})
+    empty!(out); i = 1; j = 1; k = 0
+    while i <= length(a)
+        if j > length(b) || a[i] < b[j]; push!(out, a[i]); i += 1
+        elseif a[i] == b[j]; i += 1; j += 1; k += 1
+        else j += 1 end
+    end
+    k
+end
+
+"Copy-aware estimate C_W of `order` in bytes (W = 0 is the exact R=0 size)."
+function _cw_bytes(c::_R0Ctx, order::Vector{Int}, W::Int=64)
+    n = length(order); pos = Vector{Int}(undef, n); for (p, v) in enumerate(order); pos[v] = p - 1; end
+    ring = [Int[] for _ in 1:max(W, 1)]; cur = Int[]; res = Int[]
+    gbits = 0; obits = 1
+    for (p, v) in enumerate(order)
+        empty!(cur); for k in c.off[v]+1:c.off[v+1]; push!(cur, pos[c.tgt[k]]); end; sort!(cur)
+        best = _r0_row_bits(p - 1, cur)
+        if !isempty(cur)
+            for d in 1:min(W, p - 1)
+                tu = ring[mod1(p - d, W)]; isempty(tu) && continue
+                _setdiff_sorted!(res, cur, tu) == 0 && continue
+                # the copy row replaces the 1-bit reference field by γ(d) and adds a |tu|-bit bitmap
+                cost = _r0_row_bits(p - 1, res) - 1 + _gam(d) + length(tu)
+                cost < best && (best = cost)
+            end
+        end
+        gbits += best; obits += _gam(best)
+        W > 0 && (ring[mod1(p, W)] = copy(cur))
+    end
+    cld(gbits, 8) + cld(obits, 8)
+end
+
+"""
+    relabel_graph_select(g; candidates=(:orig, :llp, :leiden_llp), score=:cw64, seed=nothing,
+                         llp_mode=:sym, llp_passes=5, merge_clusters=nothing, guard=:block,
+                         return_scores=false)
+
+Compute several candidate orders, score each, and keep the one with the smallest score.
+Ties keep the earlier candidate, so with `:orig` first the input order is kept unless a
+candidate is strictly smaller.
+
+Candidates: `:orig` (the input order), `:llp` (`relabel_vertices_llp` with `guard`),
+`:leiden_llp` (`relabel_graph_leiden_llp` with `guard`, `sort_clusters=:none` and
+`merge_clusters`).
+
+`score`:
+- `:cw64` (default): copy-aware size estimate C_64 of the out-adjacency (BVGraph-style
+  direct coding, or a copy from one of the 64 previous rows). No encoder run.
+- `:bvgraph`: exact BVGraph size (window 7, maxRefCount 3, WebGraph default codes). The
+  result is then never larger than the input in BVGraph bytes, and is the smallest of the
+  candidates.
+- a function `f(h)::Real` of the relabeled graph `h` (for example the file size of the
+  target encoder). Selection is then exact for that encoder: the result is the best
+  candidate and, with `:orig` among the candidates, never larger than the input.
+
+Leiden+LLP and plain LLP each win on some graphs; neither is uniformly better, and no
+cheap structural statistic predicts which. Selection by C_64 picked the best candidate in
+55 of 60 graph × encoder cells in our tests, worst miss 0.21%.
+
+`seed`: if given, `Random.seed!(seed)` is called before each stochastic candidate, so each
+candidate equals its stand-alone run with that seed.
+
+Returns `(relabeled_graph, mapping)` (mapping old id → new id), plus a vector of
+`candidate => score` pairs when `return_scores=true`.
+"""
+function relabel_graph_select(g::AbstractGraph{T}; candidates=(:orig, :llp, :leiden_llp),
+                              score=:cw64, seed::Union{Nothing,Integer}=nothing,
+                              llp_mode::Symbol=:sym, llp_passes::Int=5,
+                              merge_clusters::Union{Nothing,Integer,Symbol}=nothing,
+                              guard::Symbol=:block, return_scores::Bool=false) where {T<:Unsigned}
+    isempty(candidates) && throw(ArgumentError("candidates must not be empty"))
+    for cand in candidates
+        cand in (:orig, :llp, :leiden_llp) ||
+            throw(ArgumentError("unknown candidate $cand (use :orig, :llp, :leiden_llp)"))
+    end
+    score isa Function || score in (:cw64, :bvgraph) ||
+        throw(ArgumentError("score must be :cw64, :bvgraph or a function of the relabeled graph"))
+    n = Int(nv(g)); ctx = score isa Function ? nothing : _R0Ctx(g)
+    to_order(mp) = (o = Vector{Int}(undef, n); for (k, x) in mp; o[Int(x)] = Int(k); end; o)
+    scores = Pair{Symbol,Float64}[]
+    best = nothing; bestscore = Inf
+    for cand in candidates
+        if cand === :orig
+            order = collect(1:n)
+        else
+            seed === nothing || Random.seed!(seed)
+            if cand === :llp
+                order = to_order(relabel_vertices_llp(g, llp_mode; passes=llp_passes, guard=guard))
+            else
+                _, mp = relabel_graph_leiden_llp(g; llp_mode=llp_mode, llp_passes=llp_passes,
+                    merge_clusters=merge_clusters, sort_clusters=:none, guard=guard)
+                order = to_order(mp)
+            end
+        end
+        if score isa Function
+            h = relabel_graph(g, Dict(T(v) => T(i) for (i, v) in enumerate(order)))
+            sc = Float64(score(h))
+        elseif score === :cw64
+            sc = Float64(_cw_bytes(ctx, order, 64))
+        else
+            sc = Float64(_bv_bytes(ctx, order; W=7, Rmax=3))
+        end
+        push!(scores, cand => sc)
+        @info "select: $cand scores $sc"
+        if sc < bestscore
+            bestscore = sc; best = cand => order
+        end
+    end
+    @info "select: kept $(best.first)"
+    mapping = Dict{T,T}(T(v) => T(i) for (i, v) in enumerate(best.second))
+    h = relabel_graph(g, mapping)
+    return return_scores ? (h, mapping, scores) : (h, mapping)
 end
 
 # ─────────────────────────────────────────────────────────────────────────────

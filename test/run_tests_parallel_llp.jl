@@ -161,3 +161,36 @@ end
         R.LLP_GROUP_ORDER[]=old
     end
 end
+
+@testset "Order costs and selection" begin
+    g=fixture_graph(); n=Int(nv(g)); ctx=R._R0Ctx(g)
+    id=collect(1:n); sh=shuffle(Xoshiro(1),collect(1:n))
+    # exact BVGraph sizes, checked against WebGraph 3.6.12 (.graph + .offsets bytes)
+    @test [R._bv_bytes(ctx,o;W=w,Rmax=r) for o in (id,sh) for (w,r) in ((7,3),(3,1),(7,0))]==[489,491,498,665,665,669]
+    for o in (id,sh)
+        @test R._bv_bytes(ctx,o;Rmax=0)==R._r0_bytes(ctx,o)
+        @test R._cw_bytes(ctx,o,0)==R._r0_bytes(ctx,o)
+        @test R._cw_bytes(ctx,o,64)<=R._r0_bytes(ctx,o)
+    end
+    @test_throws ArgumentError R.relabel_graph_select(g;candidates=(:bfs,))
+    @test_throws ArgumentError R.relabel_graph_select(g;score=:zuckerli)
+    for score in (:cw64,:bvgraph)
+        cost(o)=score===:cw64 ? R._cw_bytes(ctx,o,64) : R._bv_bytes(ctx,o)
+        h,m,sc=R.relabel_graph_select(g;llp_passes=2,seed=3,score=score,return_scores=true)
+        order=zeros(Int,n); for (o,nw) in m; order[Int(nw)]=Int(o); end
+        @test sort(order)==id && ne(h)==ne(g)
+        @test [first(p) for p in sc]==[:orig,:llp,:leiden_llp]
+        @test cost(order)==minimum(last.(sc)) && cost(order)<=cost(id)
+        # each candidate equals its stand-alone seeded run
+        Random.seed!(3); ml=R.relabel_vertices_llp(g,:sym;passes=2,guard=:block)
+        ol=zeros(Int,n); for (o,nw) in ml; ol[Int(nw)]=Int(o); end
+        @test last(sc[2])==cost(ol)
+    end
+    # a user score: exact selection for that score, ties keep the earlier candidate
+    h,m,sc=R.relabel_graph_select(g;llp_passes=2,seed=3,score=x->0,return_scores=true)
+    @test all(Int(m[UInt16(v)])==v for v in 1:n)
+    h,m,sc=R.relabel_graph_select(g;llp_passes=2,seed=3,candidates=(:llp,:leiden_llp),
+        score=x->R._r0_bytes(R._R0Ctx(x),collect(1:n)),return_scores=true)
+    order=zeros(Int,n); for (o,nw) in m; order[Int(nw)]=Int(o); end
+    @test R._r0_bytes(ctx,order)==minimum(last.(sc))
+end
