@@ -1,7 +1,8 @@
 """
     load_adjacency_mgs3_graph(filename; compact_output=false,
         compact_lists=false, fused_lr=false, reuse_identity=false,
-        sorted_fastpath=false, reuse_scratch=false)
+        sorted_fastpath=false, reuse_scratch=false, optimize_decode=false,
+        parallel_reconstruct=false, decode_workers=Threads.nthreads(:default))
 
 Decode a directed, non-indexed BG/CS/CG file into `Vector{Vector{T}}`, indexed
 by the file's 1-based vertex IDs. Lists are sorted, unique and independently
@@ -17,6 +18,21 @@ at the cost of additional allocation and loading time. This differs from
 CG decoder switches have the same meaning as in `load_compressed_mgs3_graph`
 and are rejected for BG/CS. All switches default to false.
 
+`optimize_decode=true` enables dense output, call-owned scratch and guarded
+normalization removal. For CG it also enables the five existing decoder
+switches above, falling back internally when the identity K=1 LR invariant
+does not hold. BG/CS acceleration requires non-indexed LR context-range;
+other supported files use the legacy decoder.
+
+`parallel_reconstruct=true` is an experimental, higher-memory two-pass
+decoder for CS LR context-range or CG identity K=1 implicit-range LR
+context-range files. It parses entropy streams serially, then reconstructs
+reference trees with at most `decode_workers` tasks. Unsupported options
+throw an ArgumentError. This is distinct from indexed CG parallel-cluster
+decoding and does not enable random access. Staging requires O(vertices +
+arcs) extra memory (about 41–45 MB on the measured CNR files). More workers
+do not parallelize entropy parsing. File bytes and BPE are unchanged.
+
 Supported: children-mode Fibonacci v3.2 and context-range files (BG/CS v3.3,
 CG v3.2), with parameterized or default algorithm headers and any CG cluster
 count. An `implicit_ranges` file retains only contiguous cluster membership,
@@ -25,13 +41,18 @@ undirected graphs, other backends and a zero-vertex
 universe are explicitly rejected. Use `load_compressed_mgs3_graph` for those
 formats. The codec's existing trusted-input assumptions still apply; this is
 not a validator for untrusted compressed payloads.
-Concurrent top-level decode calls retain the underlying codecs' restrictions
-on shared entropy-source hooks; this API does not add thread safety.
+The accelerated BG/CS LR path and staged CS/CG paths use call-owned entropy
+sources. Other paths retain their underlying shared-hook restrictions;
+enabling this option is not a general thread-safety guarantee for all formats.
 """
 function load_adjacency_mgs3_graph(filename::AbstractString;
         compact_output::Bool=false, compact_lists::Bool=false,
         fused_lr::Bool=false, reuse_identity::Bool=false,
-        sorted_fastpath::Bool=false, reuse_scratch::Bool=false)
+        sorted_fastpath::Bool=false, reuse_scratch::Bool=false,
+        optimize_decode::Bool=false, parallel_reconstruct::Bool=false,
+        decode_workers::Int=Threads.nthreads(:default))
+    parallel_reconstruct && decode_workers < 1 &&
+        throw(ArgumentError("decode_workers must be positive"))
     open(filename, "r") do io
         h = read(io, 12)
         length(h) == 12 || throw(EOFError())
@@ -89,28 +110,56 @@ function load_adjacency_mgs3_graph(filename::AbstractString;
         end
         r = BitReader(structural)
         kw = (; ctx_range=ctx, resid_bytes=resid, refdist_bytes=rd, copy_bytes=cp)
+        if parallel_reconstruct
+            (ctx && alg in (:cs, :cg)) ||
+                throw(ArgumentError("Parallel reconstruction requires CS/CG context-range"))
+            f = (; n, T, alg, p, structural, rd, cp, resid, cmd, flag)
+            rows = _nonra_parallel_adjacency(f, decode_workers)
+            return _own_mgs3_adjacency(rows, n, compact_output, true)
+        end
+        fast_bgcs = optimize_decode && alg != :cg && ctx && p.lr_split
         rows = if alg == :cg
             decode_level(r, p; T=T, directed=true, coding_scheme=:children, kw...,
-                compact_lists=compact_lists, fused_lr=fused_lr, reuse_identity=reuse_identity,
-                sorted_fastpath=sorted_fastpath, reuse_scratch=reuse_scratch)
+                compact_lists=compact_lists || optimize_decode, fused_lr=fused_lr || optimize_decode,
+                reuse_identity=reuse_identity || optimize_decode,
+                sorted_fastpath=sorted_fastpath || optimize_decode,
+                reuse_scratch=reuse_scratch || optimize_decode,
+                skip_normalize=optimize_decode, direct_output=optimize_decode)
         else
             decoder = alg == :bg ? read_greedy_graph_data : read_cmdstream_graph_data
             decoder(r, T(n), :children, T; integer_encoding=backend, p..., kw...,
-                cmd_bytes=cmd, flag_bytes=flag)
+                cmd_bytes=cmd, flag_bytes=flag, optimize_decode=fast_bgcs)
         end
-        _own_mgs3_adjacency(rows, n, compact_output)
+        _own_mgs3_adjacency(rows, n, compact_output,
+            fast_bgcs || (alg == :cg && optimize_decode))
     end
 end
 
 # Function barrier keeps the per-vertex loop specialized on the decoded ID type.
 # Ownership transfers only after decoding has consumed all back-references.
-function _own_mgs3_adjacency(rows::Dict{T,Vector{T}}, n::Int, compact::Bool) where T
+function _own_mgs3_adjacency(rows::Dict{T,Vector{T}}, n::Int, compact::Bool, normalized::Bool=false) where T
     adj = Vector{Vector{T}}(undef, n)
     for v in 1:n
         ns = get(rows, T(v), nothing)
         list = ns === nothing ? T[] : ns
-        Compression.CG._cg_sorted_unique!(list)
+        normalized || Compression.CG._cg_sorted_unique!(list)
         adj[v] = compact ? copy(list) : list
     end
     return adj
 end
+
+function _own_mgs3_adjacency(rows::Vector{Vector{T}}, n::Int, compact::Bool, normalized::Bool=false) where T
+    length(rows) == n || throw(ArgumentError("Wrong output universe"))
+    if !normalized
+        for list in rows; Compression.CG._cg_sorted_unique!(list); end
+    end
+    compact ? copy.(rows) : rows
+end
+
+function _own_mgs3_adjacency(rows::Compression._PrefixLists{T}, n::Int,
+        compact::Bool, normalized::Bool=false) where T
+    rows.first_vertex == 1 || throw(ArgumentError("Incomplete output universe"))
+    _own_mgs3_adjacency(rows.lists, n, compact, normalized)
+end
+
+include("mgs_nonra_parallel.jl")

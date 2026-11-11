@@ -32,6 +32,8 @@ using ..Compression: write_encoded_value, write_delta, write_truncated_binary_co
 
 export CGParams, CGStats, encode_level, decode_level, load_cg_graph
 
+include("cg_cost_scan.jl")
+
 """
     CGStats
 
@@ -105,6 +107,10 @@ end
                  intra_block_try::Bool=false)
 
 Parameters for CG encoding.
+- optimize_costs: runtime-only, default false. Use allocation-free complement
+  and LR cost scans, direct candidate ranges, and skip empty K=1 inter
+  preparation. Costs, candidate order/ties, and encoded bytes are unchanged;
+  FULL remains FULL. This flag is not stored in the file header.
 - L: cluster size threshold for bit-matrix vs list encoding
 - varint: integer encoding used for sizes/lengths (positive only)
 - count_varint: encoding for counts that may be zero (default :golomb supports zero)
@@ -148,6 +154,7 @@ Base.@kwdef struct CGParams
     intra_lr_split::Bool = false       # Left/right residual split: split residuals at vertex_id after interval extraction
     intra_tight_deltas::Bool = false  # Skip +1 shift on delta gaps in LR residuals (gaps are always ≥ 1 for sorted unique lists)
     cost_model::Int = Compression.DEFAULT_COST_MODEL  # 0=full analytical, 1=fast (skip interval/LR, pure delta cost)
+    optimize_costs::Bool = false  # Runtime-only exact cost scans; no format or tie-order change.
     index_sample_k::Int = 0  # Two-level sampled offsets: 0=full, >0=sample every k-th vertex (must be multiple of 4)
 end
 
@@ -955,7 +962,8 @@ end
 CG-specific analytical cost of `_write_ir_lr` (intervals + LR-split residuals).
 """
 function _estimate_ir_lr_cost(neighbors::Vector{T}, encoding::Symbol, mil::Int,
-                               vertex_id; tight_deltas::Bool=false)::Int where {T<:Unsigned}
+                               vertex_id; tight_deltas::Bool=false, optimize::Bool=false)::Int where {T<:Unsigned}
+    optimize && return _estimate_ir_lr_scan(neighbors,encoding,mil,vertex_id;tight_deltas)
     if vertex_id === nothing || isempty(neighbors)
         return estimate_interval_runlength_encoding_cost(neighbors, encoding, mil, 3; vertex_id=vertex_id)
     end
@@ -1063,7 +1071,7 @@ function _estimate_raw_cost_analytical(nl::Vector{T}, params::CGParams,
     end
 
     if params.intra_intervals && params.intra_lr_split
-        raw_bits = _estimate_ir_lr_cost(nl, :fibonacci, params.intra_mil, _zz_vid; tight_deltas=params.intra_tight_deltas)
+        raw_bits = _estimate_ir_lr_cost(nl, :fibonacci, params.intra_mil, _zz_vid; tight_deltas=params.intra_tight_deltas, optimize=params.optimize_costs)
     elseif params.intra_intervals
         raw_bits = estimate_interval_runlength_encoding_cost(nl, :fibonacci, params.intra_mil, 3; vertex_id=_zz_vid)
     elseif params.intra_stop_deltas
@@ -1158,7 +1166,9 @@ function _evaluate_candidate_analytical(positions::Vector{T}, adds::Vector{T},
         bm_bits = ref_len
         # Complement cost
         n_skipped = ref_len - length(positions)
-        if n_skipped > 0
+        if params.optimize_costs
+            cc_bits = _estimate_complement_blocks_cost(positions, ref_len, params.varint)
+        elseif n_skipped > 0
             # Build complement inline for cost estimation
             skipped = Vector{T}(undef, n_skipped)
             si = 0; pi = 1
@@ -1202,7 +1212,7 @@ function _evaluate_candidate_analytical(positions::Vector{T}, adds::Vector{T},
     local add_bits::Int
     local add_use_intervals::Bool = false
     if params.intra_intervals && params.intra_lr_split
-        add_bits = _estimate_ir_lr_cost(adds, :fibonacci, params.intra_mil, _zz_vid; tight_deltas=params.intra_tight_deltas)
+        add_bits = _estimate_ir_lr_cost(adds, :fibonacci, params.intra_mil, _zz_vid; tight_deltas=params.intra_tight_deltas, optimize=params.optimize_costs)
     elseif params.intra_intervals
         add_bits = estimate_interval_runlength_encoding_cost(adds, :fibonacci, params.intra_mil, 3; vertex_id=_zz_vid)
     elseif params.intra_add_adaptive && params.intra_stop_deltas
@@ -1275,7 +1285,7 @@ function _evaluate_candidate_greedy_analytical(positions::Vector{T}, adds::Vecto
     best_mil = mil_options[1]
     for mil in mil_options
         if params.intra_lr_split
-            add_bits = _estimate_ir_lr_cost(adds, :fibonacci, mil, _zz_vid; tight_deltas=params.intra_tight_deltas)
+            add_bits = _estimate_ir_lr_cost(adds, :fibonacci, mil, _zz_vid; tight_deltas=params.intra_tight_deltas, optimize=params.optimize_costs)
         else
             add_bits = estimate_interval_runlength_encoding_cost(adds, :fibonacci, mil, 3; vertex_id=_zz_vid)
         end
@@ -1912,7 +1922,7 @@ end
     mclusters = length(clusters)
     # Precompute local index maps for all clusters
     local_index_by_cluster = Vector{Dict{T,Int}}(undef, mclusters)
-    for ci in 1:mclusters
+    for ci in (params.optimize_costs && mclusters == 1 ? (1:0) : (1:mclusters))
         C = clusters[ci]
         li = Dict{T,Int}()
         for (i,u) in enumerate(C)
@@ -1923,7 +1933,7 @@ end
 
     # Build mapping from (ia,ib) -> neighbors_in_B dict: u_in_A => [B-local neighbors]
     pair_map = Dict{Tuple{Int,Int}, Dict{T,Vector{Int}}}()
-    for u_int in 1:n
+    for u_int in (params.optimize_costs && mclusters == 1 ? (1:0) : (1:n))
         ia = cluster_of[u_int]
         # Skip vertices not in any cluster (shouldn't happen)
         ia == 0 && continue
@@ -2090,6 +2100,13 @@ path. Tight-gap/non-range formats retain compatible readers. Files and decoded
 neighbors are unchanged; no reference or returned list aliases reusable scratch.
 Entropy sources are call-owned, never installed in process-global selectors.
 
+`skip_normalize=false` and `direct_output=false` additionally enable guarded
+identity K=1 children/context-range LR cleanup. They require the matching
+identity/type invariant and fall back otherwise. `direct_output` returns a
+vector instead of a dictionary only on that guarded path. Prefer
+`MGS.load_adjacency_mgs3_graph(...; optimize_decode=true)` for a stable vector
+return type across supported formats.
+
 `parallel_clusters=true` requires independent indexed context-range clusters and
 their structural/entropy offsets. Workers own and reuse their entropy models;
 only completed dictionaries are combined by the caller. K=1 and single-worker
@@ -2097,8 +2114,9 @@ execution remain serial. This improves multi-cluster throughput, not cold K=1
 query granularity. A shared random-access reader's mutable memo is not thread-safe.
 """
 function decode_level(r::BitReader, params::CGParams; reuse_identity::Bool=false,
-        sorted_fastpath::Bool=false, reuse_scratch::Bool=false, kw...)
-    _decode_level(r, params, Val((reuse_identity,sorted_fastpath,reuse_scratch)); kw...)
+        sorted_fastpath::Bool=false, reuse_scratch::Bool=false,
+        skip_normalize::Bool=false, direct_output::Bool=false, kw...)
+    _decode_level(r, params, Val((reuse_identity,sorted_fastpath,reuse_scratch,skip_normalize,direct_output)); kw...)
 end
 
 function _decode_level(r::BitReader, params::CGParams, ::Val{Options}; T::Type{<:Unsigned}=UInt32, directed::Bool=true, coding_scheme::Symbol=:children, ctx_range::Bool=false, resid_bytes::Vector{UInt8}=UInt8[], refdist_bytes::Vector{UInt8}=UInt8[], copy_bytes::Vector{UInt8}=UInt8[],
@@ -2110,7 +2128,7 @@ function _decode_level(r::BitReader, params::CGParams, ::Val{Options}; T::Type{<
         compact_lists::Bool=false, local_type::Type{I}=(compact_lists ? T : Int), fused_lr::Bool=false,
         parallel_clusters::Bool=false, decode_workers::Int=Threads.nthreads(:default),
         decoder_workspace=nothing) where {I<:Integer,Options}
-    reuse_identity, sorted_fastpath, reuse_scratch = Options
+    reuse_identity, sorted_fastpath, reuse_scratch, skip_normalize, direct_output = Options
     if parallel_clusters
         decode_workers > 0 || throw(ArgumentError("decode_workers must be positive"))
         (directed && ctx_range && coding_scheme == :index && cg_offsets !== nothing &&
@@ -2150,6 +2168,14 @@ function _decode_level(r::BitReader, params::CGParams, ::Val{Options}; T::Type{<
     identity_output = reuse_identity && K == 1 && I === T &&
         all(i -> clusters[1][i] == i, eachindex(clusters[1]))
     lr_lists = (params.intra_intervals || params.intra_greedy_mil) && params.intra_lr_split
+    # Narrow trusted-input invariant: raw LR lists are sorted and unique;
+    # positional copying preserves order; rank inversion makes additions disjoint
+    # from copied IDs. Their merge stays unique. Identity adds no permutation.
+    clean_identity = identity_output && directed && ctx_range && lr_lists &&
+        coding_scheme == :children && !params.intra_mgs && !params.intra_block_try &&
+        only_cluster === nothing && !parallel_clusters
+    skip_final = skip_normalize && clean_identity
+    vector_output = direct_output && clean_identity
     additions_scratch = reuse_scratch ? T[] : nothing
     merge_scratch = reuse_scratch ? T[] : nothing
     if parallel_clusters && only_cluster === nothing && K > 1 &&
@@ -2160,7 +2186,7 @@ function _decode_level(r::BitReader, params::CGParams, ::Val{Options}; T::Type{<
     end
 
     # Build global neighbor dict
-    neighbor_lists = Dict{T, Vector{T}}()
+    neighbor_lists = vector_output ? Vector{Vector{T}}(undef,length(clusters[1])) : Dict{T, Vector{T}}()
 
     # ----------------------------------------------------------------
     # Section 2: Read intra-cluster edges
@@ -2472,9 +2498,14 @@ function _decode_level(r::BitReader, params::CGParams, ::Val{Options}; T::Type{<
                 if identity_output && all(nb -> 1 <= nb <= s, nl_local)
                     # Ownership belongs to this decode call, not its input. Do
                     # not mutate until all references have consumed the lists.
-                    isempty(nl_local) || (neighbor_lists[u_global] = nl_local)
+                    if vector_output
+                        neighbor_lists[Int(u_global)] = nl_local
+                    else
+                        isempty(nl_local) || (neighbor_lists[u_global] = nl_local)
+                    end
                     continue
                 end
+                vector_output && throw(ArgumentError("Invalid local ID in direct output"))
                 dst = nothing
                 for nb_local in nl_local
                     if 1 <= nb_local <= s
@@ -2498,6 +2529,7 @@ function _decode_level(r::BitReader, params::CGParams, ::Val{Options}; T::Type{<
         A = clusters[ia]
         # Read STOP-terminated delta list of target cluster indices
         Bs = read_stop_delta_list(r; encoding=params.gap, T=T)
+        (vector_output || skip_final) && !isempty(Bs) && throw(ArgumentError("Identity K=1 fast path requires empty inter section"))
 
         for ib_T in Bs
             ib = Int(ib_T)
@@ -2523,7 +2555,7 @@ function _decode_level(r::BitReader, params::CGParams, ::Val{Options}; T::Type{<
     end
 
     # Sort and deduplicate all neighbor lists
-    for (v, nbs) in neighbor_lists
+    for nbs in (skip_final ? () : values(neighbor_lists))
         if sorted_fastpath
             _cg_sorted_unique!(nbs)
         else

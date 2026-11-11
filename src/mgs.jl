@@ -29,7 +29,8 @@ using ..Compression: huffman_encoding, get_huffman_codes!, decode_huffman_values
 	write_golomb, read_golomb, write_fibonacci, read_fibonacci,
 	write_zeta, read_zeta, write_compressed_graph_data, read_compressed_graph_data,
 	write_greedy_graph_data, read_greedy_graph_data, parse_bg_ctxrange_index,
-	write_cmdstream_graph_data, read_cmdstream_graph_data,
+	write_cmdstream_graph_data, read_cmdstream_graph_data, IndexedRangeState,
+	_recycle_indexed_state!,
 	COST_MODEL_FULL, COST_MODEL_FAST, DEFAULT_COST_MODEL
 
 using ..Compression.CG: encode_level, decode_level, CGParams, CGStats, _read_membership
@@ -863,6 +864,18 @@ end
 
 Write graph in MGS v3 format with BG (Baseline greedy) compression.
 Produces a `.mgz` file with v3.1 header (params encoded in byte2).
+
+`chunk_local_refs=true` restricts references to the current sampled context-range
+chunk. This optional encoding policy trades compression for bounded access work;
+it changes no file syntax and old readers can decode the result. Default: false.
+
+`parallel_search=true` parallelizes FULL/FAST cost search in children mode only,
+then emits decisions sequentially in bounded batches. `search_workers` defaults
+to the Julia default thread-pool size; `search_batch_size` defaults to 4096.
+Launch Julia with `--threads=N`. Bytes and decision tie-breaking match serial
+encoding. Indexed mode and `exact_costing=true` trial writes are not supported
+by this opt-in path. Concurrent top-level encoder calls remain unsupported
+because emission uses shared stream hooks.
 """
 function write_bg_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString;
 		coding_scheme::Symbol=:children, integer_encoding::Symbol=:fibonacci,
@@ -872,11 +885,13 @@ function write_bg_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString;
 		multi_ref::Bool=false,
 		adaptive_header::Bool=false,
 		cost_model::Int=DEFAULT_COST_MODEL,
-		index_sample_k::Int=0,
+		index_sample_k::Int=0, chunk_local_refs::Bool=false,
 		parallel_search::Bool=false,
 		search_workers::Int=Threads.nthreads(:default),
 		search_batch_size::Int=4096) where {T<:Unsigned}
 	Compression._check_parallel_search(parallel_search, coding_scheme, exact_costing, search_workers, search_batch_size)
+	chunk_local_refs && !(coding_scheme == :index && integer_encoding == :context_range) &&
+		throw(ArgumentError("chunk_local_refs requires context-range index mode"))
 	vs = vertices(g)
 	gs = convert(UInt64, length(vs))
 
@@ -921,7 +936,7 @@ function write_bg_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString;
 				exact_costing=exact_costing, lr_split=lr_split,
 				multi_ref=multi_ref, adaptive_header=adaptive_header,
 				cost_model=cost_model, index_sample_k=index_sample_k,
-				parallel_search=parallel_search,
+				chunk_local_refs=chunk_local_refs, parallel_search=parallel_search,
 				search_workers=search_workers, search_batch_size=search_batch_size)
 		flush_bitwriter(sbw; flush_last_bits=true)
 		struct_bytes = collect(get_bytes(sbw))
@@ -970,17 +985,27 @@ end
 
 Write graph in MGS v3 format with CS (Command Stream) compression.
 Produces a `.mgz` file with v3.1 header (params encoded in byte2).
+
+`chunk_local_refs=true` restricts references to the current sampled context-range
+chunk without changing the file syntax. It may increase compressed size and is
+disabled by default. It requires `coding_scheme=:index, integer_encoding=:context_range`.
+
+`parallel_search=true`, `search_workers`, and `search_batch_size` have the same
+children-only, byte-preserving behavior as `write_bg_mgs3_graph`. Stream emission
+is serial; this does not make concurrent top-level encoder calls safe.
 """
 function write_cs_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString;
 		coding_scheme::Symbol=:children, integer_encoding::Symbol=:fibonacci,
 		ref_window_size::Int=64, compact_copy::Bool=true,
 		tight_intervals::Bool=true, lr_split::Bool=false,
 		cost_model::Int=DEFAULT_COST_MODEL,
-		index_sample_k::Int=0,
+		index_sample_k::Int=0, chunk_local_refs::Bool=false,
 		parallel_search::Bool=false,
 		search_workers::Int=Threads.nthreads(:default),
 		search_batch_size::Int=4096) where {T<:Unsigned}
 	Compression._check_parallel_search(parallel_search, coding_scheme, false, search_workers, search_batch_size)
+	chunk_local_refs && !(coding_scheme == :index && integer_encoding == :context_range) &&
+		throw(ArgumentError("chunk_local_refs requires context-range index mode"))
 	vs = vertices(g)
 	gs = convert(UInt64, length(vs))
 
@@ -1021,7 +1046,7 @@ function write_cs_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString;
 				integer_encoding=:context_range, compact_copy=compact_copy,
 				tight_intervals=tight_intervals, lr_split=lr_split,
 				cost_model=cost_model, index_sample_k=index_sample_k,
-				parallel_search=parallel_search,
+				chunk_local_refs=chunk_local_refs, parallel_search=parallel_search,
 				search_workers=search_workers, search_batch_size=search_batch_size)
 		flush_bitwriter(sbw; flush_last_bits=true)
 		struct_bytes = collect(get_bytes(sbw))
@@ -1069,6 +1094,18 @@ Parameters:
 - filename: Output filename (without .mgz extension)
 - clusters: Partition as Vector{Vector{T}} of vertex clusters
 - params: CGParams encoding parameters (varint stored in header integer_encoding field)
+
+`parallel_search=true` evaluates per-vertex analytical costs concurrently, even
+with one cluster, then writes the same decisions in order. `search_workers` is
+capped by Julia's default thread pool (`--threads=N`). FULL stays FULL. Both
+children and indexed modes are supported; MGS/block trial paths are excluded.
+Decision storage remains cluster-sized, as in serial CG. Progress callbacks run
+in order on the caller after each cluster's parallel search, not live on workers.
+Concurrent top-level encoding calls remain unsupported (shared emission hooks).
+
+`params.optimize_costs=true` enables byte-identical allocation-free analytical
+cost scans and empty K=1 preparation removal. It defaults to false, is not an
+encoded parameter, and can be combined with `parallel_search=true`.
 """
 function write_cg_mgs3_graph(g::AbstractGraph{T}, filename::AbstractString,
 		clusters::Vector{Vector{T}};
@@ -1246,6 +1283,10 @@ transfer, sorted finalization, and scratch reuse without changing the file forma
 `parallel_decode=false` also defaults off; enabling it requires independent
 indexed context-range CG clusters and positive `decode_workers`. K=1 remains
 serial. CG options on non-CG files are rejected rather than silently ignored.
+
+`parallel_decode=true` is opt-in for indexed context-range CG files only. It
+decodes independent clusters with up to `decode_workers` default-pool threads;
+graph construction remains serial. K=1 falls back to serial stream decoding.
 """
 function load_compressed_mgs3_graph(filename::AbstractString;
 		parallel_decode::Bool=false, decode_workers::Int=Threads.nthreads(:default),
@@ -1500,7 +1541,7 @@ function load_greedy_mgs3_graph(io::IO, graph_type::Symbol, coding_scheme::Symbo
 		cmd_bytes = read(io, cmdlen)
 		flag_bytes = read(io, flaglen)
 		resid_bytes = read(io)                      # remaining bytes = residual blob
-		reader = BitReader(IOBuffer(struct_bytes))
+		reader = BitReader(struct_bytes)
 	else
 		reader = BitReader(io)
 	end
@@ -1566,7 +1607,7 @@ function load_cs_mgs3_graph(io::IO, graph_type::Symbol, coding_scheme::Symbol, g
 		cmd_bytes = read(io, cmdlen)
 		flag_bytes = read(io, flaglen)
 		resid_bytes = read(io)
-		reader = BitReader(IOBuffer(struct_bytes))
+		reader = BitReader(struct_bytes)
 	else
 		reader = BitReader(io)
 	end
@@ -1671,11 +1712,14 @@ function load_cg_mgs3_graph(io::IO, graph_type::Symbol, gs::UInt64;
 	return g
 end
 
-"""
-    load_indexed_mgs3_graph(filename)
+include("mgs_cache.jl")
+
+const _INDEXED_MGS3_DOC = """
+    load_indexed_mgs3_graph(filename; decode_prefix=true, max_live_chunks=16,
+                          cache_budget_bytes=nothing)
 
 Load an MGS v3.2 compressed graph with sampled index and return an object
-supporting O(k) random access to any vertex's neighbor list.
+supporting indexed access where available, or a full-decode fallback otherwise.
 
 Returns a named tuple `(n, m, neighbors, algorithm, ...)` where:
 - `n`: number of vertices
@@ -1683,14 +1727,36 @@ Returns a named tuple `(n, m, neighbors, algorithm, ...)` where:
 - `neighbors(v)`: function that returns sorted neighbor list of vertex v (1-indexed)
 - `algorithm`: symbol (:bg, :cs, or :cg)
 
-Two backends:
-- **BG + :context_range + sampled index** → *true* O(k) random access: `neighbors(v)`
-  seeks to the chunk containing v (granularity = sample_k), spins up fresh range
-  decoders on that chunk's byte slice, decodes the chunk, and recursively
-  materialises any referenced vertex living in an earlier chunk. Chunks are
-  memoised. The tuple also carries `stats` (`chunks_decoded`, `total_chunks`,
-  `samp_k`) and `reset_fn()` (clears the memo for cold-seek measurement).
-- **All other formats** → the graph is fully decoded once and cached, giving O(1)
+Access paths:
+- **BG/CS + :context_range + sampled index** → indexed seek: `neighbors(v)`
+  decodes through v, not the rest of its chunk. Earlier cross-chunk references
+  are recursively resolved; only files encoded with chunk-local references
+  guarantee one-chunk access. Work also depends on decoded degrees, not just k.
+  Prefix adjacency and live coder state are memoised, allowing later vertices in
+  the same chunk to resume without replay. Coder models are released when a chunk
+  is complete. At most `max_live_chunks` (default 16) suspended workspaces are
+  retained, in least-recently-used order. An evicted prefix can be replayed if a
+  later query extends it; its already memoised answers remain available. This
+  bound excludes active recursive calls and the existing adjacency memo.
+  `decode_prefix=false` restores whole-chunk materialisation for
+  comparisons or workloads that prefer it. This keyword does not change files.
+  `stats` includes distinct `chunks_decoded`, `decode_calls`, `vertices_decoded`,
+  `arcs_decoded`, `total_chunks`, `samp_k`, and `active_workspaces()`.
+  `reset_fn()` clears all memoised adjacency, continuation positions, and counters.
+  At most one additional idle workspace retains reusable allocation buffers, not
+  answers. Every reuse resets all probability tables and registers inside the
+  decode call. `stats.scratch_bytes()` reports this idle storage excluding shared
+  compressed input; it does not include live continuation workspaces or adjacency.
+  For an opt-in byte-budgeted whole-chunk cache, set `decode_prefix=false` and
+  `cache_budget_bytes` to a nonnegative byte count. Decoded chunks are packed into
+  offsets/targets arrays and evicted by LRU; oversized chunks bypass the cache.
+  The budget includes nonempty cache entries and their hash-table storage, but
+  excludes the empty manager, compressed input, active query scratch and output.
+  Cache stats distinguish top-level hits/misses, retained/peak bytes, evictions,
+  oversized bypasses and actual manager heap size. This mode retains no live
+  decoder models between queries. A zero budget disables persistent caching.
+- **CG + :context_range + index** → indexed whole-cluster seek.
+- **Other formats** → the graph is fully decoded once and cached, giving O(1)
   access to any vertex thereafter (no per-vertex seek).
 
 # Example
@@ -1700,14 +1766,68 @@ println("Graph: \$(idx.n) vertices, \$(idx.m) edges")
 nbrs = idx.neighbors(42)  # get neighbors of vertex 42
 ```
 """
+# Decode only the missing prefix. Keep live entropy state until the chunk is
+# complete. One idle model allocation may be reused after a full reset; completed
+# adjacency stays memoised separately and is never exposed as mutable scratch.
+function _materialize_indexed_prefix!(decode!, memo, states, pool, c, target, samp_k, vs,
+		decode_prefix, max_live_chunks, chunks_decoded, decode_calls, vertices_decoded, arcs_decoded)
+	if haskey(memo, c) && haskey(memo[c], target)
+		return memo[c]
+	end
+	cs = (c - 1) * samp_k + 1
+	ce = min(c * samp_k, vs)
+	stop = decode_prefix ? Int(target) : ce
+	T = typeof(target)
+	state = get!(states, c) do
+		isempty(pool) ? valtype(typeof(states))() : pop!(pool)
+	end
+	start = state.next_vertex == 0 ? cs : state.next_vertex
+	is_new = !haskey(memo, c)
+	local nls
+	try
+		nls = decode!(start:stop, state)
+	catch
+		# A failed decode may have partially advanced the live models. Never reuse it.
+		delete!(states, c); delete!(memo, c)
+		rethrow()
+	end
+	memo[c] = nls
+	chunks_decoded[] += is_new
+	decode_calls[] += 1
+	vertices_decoded[] += stop - start + 1
+	for v in start:stop
+		arcs_decoded[] += length(nls[T(v)])
+	end
+	delete!(states, c)
+	if stop < ce
+		states[c] = state # most recently resumed workspace goes to the end
+		while length(states) > max_live_chunks
+			# An evicted ancestor may still be active on the recursive call stack.
+			# Remove its cache entry, but never recycle its mutable models here.
+			popfirst!(states)
+		end
+	elseif isempty(pool)
+		push!(pool, _recycle_indexed_state!(state))
+	end
+	return nls
+end
+
+function _reset_indexed_reader!(memo, states, pool)
+	if isempty(pool) && !isempty(states)
+		push!(pool, _recycle_indexed_state!(first(values(states))))
+	end
+	empty!(memo); empty!(states)
+	return nothing
+end
+_indexed_scratch_bytes(pool) = Base.summarysize(pool; exclude=Union{Module,DataType,Task,Vector{UInt8}})
+
 # ── True random-access reader: BG + :context_range + sampled index ────────────
 # Returns (n, m, neighbors, algorithm, stats) where `neighbors(v)` seeks to the
-# chunk containing v (granularity = sample_k), decodes that chunk, and recursively
-# materialises any referenced vertex living in an earlier chunk. Chunks are
-# memoised, so repeated access is O(1) after the first touch. `stats.chunks_decoded`
-# reports how many chunks were decoded (for verifying true seek vs full decode).
+# chunk containing v, decodes through v, and recursively materialises required
+# prefixes in earlier chunks. `stats.chunks_decoded` counts distinct touched
+# chunks, not continuation calls; vertices/arcs counters count actual decode work.
 function _load_bg_ctxrange_random_access(filename::AbstractString, graph_type::Symbol,
-		gs::UInt64, params)
+		gs::UInt64, params; decode_prefix::Bool=true, max_live_chunks::Int=16, cache_budget_bytes=nothing)
 	# Re-read the file body (header already validated by caller).
 	local struct_bytes, refdist_bytes, copy_bytes, cmd_bytes, flag_bytes, resid_bytes
 	open(filename, "r") do io
@@ -1729,18 +1849,20 @@ function _load_bg_ctxrange_random_access(filename::AbstractString, graph_type::S
 	samp_k = meta.samp_k
 	rws = params.ref_window_size
 
-	memo = Dict{Int,Dict{T,Vector{T}}}()
+	prototype = IndexedRangeState(T; dense=true)
+	memo = Dict{Int,typeof(prototype.neighbor_lists)}()
+	states = OrderedDict{Int,typeof(prototype)}()
+	pool = [prototype] # at most one idle, answer-free workspace
 	chunks_decoded = Ref(0)
+	decode_calls = Ref(0); vertices_decoded = Ref(0); arcs_decoded = Ref(0)
 	chunk_of(u::Int) = ((u - 1) ÷ samp_k) + 1
 
 	# Forward declaration for mutual recursion (chunk → resolver → chunk).
 	local get_neighbors_v
-	function materialize_chunk(c::Int)
-		haskey(memo, c) && return memo[c]
-		cs = (c - 1) * samp_k + 1
-		ce = min(c * samp_k, vs)
+	function decode_prefix!(range, state)
+		cs = ((first(range) - 1) ÷ samp_k) * samp_k + 1
 		seed_window = T[T(u) for u in max(1, cs - rws):(cs - 1)]
-		reader = BitReader(IOBuffer(struct_bytes))
+		reader = BitReader(struct_bytes)
 		nls = read_greedy_graph_data(reader, T(gs), :index, T;
 			integer_encoding=:context_range,
 			copy_blocks=params.copy_blocks, adaptive_copy=params.adaptive_copy,
@@ -1750,13 +1872,18 @@ function _load_bg_ctxrange_random_access(filename::AbstractString, graph_type::S
 			adaptive_header=params.adaptive_header,
 			ctx_range=true, resid_bytes=resid_bytes, refdist_bytes=refdist_bytes,
 			copy_bytes=copy_bytes, cmd_bytes=cmd_bytes, flag_bytes=flag_bytes,
-			decode_range=cs:ce, seed_window=seed_window, ref_resolver=get_neighbors_v)
-		memo[c] = nls
-		chunks_decoded[] += 1
+			decode_range=range, seed_window=seed_window, ref_resolver=get_neighbors_v,
+			preparsed_index=meta, workspace=state)
 		return nls
 	end
+	if cache_budget_bytes !== nothing
+		bounded=_budgeted_chunk_reader(decode_prefix!,T,vs,samp_k,:bg,cache_budget_bytes)
+		get_neighbors_v=bounded.resolve
+		return bounded.api
+	end
 	get_neighbors_v = function(u)
-		return materialize_chunk(chunk_of(Int(u)))[T(u)]
+		return _materialize_indexed_prefix!(decode_prefix!, memo, states, pool, chunk_of(Int(u)), T(u),
+			samp_k, vs, decode_prefix, max_live_chunks, chunks_decoded, decode_calls, vertices_decoded, arcs_decoded)[T(u)]
 	end
 
 	function _neighbors(v::Integer)
@@ -1765,8 +1892,11 @@ function _load_bg_ctxrange_random_access(filename::AbstractString, graph_type::S
 	end
 
 	return (n=vs, m=-1, neighbors=_neighbors, algorithm=:bg,
-		stats=(chunks_decoded=chunks_decoded, total_chunks=meta.n_sampled, samp_k=samp_k),
-		reset_fn=() -> (empty!(memo); chunks_decoded[] = 0))
+		stats=(chunks_decoded=chunks_decoded, total_chunks=meta.n_sampled, samp_k=samp_k,
+			decode_calls=decode_calls, vertices_decoded=vertices_decoded, arcs_decoded=arcs_decoded,
+			active_workspaces=() -> length(states), scratch_bytes=() -> _indexed_scratch_bytes(pool)),
+		reset_fn=() -> (_reset_indexed_reader!(memo, states, pool); chunks_decoded[] = 0;
+			decode_calls[] = 0; vertices_decoded[] = 0; arcs_decoded[] = 0))
 end
 
 # ── True random-access reader: CS + :context_range + sampled index ────────────
@@ -1774,7 +1904,7 @@ end
 # parse_bg_ctxrange_index is reused); the only difference is the per-chunk decode
 # calls read_cmdstream_graph_data with CS params.
 function _load_cs_ctxrange_random_access(filename::AbstractString, graph_type::Symbol,
-		gs::UInt64, params)
+		gs::UInt64, params; decode_prefix::Bool=true, max_live_chunks::Int=16, cache_budget_bytes=nothing)
 	local struct_bytes, refdist_bytes, copy_bytes, cmd_bytes, flag_bytes, resid_bytes
 	open(filename, "r") do io
 		read(io, 12)  # skip header
@@ -1795,30 +1925,37 @@ function _load_cs_ctxrange_random_access(filename::AbstractString, graph_type::S
 	samp_k = meta.samp_k
 	rws = params.ref_window_size
 
-	memo = Dict{Int,Dict{T,Vector{T}}}()
+	prototype = IndexedRangeState(T; dense=true)
+	memo = Dict{Int,typeof(prototype.neighbor_lists)}()
+	states = OrderedDict{Int,typeof(prototype)}()
+	pool = [prototype]
 	chunks_decoded = Ref(0)
+	decode_calls = Ref(0); vertices_decoded = Ref(0); arcs_decoded = Ref(0)
 	chunk_of(u::Int) = ((u - 1) ÷ samp_k) + 1
 
 	local get_neighbors_v
-	function materialize_chunk(c::Int)
-		haskey(memo, c) && return memo[c]
-		cs = (c - 1) * samp_k + 1
-		ce = min(c * samp_k, vs)
+	function decode_prefix!(range, state)
+		cs = ((first(range) - 1) ÷ samp_k) * samp_k + 1
 		seed_window = T[T(u) for u in max(1, cs - rws):(cs - 1)]
-		reader = BitReader(IOBuffer(struct_bytes))
+		reader = BitReader(struct_bytes)
 		nls = read_cmdstream_graph_data(reader, T(gs), :index, T;
 			integer_encoding=:context_range,
 			compact_copy=params.compact_copy, tight_intervals=params.tight_intervals,
 			ref_window_size=params.ref_window_size, lr_split=params.lr_split,
 			ctx_range=true, resid_bytes=resid_bytes, refdist_bytes=refdist_bytes,
 			copy_bytes=copy_bytes, cmd_bytes=cmd_bytes, flag_bytes=flag_bytes,
-			decode_range=cs:ce, seed_window=seed_window, ref_resolver=get_neighbors_v)
-		memo[c] = nls
-		chunks_decoded[] += 1
+			decode_range=range, seed_window=seed_window, ref_resolver=get_neighbors_v,
+			preparsed_index=meta, workspace=state)
 		return nls
 	end
+	if cache_budget_bytes !== nothing
+		bounded=_budgeted_chunk_reader(decode_prefix!,T,vs,samp_k,:cs,cache_budget_bytes)
+		get_neighbors_v=bounded.resolve
+		return bounded.api
+	end
 	get_neighbors_v = function(u)
-		return materialize_chunk(chunk_of(Int(u)))[T(u)]
+		return _materialize_indexed_prefix!(decode_prefix!, memo, states, pool, chunk_of(Int(u)), T(u),
+			samp_k, vs, decode_prefix, max_live_chunks, chunks_decoded, decode_calls, vertices_decoded, arcs_decoded)[T(u)]
 	end
 
 	function _neighbors(v::Integer)
@@ -1827,8 +1964,11 @@ function _load_cs_ctxrange_random_access(filename::AbstractString, graph_type::S
 	end
 
 	return (n=vs, m=-1, neighbors=_neighbors, algorithm=:cs,
-		stats=(chunks_decoded=chunks_decoded, total_chunks=meta.n_sampled, samp_k=samp_k),
-		reset_fn=() -> (empty!(memo); chunks_decoded[] = 0))
+		stats=(chunks_decoded=chunks_decoded, total_chunks=meta.n_sampled, samp_k=samp_k,
+			decode_calls=decode_calls, vertices_decoded=vertices_decoded, arcs_decoded=arcs_decoded,
+			active_workspaces=() -> length(states), scratch_bytes=() -> _indexed_scratch_bytes(pool)),
+		reset_fn=() -> (_reset_indexed_reader!(memo, states, pool); chunks_decoded[] = 0;
+			decode_calls[] = 0; vertices_decoded[] = 0; arcs_decoded[] = 0))
 end
 
 # ── True random-access reader: CG + :context_range + index ────────────────────
@@ -1903,46 +2043,58 @@ function _load_cg_ctxrange_random_access(filename::AbstractString, graph_type::S
 		reset_fn=() -> (empty!(memo); clusters_decoded[] = 0))
 end
 
-function load_indexed_mgs3_graph(filename::AbstractString; compact_lists::Bool=false,
-        fused_lr::Bool=false, reuse_identity::Bool=false, sorted_fastpath::Bool=false,
-        reuse_scratch::Bool=false)
-	# Fast path: BG + :context_range + sampled index supports true O(k) random
-	# access via chunked range streams — no upfront full decode.
+function load_indexed_mgs3_graph(filename::AbstractString; decode_prefix::Bool=true, max_live_chunks::Int=16,
+		cache_budget_bytes::Union{Nothing,Int}=nothing, compact_lists::Bool=false,
+		fused_lr::Bool=false, reuse_identity::Bool=false, sorted_fastpath::Bool=false,
+		reuse_scratch::Bool=false)
+	max_live_chunks >= 1 || throw(ArgumentError("max_live_chunks must be positive"))
+	if cache_budget_bytes !== nothing
+		cache_budget_bytes >= 0 || throw(ArgumentError("cache_budget_bytes must be nonnegative"))
+		!decode_prefix || throw(ArgumentError("byte-budgeted cache requires decode_prefix=false"))
+	end
+	# Indexed range streams need no upfront full decode. Cross-chunk references
+	# in older files can still amplify the seek beyond the target chunk.
 	open(filename, "r") do f
 		header = read(f, 12)
 		if header[1:3] == [0x4d, 0x47, 0x53]
 			flag_byte1 = header[6]; flag_byte2 = header[7]
 			graph_type, encoding, compression, byte2 = decode_header_flags(flag_byte1, flag_byte2)
-            if (compact_lists || fused_lr || reuse_identity || sorted_fastpath || reuse_scratch) &&
-                    !(byte2 == ALG_CG || PARAM_CG_BASE <= byte2 <= PARAM_CG_MAX)
-                throw(ArgumentError("CG decoder options require a CG file"))
-            end
+			if (compact_lists || fused_lr || reuse_identity || sorted_fastpath || reuse_scratch) &&
+					!(byte2 == ALG_CG || PARAM_CG_BASE <= byte2 <= PARAM_CG_MAX)
+				throw(ArgumentError("CG decoder options require a CG file"))
+			end
 			gs_bytes = header[8:12]
 			gs = UInt64(gs_bytes[1]) | (UInt64(gs_bytes[2]) << 8) | (UInt64(gs_bytes[3]) << 16) |
 				(UInt64(gs_bytes[4]) << 24) | (UInt64(gs_bytes[5]) << 32)
 			is_bg = byte2 == ALG_BG || (PARAM_BG_BASE <= byte2 <= PARAM_BG_MAX)
 			if is_bg && encoding == :index && compression == :context_range
 				p = byte2 == ALG_BG ? _bg_default_params() : decode_bg_params(byte2)
-				return _load_bg_ctxrange_random_access(filename, graph_type, gs, p)
+				return _load_bg_ctxrange_random_access(filename, graph_type, gs, p;
+					decode_prefix=decode_prefix, max_live_chunks=max_live_chunks,cache_budget_bytes=cache_budget_bytes)
 			end
 			is_cs = byte2 == ALG_CS || (PARAM_CS_BASE <= byte2 <= PARAM_CS_MAX)
 			if is_cs && encoding == :index && compression == :context_range
 				p = byte2 == ALG_CS ? _cs_default_params() : decode_cs_params(byte2)
-				return _load_cs_ctxrange_random_access(filename, graph_type, gs, p)
+				return _load_cs_ctxrange_random_access(filename, graph_type, gs, p;
+					decode_prefix=decode_prefix, max_live_chunks=max_live_chunks,cache_budget_bytes=cache_budget_bytes)
 			end
 			is_cg = byte2 == ALG_CG || (PARAM_CG_BASE <= byte2 <= PARAM_CG_MAX)
 			if is_cg && encoding == :index && compression == :context_range
+				cache_budget_bytes === nothing || throw(ArgumentError("byte-budgeted cache currently supports BG/CS indexed context-range files only"))
 				p = byte2 == ALG_CG ? CGParams() : decode_cg_params(byte2)
 				return _load_cg_ctxrange_random_access(filename, graph_type, gs, p;
-                    compact_lists=compact_lists, fused_lr=fused_lr, reuse_identity=reuse_identity,
-                    sorted_fastpath=sorted_fastpath, reuse_scratch=reuse_scratch)
+					compact_lists=compact_lists, fused_lr=fused_lr, reuse_identity=reuse_identity,
+					sorted_fastpath=sorted_fastpath, reuse_scratch=reuse_scratch)
 			end
 		end
+		cache_budget_bytes === nothing || throw(ArgumentError("byte-budgeted cache currently supports BG/CS indexed context-range files only"))
 		return nothing
 	end |> ra -> ra === nothing ? _load_indexed_mgs3_graph_fulldecode(filename;
-        compact_lists=compact_lists, fused_lr=fused_lr, reuse_identity=reuse_identity,
-        sorted_fastpath=sorted_fastpath, reuse_scratch=reuse_scratch) : ra
+		compact_lists=compact_lists, fused_lr=fused_lr, reuse_identity=reuse_identity,
+		sorted_fastpath=sorted_fastpath, reuse_scratch=reuse_scratch) : ra
 end
+
+@doc _INDEXED_MGS3_DOC load_indexed_mgs3_graph
 
 function _load_indexed_mgs3_graph_fulldecode(filename::AbstractString; kw...)
 	# Load full graph (uses sequential decode internally)
