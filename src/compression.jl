@@ -1200,6 +1200,8 @@ end
 
 # Fallback for values > FIB_LUT_SIZE (rare in practice)
 function _write_fibonacci_fallback(w::BitWriter, n::T) where {T<:Unsigned}
+    n < FIB_NUMBERS[end] + FIB_NUMBERS[end-1] ||
+        throw(ArgumentError("Fibonacci value exceeds supported coefficient range"))
     code = UInt64(0)
     max_idx = 0
     remaining = UInt64(n)
@@ -1238,6 +1240,11 @@ function read_fibonacci(r::BitReader, ::Type{T}=UInt8) where {T<:Unsigned}
         if b && prev
             break  # stop bit
         end
+        # Check after recognizing the terminator: it occupies one bit past
+        # the largest Fibonacci coefficient in an otherwise valid codeword.
+        if i > length(FIB_NUMBERS)
+            throw(ArgumentError("Fibonacci code exceeds supported coefficient range"))
+        end
         # if the bit is 1, add the corresponding Fibonacci number to the value
         if b
             value += T(FIB_NUMBERS[i])
@@ -1246,10 +1253,6 @@ function read_fibonacci(r::BitReader, ::Type{T}=UInt8) where {T<:Unsigned}
         prev = b
         # increment the index
         i += 1
-        # if the index is greater than the length of the Fibonacci numbers, we have reached the end of the Fibonacci numbers
-        if i > length(FIB_NUMBERS)
-            throw(ArgumentError("Fibonacci code exceeds supported range (>= 2^40)"))
-        end
     end
 
     return value
