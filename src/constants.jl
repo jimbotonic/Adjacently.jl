@@ -27,13 +27,13 @@ const ZETA_BASE::Int = 3
 const REF_ENCODING_TH::Int = 3  # Minimum overlap threshold for reference encoding
 const REF_V_MIN_DEGREE::Int = 4  # Minimum degree for a vertex to be considered as reference candidate
 
-# Precomputed Fibonacci numbers <= 2^40
-# NB: this is used for the Fibonacci code
+# Fibonacci fields must cover source-relative zigzag offsets for 40-bit ranks.
+# Those fields can reach 2^41-3, although a rank itself is below 2^40.
 const FIB_NUMBERS::Vector{UInt} = let
     fib = UInt[1, 2]
     while true
         next = fib[end] + fib[end - 1]
-        next > UInt(2)^40 && break
+        next > UInt(2)^41 && break
         push!(fib, next)
     end
     fib
