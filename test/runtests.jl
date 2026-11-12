@@ -21,3 +21,6 @@ end
 module AdjacencyLoaderTests
 include("run_tests_adjacency_loader.jl")
 end
+module NonRAOptimizationTests
+include("run_tests_nonra_optimizations.jl")
+end

@@ -4714,18 +4714,22 @@ function _estimate_rle_cost(neighbors::Vector{T}, ie::Symbol, mil::Int; vertex_i
         sections = analyze_delta_patterns_hybrid(rem_deltas, @view(neighbors[2:end]), mil)
         cost += estimate_encoded_value_cost(T(length(sections)), ie)
         for s in sections
-            if s.type == :delta
+            # The analyzer constructs dense T vectors here. Keep scalar costing
+            # specialized even though its public section container is heterogeneous.
+            section_type = s.type::Symbol
+            data = s.data::Vector{T}
+            if section_type == :delta
                 cost += 1
-                cost += estimate_encoded_value_cost(T(length(s.data)), ie)
-                for val in s.data; cost += estimate_encoded_value_cost(val, ie); end
-            elseif s.type == :run_length
+                cost += estimate_encoded_value_cost(T(length(data)), ie)
+                for val in data; cost += estimate_encoded_value_cost(val, ie); end
+            elseif section_type == :run_length
                 cost += 2
-                cost += estimate_encoded_value_cost(T(length(s.data)÷2), ie)
-                for val in s.data; cost += estimate_encoded_value_cost(val, ie); end
-            elseif s.type == :interval
+                cost += estimate_encoded_value_cost(T(length(data)÷2), ie)
+                for val in data; cost += estimate_encoded_value_cost(val, ie); end
+            elseif section_type == :interval
                 cost += 2
-                cost += estimate_encoded_value_cost(T(length(s.data)÷2), ie)
-                for val in s.data; cost += estimate_encoded_value_cost(val, ie); end
+                cost += estimate_encoded_value_cost(T(length(data)÷2), ie)
+                for val in data; cost += estimate_encoded_value_cost(val, ie); end
             end
         end
     end
