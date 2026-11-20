@@ -9,7 +9,7 @@ governance simulation.
 | Module | Purpose |
 |--------|---------|
 | `Compression`, `MGS` | BG / CS / CG encoders and the self-describing `.mgz` container |
-| `Clustering`, `Relabeling` | Leiden / LLP partitioning and vertex-ordering pipelines |
+| `Clustering`, `Relabeling` | Community partitioning and LLP vertex-ordering pipelines |
 | `Graph`, `Algo`, `Paths`, `PageRank`, `RandomWalks`, `Metrics` | Core graph analysis |
 | `Fingerprints` | Neural diffusion fingerprints (NDF) and graph-based text models |
 | `Metabolic` | BiGG model loading, FBA, and chemistry-aware pathway search |
@@ -122,7 +122,7 @@ write_cs_mgs3_graph(g, "output"; ref_window_size=64, lr_split=false)
 ### CG (Clustered Greedy)
 
 Two-level coarsening approach that exploits community structure. The graph is
-partitioned into clusters (e.g. via Leiden); intra-cluster edges use reference encoding
+partitioned into clusters; intra-cluster edges use reference encoding
 with adaptive copy-blocks, while inter-cluster edges use list-based encoding.
 
 ```julia
@@ -132,10 +132,15 @@ write_cg_mgs3_graph(g, "output", clusters; params=CGParams(
 
 ### Vertex ordering
 
-Compression quality depends heavily on vertex order. The **Leiden-as-ordering**
-pipeline — global LLP → Leiden fine clusters → per-cluster intra-LLP → concatenate,
-then encode with K=1 — is the strongest ordering across the datasets above and is what
-the benchmark drivers reproduce. `Relabeling` and `Clustering` expose the pieces.
+Compression quality depends heavily on the delivered vertex order. The community
+ordering pipeline partitions the graph, optionally merges small communities,
+runs LLP inside each community, and concatenates the results. The implementation
+uses a Louvain-based partitioner with connected-component refinement; the legacy
+API name `relabel_graph_leiden_llp` is not an attribution to the reference Leiden
+algorithm. Global LLP seeding is a separate experimental arm, not an implicit
+stage of every run. A strong delivered order can outperform reordering.
+`Relabeling` and `Clustering` expose the pieces; pin the ordering recipe when
+comparing encoder results.
 
 ### Integer coding backends
 
@@ -149,16 +154,18 @@ random-access mode built on independently decodable chunks.
 write_bg_mgs3_graph(g, "output"; integer_encoding=:context_range)
 ```
 
-Files written this way carry minor version `0x03` (v3.3 body layout) and remain fully
-self-describing. See [docs/FORMAT_SPECS_CONTEXT_RANGE.md](docs/FORMAT_SPECS_CONTEXT_RANGE.md).
+BG/CS context-range files carry minor version `0x03` (v3.3, five streams);
+CG uses v3.2 with three streams. See [docs/FORMAT_SPECS_CONTEXT_RANGE.md](docs/FORMAT_SPECS_CONTEXT_RANGE.md).
 
 ### Random access
 
-`load_indexed_mgs3_graph` returns an object with a `neighbors(v)` accessor. With
-**BG + `:context_range` + a sampled index** this is true O(k) random access: it seeks to
-the chunk holding `v`, decodes only that chunk (memoised), and recursively materialises
-referenced vertices from earlier chunks. All other formats fall back to a single full
-decode plus O(1) lookups thereafter.
+`load_indexed_mgs3_graph` returns an object with a `neighbors(v)` accessor.
+Supported indexed layouts seek into compressed streams; non-indexed files fall
+back to full decoding and subsequent RAM lookups. Sampled BG/CS access decodes a
+chunk or prefix and may follow references into other chunks unless encoding used
+`chunk_local_refs=true`. Query work also depends on list sizes, dependencies and
+cache state, so sample stride alone is not a general O(k) time bound. Do not compare
+cached hits with a competitor's uncached queries.
 
 ```julia
 idx = load_indexed_mgs3_graph("graph.mgz")
@@ -168,16 +175,23 @@ nbrs = idx.neighbors(42)
 ### Compression ratio
 
 Bits per edge (BPE = `8 × filesize / m`) is a property of the encoded bitstream and is
-therefore machine-independent, so every figure below is reproducible on any machine.
+therefore machine-independent for identical inputs, ordering, and settings.
 Encoder throughput is not — it depends on the CPU, the JIT, and the I/O path — so no
 timings are published here; see the [companion paper](https://arxiv.org/abs/2605.21510)
 for the speed discussion.
 
-The tables report the `:context_range` backend at K=1 against the strongest
-reference-based baselines: WebGraph **BV-HC** (high-compression) and **Zuckerli**
-(max-compression mode), on seven datasets in both their native and Leiden+LLP orderings.
-The best of the three Adjacently encoders is in bold; the last column is its relative
-reduction over Zuckerli.
+**Historical results, superseded by the corrective v3 comparison.** These tables
+preserve older per-cell configurations and use default-parameter Zuckerli, not
+its published settings. They do not establish the withdrawn “28/28” superiority
+claim, encoder-independent ordering gains, or low-overhead random access.
+The v3 manuscript compares a fixed CS configuration with both Zuckerli modes and
+both parameter settings, and reports the encoding and access costs explicitly.
+
+The tables use the `:context_range` backend. Sequential native configurations use
+K=1; CG's historical access configuration uses a separate group layout. BV-HC is
+WebGraph's high-compression setting. The legacy `leiden` label means community+LLP,
+not the reference Leiden algorithm. Bold selects the best of BG/CS/CG after
+measurement; the margin is against the historical default Zuckerli configuration.
 
 **Whole-graph compression (BPE)**
 
@@ -199,8 +213,9 @@ reduction over Zuckerli.
 | web-google | leiden | 4.095 | 3.408 | 3.188 | **3.142** | 3.349 | +7.8% |
 
 **Random access (BPE)**, each system in its own random-access mode: BV at w=7 with
-bounded reference chains (m=3), Zuckerli with `--allow_random_access`, ours with the
-embedded sampled index.
+bounded reference chains (m=3), default-parameter Zuckerli with
+`--allow_random_access`, BG/CS with an embedded sampled index, and CG with its
+distinct group-based access layout.
 
 | Dataset | Ordering | BV w=7 | Zuck.-RA | BG | CS | CG | vs Zuck. |
 |---|---|---|---|---|---|---|---|
@@ -221,10 +236,9 @@ embedded sampled index.
 
 Reading the tables:
 
-- The best of the three encoders beats Zuckerli in all 28 cells, by +0.3% to +35%. The
-  margin is largest on the most compressible graphs (in-2004, cnr-2000), where
-  entropy-coding the control bits — previously 0.2–0.3 BPE of raw overhead — matters most.
-- **BG-RA and CS-RA are the random-access winners.** CG-RA uses the K>1 cluster layer
+- These best-of-three margins describe the printed historical table only. They
+  are not a comparison with published-setting Zuckerli or a fixed-encoder result.
+- **Access size does not establish query speed.** CG-RA uses the K>1 cluster layer
   directly (cluster = seek chunk), so its cross-cluster edges cannot use reference or
   interval compression and pay the expensive inter-cluster stub encoding.
 - BV-HC (w=16, unbounded reference chains) has no practical random access, which is why
@@ -235,12 +249,14 @@ Reading the tables:
   is therefore compared in its own mode rather than across modes.
 - All compressed files are verified by roundtrip decompression.
 
-The `leiden` rows use the Leiden+LLP ordering with the small-cluster merge refinement
+The `leiden` rows use the community+LLP ordering with the small-cluster merge refinement
 (`relabel_graph_leiden_llp(g; merge_clusters=:auto)`), so these absolute values are not
 directly comparable to the ordering-ablation numbers reproduced by
 `bench/graph_compression/ord_ablation.jl`, which use the Fibonacci backend and the
 unmerged ordering. With that classic backend, the best cnr-2000 results are CS 2.304 and
-BG 2.326 (Leiden+LLP) and CG K=2 2.329 (LAW order), against BV 2.898 and BV-HC 2.448.
+BG 2.326 (community+LLP). The old CG K=2 value of 2.329 used first-encounter
+CSV identifiers followed by cluster relabeling, not unchanged LAW/URL identifiers;
+it is not a matched comparison with the other input-order results.
 
 > **Reproducibility of these two tables.** `sota_wholegraph.jl` and `sota_ra.jl` in
 > `bench/graph_compression/` drive the **BG / CS / CG columns of both tables** — each
@@ -258,9 +274,9 @@ BG 2.326 (Leiden+LLP) and CG K=2 2.329 (LAW order), against BV 2.898 and BV-HC 2
 > [bench/graph_compression/README.md](bench/graph_compression/README.md) for the full
 > per-cell comparison.
 
-A dual cost model is available for the greedy encoders: the full model (`cost_model=0`)
-explores all encoding options and candidates for the best ratio, while the fast model
-(`cost_model=1`) trades a few tenths of a BPE for a large reduction in encoding work.
+The full search (`cost_model=0`) considers the enabled candidates under its cost
+model; it does not guarantee the smallest adaptive-coded file. The faster search
+(`cost_model=1`) reduces search effort and can make files either smaller or larger.
 
 ### References
 
