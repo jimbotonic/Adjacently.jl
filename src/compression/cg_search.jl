@@ -69,7 +69,7 @@ function _search_cluster(all_nl::Vector{Vector{T}}, params;
                 else
                 for mil in _mil_options
                     if params.intra_lr_split
-                        raw_bits = _estimate_ir_lr_cost(nl, :fibonacci, mil, _zz_vid; tight_deltas=params.intra_tight_deltas)
+                        raw_bits = _estimate_ir_lr_cost(nl, :fibonacci, mil, _zz_vid; tight_deltas=params.intra_tight_deltas, optimize=params.optimize_costs)
                     else
                         raw_bits = estimate_interval_runlength_encoding_cost(nl, :fibonacci, mil, 3; vertex_id=_zz_vid)
                     end
@@ -98,7 +98,7 @@ function _search_cluster(all_nl::Vector{Vector{T}}, params;
                         sort!(overlap_scores; by = x -> -x[1])
                         phase2_indices = [overlap_scores[k][2] for k in 1:min(_max_k_greedy, n_candidates)]
                     else
-                        phase2_indices = collect(wstart:wend)
+                        phase2_indices = params.optimize_costs ? (wstart:wend) : collect(wstart:wend)
                     end
 
                     # Phase 2: full analytical evaluation on top candidates
@@ -155,7 +155,7 @@ function _search_cluster(all_nl::Vector{Vector{T}}, params;
                     sort!(overlap_scores; by = x -> -x[1])
                     phase2_indices = [overlap_scores[k][2] for k in 1:min(_max_k_ref, n_candidates)]
                 else
-                    phase2_indices = collect(wstart:wend)
+                    phase2_indices = params.optimize_costs ? (wstart:wend) : collect(wstart:wend)
                 end
 
                 # Phase 2: analytical evaluation with early termination

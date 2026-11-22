@@ -114,7 +114,7 @@ end
     return nothing
 end
 
-@inline function _rc_update!(freq::Matrix{UInt32}, tot::Vector{UInt32}, ctx::Int, sym::Int)
+@inline function _rc_update!(freq::AbstractMatrix{UInt32}, tot::Vector{UInt32}, ctx::Int, sym::Int)
     freq[ctx, sym] += _RC_INC
     tot[ctx] += _RC_INC
     if tot[ctx] >= _RC_TOP ÷ 2
@@ -170,13 +170,75 @@ function rc_finish_and_reset!(e::CtxRangeEncoder)
 end
 
 # ---------------- Decoder ----------------
+# Preserve the logical [context, symbol] and linear snapshot interfaces, but
+# store each context's symbols contiguously. Encoder storage/bytes are unchanged.
+const _RC_GROUP_SIZE = 8
+const _RC_NGROUP = cld(_RC_NSYM, _RC_GROUP_SIZE)
+struct _DecoderFrequencies <: AbstractMatrix{UInt32}
+    data::Matrix{UInt32} # symbol × context
+    groups::Matrix{UInt32} # exact sums, group × context; runtime only
+end
+function _DecoderFrequencies(data::Matrix{UInt32})
+    size(data) == (_RC_NSYM, _RC_NCTX) || throw(ArgumentError("invalid frequency dimensions"))
+    groups=zeros(UInt32,_RC_NGROUP,_RC_NCTX)
+    for ctx in 1:_RC_NCTX, sym in 1:_RC_NSYM
+        groups[(sym-1) ÷ _RC_GROUP_SIZE+1,ctx] += data[sym,ctx]
+    end
+    return _DecoderFrequencies(data,groups)
+end
+Base.size(f::_DecoderFrequencies) = reverse(size(f.data))
+Base.IndexStyle(::Type{_DecoderFrequencies}) = IndexLinear()
+@inline Base.getindex(f::_DecoderFrequencies, ctx::Int, sym::Int) = f.data[sym, ctx]
+@inline function Base.setindex!(f::_DecoderFrequencies, x, ctx::Int, sym::Int)
+    value=UInt32(x); old=f.data[sym,ctx]
+    group=(sym-1) ÷ _RC_GROUP_SIZE+1
+    f.groups[group,ctx] = f.groups[group,ctx] - old + value
+    return (f.data[sym,ctx]=value)
+end
+@inline function Base.getindex(f::_DecoderFrequencies, i::Int)
+    @boundscheck checkbounds(f,i)
+    return f[mod(i-1, size(f,1))+1, (i-1) ÷ size(f,1)+1]
+end
+@inline function Base.setindex!(f::_DecoderFrequencies, x, i::Int)
+    @boundscheck checkbounds(f,i)
+    return (f[mod(i-1, size(f,1))+1, (i-1) ÷ size(f,1)+1] = x)
+end
+function Base.fill!(f::_DecoderFrequencies, x)
+    fill!(f.data,x)
+    fill!(f.groups,UInt32(x)*UInt32(_RC_GROUP_SIZE))
+    tail=UInt32(_RC_NSYM-(_RC_NGROUP-1)*_RC_GROUP_SIZE)*UInt32(x)
+    for ctx in 1:_RC_NCTX; f.groups[end,ctx]=tail; end
+    return f
+end
+
+@inline function _rc_update!(f::_DecoderFrequencies, tot::Vector{UInt32}, ctx::Int, sym::Int)
+    # These indices come from the bounded symbol search; snapshots use setindex!
+    # above so external frequency restoration also keeps these sums exact.
+    f.data[sym,ctx] += _RC_INC
+    f.groups[(sym-1) ÷ _RC_GROUP_SIZE+1,ctx] += _RC_INC
+    tot[ctx] += _RC_INC
+    if tot[ctx] >= _RC_TOP ÷ 2
+        t=UInt32(0)
+        for group in 1:_RC_NGROUP
+            subtotal=UInt32(0)
+            for s in ((group-1)*_RC_GROUP_SIZE+1):min(group*_RC_GROUP_SIZE,_RC_NSYM)
+                value=(f.data[s,ctx] >> 1) | UInt32(1)
+                f.data[s,ctx]=value; subtotal+=value
+            end
+            f.groups[group,ctx]=subtotal; t+=subtotal
+        end
+        tot[ctx]=t
+    end
+    return nothing
+end
+
 mutable struct CtxRangeDecoder
     code::UInt32
     range::UInt32
     inp::Vector{UInt8}
     ip::Int
     limit::Int              # inclusive end of this chunk, not the backing buffer
-    freq::Matrix{UInt32}
+    freq::_DecoderFrequencies
     tot::Vector{UInt32}
     pos::Int
     prev::Int
@@ -205,7 +267,7 @@ end
 
 function CtxRangeDecoder(bytes::Vector{UInt8}, first::Int=1, last::Int=length(bytes))
     d = CtxRangeDecoder(UInt32(0), typemax(UInt32), bytes, 1, last,
-        ones(UInt32, _RC_NCTX, _RC_NSYM), fill(UInt32(_RC_NSYM), _RC_NCTX),
+        _DecoderFrequencies(ones(UInt32, _RC_NSYM, _RC_NCTX)), fill(UInt32(_RC_NSYM), _RC_NCTX),
         0, _RC_RESET)
     return _range_span!(d, bytes, first, last)
 end
@@ -277,9 +339,23 @@ function rc_decode_value!(d::CtxRangeDecoder)
     ctx = _rc_ctx(_rc_posb(d.pos), d.prev)
     d.range ÷= d.tot[ctx]
     f = min(d.code ÷ d.range, d.tot[ctx] - 1)
-    cum = UInt32(0); sym = 1
-    while cum + d.freq[ctx, sym] <= f; cum += d.freq[ctx, sym]; sym += 1; end
-    _rc_dec_update!(d, cum, d.freq[ctx, sym])
+    cum = UInt32(0); group = 1
+    # Context is checked once; the bounded search never reads past the alphabet.
+    checkbounds(d.freq.data, 1, ctx)
+    subtotal = @inbounds d.freq.groups[group,ctx]
+    while cum + subtotal <= f && group < _RC_NGROUP
+        cum += subtotal; group += 1
+        subtotal = @inbounds d.freq.groups[group,ctx]
+    end
+    sym=(group-1)*_RC_GROUP_SIZE+1
+    last_symbol=min(group*_RC_GROUP_SIZE,_RC_NSYM)
+    frequency = @inbounds d.freq.data[sym, ctx]
+    while cum + frequency <= f && sym < last_symbol
+        cum += frequency; sym += 1
+        frequency = @inbounds d.freq.data[sym, ctx]
+    end
+    cum + frequency > f || throw(ArgumentError("invalid range model total"))
+    _rc_dec_update!(d, cum, frequency)
     _rc_update!(d.freq, d.tot, ctx, sym)
     token = sym - 1
     v = _rc_hybrid_decode(d, token)
@@ -375,6 +451,20 @@ function brc_finish_and_reset!(e::BinRangeEncoder)
     return bytes
 end
 
+# Multi-context adaptive bits on the BinRange registers. The caller owns the count
+# tables (one c0/c1 pair per context, initialised to 1) and must use the same
+# context sequence on both sides.
+function brc_encode_ctx_bit!(e::BinRangeEncoder, c0::Vector{UInt32}, c1::Vector{UInt32}, ctx::Int, b::Bool)
+    z = c0[ctx]; o = c1[ctx]; tot = z + o
+    if b
+        _brc_enc_freq!(e, z, o, tot); c1[ctx] += _BRC_INC
+    else
+        _brc_enc_freq!(e, UInt32(0), z, tot); c0[ctx] += _BRC_INC
+    end
+    _brc_rescale!(c0, c1, ctx)
+    return nothing
+end
+
 mutable struct BinRangeDecoder
     code::UInt32
     range::UInt32
@@ -406,6 +496,19 @@ end
         d.range <<= 8
     end
     return nothing
+end
+
+function brc_decode_ctx_bit!(d::BinRangeDecoder, c0::Vector{UInt32}, c1::Vector{UInt32}, ctx::Int)
+    z = c0[ctx]; o = c1[ctx]; tot = z + o
+    d.range ÷= tot
+    f = min(d.code ÷ d.range, tot - 1)
+    if f < z
+        _brc_dec_update!(d, UInt32(0), z); c0[ctx] += _BRC_INC; b = false
+    else
+        _brc_dec_update!(d, z, o); c1[ctx] += _BRC_INC; b = true
+    end
+    _brc_rescale!(c0, c1, ctx)
+    return b
 end
 
 function brc_decode_bit!(d::BinRangeDecoder)
